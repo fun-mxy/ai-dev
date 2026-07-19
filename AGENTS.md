@@ -1,5 +1,11 @@
 # Agents
 
+## Development environment
+
+Before writing or running code, set up the env and learn the test/debug loop:
+see [`DEVELOPMENT.md`](DEVELOPMENT.md). Short version: `uv sync`, then prefix
+every command with `uv run` (`uv run pytest`, `uv run mypy`, `uv run ai-dev …`).
+
 ## Agent skills
 
 ### Issue tracker

@@ -5,9 +5,18 @@
 # reference, NOT project code — see prototype/adapter/run.sh header "Do NOT promote".
 prototype/
 
-# Python
+# Python / uv — environment is managed by uv (see DEVELOPMENT.md).
+# uv.lock IS committed for reproducibility; the venv + build metadata are not.
+.venv/
 __pycache__/
 *.py[cod]
+src/*.egg-info/
 
 # macOS
 .DS_Store
+
+# ai-dev runtime state. Feature runs created by local CLI runs in THIS dev repo
+# are throwaway demo output, not project state. (In a real *target* project,
+# .ai-dev/ is the committed source of truth per spec §4.1 — that rule applies to
+# the project being developed, not to the orchestrator's own repo.)
+.ai-dev/

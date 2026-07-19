@@ -14,7 +14,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
-[project.optional-dependencies]
+# Dev tooling lives in a PEP 735 dependency group so `uv sync` installs it
+# automatically (no `--extra dev` needed). These are not runtime dependencies.
+[dependency-groups]
 dev = [
     "pytest>=7.0",
     "mypy>=1.10",

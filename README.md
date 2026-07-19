@@ -17,8 +17,9 @@ v0.0 — local artifact skeleton (§26.1). Currently implements ticket 01: the
 ## Usage
 
 ```bash
-# After `pip install -e .[dev]` (or run via module with src on the path):
-ai-dev create-feature-run "<intent text>"
-
-# …creates .ai-dev/features/FEATURE-NNN/ with the §6 directory skeleton.
+uv sync                                      # one-time: set up the env (see DEVELOPMENT.md)
+uv run ai-dev create-feature-run "<intent>"  # creates .ai-dev/features/FEATURE-NNN/ (§6 skeleton)
 ```
+
+For environment setup, testing, typechecking, and debugging, see
+[**DEVELOPMENT.md**](DEVELOPMENT.md).
