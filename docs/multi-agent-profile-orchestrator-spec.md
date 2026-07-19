@@ -709,10 +709,13 @@ MVP 采用 headless 模式：
 ```bash
 claude -p "<prompt>" \
   --output-format stream-json \
+  --verbose \
   --include-partial-messages \
   --permission-mode <mode> \
   --max-turns <n>
 ```
+
+> **`--verbose` 是硬性要求**（claude v2.1.207+）：当 `--output-format stream-json` 与 `-p` 组合时，缺它会在调用模型前直接报错退出（`Error: When using --print, --output-format=stream-json requires --verbose`）。该 flag 在原 spec 中遗漏，已由 cc-glm52 prototype 实跑确认（那次唯一重试就是补它）。
 
 可选能力：
 
