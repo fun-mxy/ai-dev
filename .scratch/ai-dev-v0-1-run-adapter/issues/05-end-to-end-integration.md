@@ -4,12 +4,12 @@
 
 **Blocked by:** 01, 02, 03, 04
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `.ai-dev/agent-profiles.yml` 配置 cc-glm52 profile（ark base_url，token 仅变量名）
-- [ ] 从一条 intent 起步：create -> prepare -> run -> validate 四步依次跑通，无手动干预
-- [ ] 实跑的 run：exit_code 0、result.json schema 合法、changed_files 全在 allowed-files 内、validate-run 输出 PASS（退出码 0）
-- [ ] RUN-NNN 正确分配在 feature run 的 `runs/` 下（v0.0 feature 骨架 ↔ v0.1 run 路径集成无误）
-- [ ] metadata.json 字段齐全，changed_files 与工作区实际改动一致
-- [ ] token 全程不落盘（在 run 目录内 grep 不到 token 值）
-- [ ] 集成暴露的接缝问题（路径 / ID / 接口对齐）在本票内修复
+- [x] `.ai-dev/agent-profiles.yml` 配置 cc-glm52 profile（ark base_url，token 仅变量名）
+- [x] 从一条 intent 起步：create -> prepare -> run -> validate 四步依次跑通，无手动干预
+- [x] 实跑的 run：exit_code 0、result.json schema 合法、changed_files 全在 allowed-files 内、validate-run 输出 PASS（退出码 0）
+- [x] RUN-NNN 正确分配在 feature run 的 `runs/` 下（v0.0 feature 骨架 ↔ v0.1 run 路径集成无误）
+- [x] metadata.json 字段齐全，changed_files 与工作区实际改动一致
+- [x] token 全程不落盘（在 run 目录内 grep 不到 token 值）
+- [x] 集成暴露的接缝问题（路径 / ID / 接口对齐）在本票内修复
