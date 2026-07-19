@@ -12,6 +12,7 @@ from pathlib import Path
 AI_DEV_DIR = ".ai-dev"
 FEATURES_DIR = "features"
 AGENT_PROFILES_FILE = "agent-profiles.yml"
+RUNS_DIR = "runs"
 
 
 def ai_dev_root(repo_root: Path) -> Path:
@@ -32,3 +33,18 @@ def features_dir(repo_root: Path) -> Path:
 def feature_dir(repo_root: Path, feature_id: str) -> Path:
     """``<repo_root>/.ai-dev/features/<feature_id>``."""
     return features_dir(repo_root) / feature_id
+
+
+def runs_dir(repo_root: Path, feature_id: str) -> Path:
+    """``<repo_root>/.ai-dev/features/<feature_id>/runs`` (§6 skeleton, §12.1).
+
+    One ``RUN-NNN`` directory per agent invocation lives beneath this; the v0.0
+    ``create-feature-run`` seeds it empty, and the v0.1 ``prepare-run`` command
+    fills it one run at a time.
+    """
+    return feature_dir(repo_root, feature_id) / RUNS_DIR
+
+
+def run_dir(repo_root: Path, feature_id: str, run_id: str) -> Path:
+    """``<repo_root>/.ai-dev/features/<feature_id>/runs/<run_id>`` (§12.1)."""
+    return runs_dir(repo_root, feature_id) / run_id

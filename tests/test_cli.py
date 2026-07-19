@@ -246,3 +246,151 @@ class TestCliShowProfile:
         # No Python traceback leaks to the user.
         assert "Traceback" not in err
 
+
+class TestCliPrepareRun:
+    """``ai-dev prepare-run`` - the v0.1 run-scaffold entry (§12, ticket 02).
+
+    Allocates RUN-NNN under the feature run's ``runs/`` and writes the §12.2
+    input package. Exits non-zero when the feature run is missing or
+    ``--role`` / ``--task`` is omitted (argparse) or empty (§24.2 fail loud).
+    """
+
+    def test_prints_run_id_and_returns_zero(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        code = main(
+            [
+                "prepare-run",
+                "FEATURE-001",
+                "--role",
+                "Implementer",
+                "--task",
+                "Create workspace/hello.py.",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+
+        assert code == 0
+        assert "RUN-001" in capsys.readouterr().out
+        # The input package landed on disk under the feature's runs/.
+        pkg = (
+            repo_root
+            / ".ai-dev"
+            / "features"
+            / "FEATURE-001"
+            / "runs"
+            / "RUN-001"
+            / "input"
+        )
+        assert (pkg / "system.md").is_file()
+        assert (pkg / "output-schema.json").is_file()
+
+    def test_two_invocations_increment(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        main(
+            [
+                "prepare-run",
+                "FEATURE-001",
+                "--role",
+                "Implementer",
+                "--task",
+                "first",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+        capsys.readouterr()  # drain
+        code = main(
+            [
+                "prepare-run",
+                "FEATURE-001",
+                "--role",
+                "Reviewer",
+                "--task",
+                "second",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+
+        assert code == 0
+        assert "RUN-002" in capsys.readouterr().out
+
+    def test_missing_feature_exits_nonzero(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(
+            [
+                "prepare-run",
+                "FEATURE-999",
+                "--role",
+                "Implementer",
+                "--task",
+                "anything",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+
+        assert code == 1
+        assert "FEATURE-999" in capsys.readouterr().err
+
+    def test_missing_role_rejected_by_argparse(self, repo_root: Path) -> None:
+        # argparse rejects a missing required --role with exit code 2 before any
+        # state is touched.
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        with pytest.raises(SystemExit) as exc:
+            main(
+                [
+                    "prepare-run",
+                    "FEATURE-001",
+                    "--task",
+                    "something",
+                    "--repo-root",
+                    str(repo_root),
+                ]
+            )
+        assert exc.value.code == 2
+
+    def test_missing_task_rejected_by_argparse(self, repo_root: Path) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        with pytest.raises(SystemExit) as exc:
+            main(
+                [
+                    "prepare-run",
+                    "FEATURE-001",
+                    "--role",
+                    "Implementer",
+                    "--repo-root",
+                    str(repo_root),
+                ]
+            )
+        assert exc.value.code == 2
+
+    def test_default_repo_root_is_cwd(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # create + prepare against the cwd, with no --repo-root on either.
+        monkeypatch.chdir(tmp_path)
+        main(["create-feature-run", INTENT])
+        code = main(
+            ["prepare-run", "FEATURE-001", "--role", "Implementer", "--task", "x"]
+        )
+
+        assert code == 0
+        assert "RUN-001" in capsys.readouterr().out
+        assert (
+            tmp_path / ".ai-dev" / "features" / "FEATURE-001" / "runs" / "RUN-001"
+        ).is_dir()
+

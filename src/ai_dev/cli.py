@@ -17,6 +17,12 @@ v0.1 additions:
   (§10.2, invariant #11). Exits non-zero when the profile is missing or its
   token source is unset (§24.2 fail loud).
 
+* ``ai-dev prepare-run <FEATURE> --role <role> --task <task>`` (run-adapter
+  ticket 02) - allocate ``RUN-NNN`` under the feature run's ``runs/`` and write
+  the §12.2 input package. The run id is minted by the deterministic stable-id
+  allocator (no model involvement), and printed to stdout. Exits non-zero when
+  the feature run is missing or ``--role`` / ``--task`` is empty (§24.2).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -36,6 +42,7 @@ from ai_dev.profiles import (
     render_profile,
     token_source_var,
 )
+from ai_dev.run_prepare import prepare_run
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
 
 
@@ -82,6 +89,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/agent-profiles.yml (default: current dir).",
+    )
+
+    prepare = subparsers.add_parser(
+        "prepare-run",
+        help="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
+    )
+    prepare.add_argument(
+        "feature_id", help="The FEATURE-NNN id to prepare the run under."
+    )
+    prepare.add_argument(
+        "--role",
+        required=True,
+        help="The role for this run (e.g. Implementer, Reviewer, Spec-Gap).",
+    )
+    prepare.add_argument(
+        "--task",
+        required=True,
+        help="The task text for this run (written verbatim into task-package.md).",
+    )
+    prepare.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
     )
 
     return parser
@@ -142,6 +172,24 @@ def _run_show_profile(repo_root: Path, name: str) -> int:
     return 0
 
 
+def _run_prepare_run(
+    repo_root: Path, feature_id: str, role: str, task: str
+) -> int:
+    """Allocate RUN-NNN and scaffold its input package (§12); print the run id.
+
+    Returns ``0`` on success, ``1`` if the feature run is missing or
+    ``role`` / ``task`` is empty (§24.2 fail loud) - both surface as a clean
+    ``ValueError`` message rather than a traceback.
+    """
+    try:
+        run_id = prepare_run(repo_root, feature_id, role, task)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(run_id)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -157,6 +205,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "show-profile":
         return _run_show_profile(Path(args.repo_root), args.name)
+
+    if args.command == "prepare-run":
+        return _run_prepare_run(
+            Path(args.repo_root), args.feature_id, args.role, args.task
+        )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get
     # here (required=True). error() is NoReturn, so this ends the function.
