@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-dev"
+version = "0.0.1"
+description = "Multi-Agent Profile orchestrator — Git/filesystem SDD loop (v0 walking skeleton)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "fun-mxy" }]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "mypy>=1.10",
+    "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+# Console entry: `ai-dev create-feature-run "<intent>"`
+ai-dev = "ai_dev.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# src layout: let tests import the package without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+packages = ["ai_dev"]
+mypy_path = "src"
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Keep the v0 skeleton honest without forcing heavy annotations everywhere yet.
+disallow_untyped_defs = true

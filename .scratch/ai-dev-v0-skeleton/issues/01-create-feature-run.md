@@ -6,8 +6,8 @@
 
 **Status:** ready-for-agent
 
-- [ ] 给定一段 intent 文本，命令在 `.ai-dev/features/` 下创建新目录并分配递增的 `FEATURE-NNN` 编号
-- [ ] 目录结构符合 §6：含 `00-intent.md`（记录 intent）、`status/feature-status.yml`、空的 `lanes/ runs/ issues/ decisions/ projections/`、`final-report.md` 与 `final-report.json` 占位
-- [ ] `status/feature-status.yml` 初始为 `status: planning`、`frozen_artifacts` 四项全 false、`current_gate: requirements_gate`（§8.3）
-- [ ] `audit.log.md` 写入第一条 create 记录
-- [ ] 连续创建两个 feature run，编号分别为 FEATURE-001、FEATURE-002
+- [x] 给定一段 intent 文本，命令在 `.ai-dev/features/` 下创建新目录并分配递增的 `FEATURE-NNN` 编号
+- [x] 目录结构符合 §6：含 `00-intent.md`（记录 intent）、`status/feature-status.yml`、空的 `lanes/ runs/ issues/ decisions/ projections/`、`final-report.md` 与 `final-report.json` 占位
+- [x] `status/feature-status.yml` 初始为 `status: planning`、`frozen_artifacts` 四项全 false、`current_gate: requirements_gate`（§8.3）
+- [x] `audit.log.md` 写入第一条 create 记录
+- [x] 连续创建两个 feature run，编号分别为 FEATURE-001、FEATURE-002
