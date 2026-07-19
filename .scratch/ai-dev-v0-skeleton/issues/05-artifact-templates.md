@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] 提供四个 artifact 的模板（requirements / design 各 md + json，tasks md，lane-graph yml）
-- [ ] 模板含 stable-ID 占位与 frozen 标记字段
-- [ ] `04-lane-graph.yml` 含单 lane MVP 默认（id: LANE-001，§7.5 形态）
-- [ ] 新建 feature run（01）时种子化四个模板
-- [ ] 模板产物 schema 合法（json/yaml 可解析、必填字段齐）
-- [ ] lane-graph 中的 LANE-001 引用 03 分配的 ID
+- [x] 提供四个 artifact 的模板（requirements / design 各 md + json，tasks md，lane-graph yml）
+- [x] 模板含 stable-ID 占位与 frozen 标记字段
+- [x] `04-lane-graph.yml` 含单 lane MVP 默认（id: LANE-001，§7.5 形态）
+- [x] 新建 feature run（01）时种子化四个模板
+- [x] 模板产物 schema 合法（json/yaml 可解析、必填字段齐）
+- [x] lane-graph 中的 LANE-001 引用 03 分配的 ID
