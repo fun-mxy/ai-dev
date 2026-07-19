@@ -695,17 +695,35 @@ Token 值来自：
 
 ### 10.3 Env 隔离
 
-Wrapper 必须显式设置 profile env。
+Wrapper 必须显式设置 profile env，并**剥离父进程的 Claude Code 身份变量**，避免子 `claude` 继承父会话或错误模型别名。
 
-尤其调用 Claude Code 第三方后端时，需要控制：
+**注入**（export）：
 
 ```bash
-ANTHROPIC_BASE_URL
-ANTHROPIC_AUTH_TOKEN
-ANTHROPIC_MODEL
+ANTHROPIC_BASE_URL    # ← profile.base_url
+ANTHROPIC_AUTH_TOKEN  # ← ${auth_env} 或 ${auth_env_fallback}（见 §10.1）
+ANTHROPIC_MODEL       # ← profile.model / extra_env
 ```
 
-并避免嵌套 Claude Code 继承错误环境。
+**剥离**（unset）：编排器自身若也跑在 Claude Code 内，父 shell 会暴露下列身份/别名变量；子进程继承会导致串会话或回退到非 GLM 别名。注入前必须清掉：
+
+```bash
+CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT \
+  CLAUDE_CODE_EXECPATH CLAUDECODE AI_AGENT CLAUDE_EFFORT \
+  ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL_NAME \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME \
+  ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL_NAME \
+  ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL_NAME \
+  ANTHROPIC_REASONING_MODEL IMG_BASE_URL
+```
+
+等价地，profile 可声明剥离正则，wrapper 据此 unset 所有匹配变量（替代或补充上面的显式列表）：
+
+```yaml
+env_strip_pattern: "^(CLAUDE_CODE_|CLAUDECODE$|AI_AGENT$|CLAUDE_EFFORT$|ANTHROPIC_DEFAULT_|ANTHROPIC_REASONING_MODEL$|IMG_BASE_URL$)"
+```
+
+> 实测（cc-glm52 prototype）：注入前 unset 上述变量、再 export 三个 ANTHROPIC 变量后，子进程 env 快照仅含这三个目标变量，`init` 事件的 `session_id` 为全新会话——证明无父会话继承。
 
 ---
 
