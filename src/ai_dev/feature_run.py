@@ -7,7 +7,10 @@ seeds the final-report placeholders, and appends a ``create`` audit record.
 
 This is deliberately a thin slice — it minimally touches directory generation,
 id allocation, status, templates and audit (the five concerns tickets 02–05
-each build out for real).
+each build out for real). Ticket 05 extends it to also seed the four §7
+artifact templates: after the ``create`` record, the single MVP lane is
+allocated through ticket 03's allocator (``LANE-001``) and the templates are
+seeded with that id so the lane-graph references a real allocated id.
 """
 
 from __future__ import annotations
@@ -16,9 +19,10 @@ import json
 from pathlib import Path
 
 from ai_dev.audit import append_audit_event
-from ai_dev.feature_ids import next_feature_id
+from ai_dev.feature_ids import allocate_id, next_feature_id
 from ai_dev.paths import feature_dir
 from ai_dev.status import write_initial_feature_status
+from ai_dev.templates import seed_artifact_templates
 from ai_dev.timeutil import utc_now_iso
 
 # §6 skeleton subdirectories that start empty (ticket 01 lists them as "空的").
@@ -67,6 +71,11 @@ def _seed_empty_dirs(feature_root: Path) -> None:
 def create_feature_run(repo_root: Path, intent: str) -> str:
     """Create a new feature run for ``intent`` and return its ``FEATURE-NNN`` id.
 
+    Lays down the §6 directory skeleton, records the intent, writes the initial
+    canonical status and final-report placeholders, appends a ``create`` audit
+    record, then allocates the single MVP lane (§5.3) and seeds the four §7
+    artifact templates against it (ticket 05).
+
     Idempotent over re-invocation: each call allocates the next id from the
     directories already on disk, so consecutive calls produce FEATURE-001,
     FEATURE-002, …
@@ -84,4 +93,9 @@ def create_feature_run(repo_root: Path, intent: str) -> str:
         event="create",
         payload={"feature": feature_id},
     )
+    # §5.3 MVP: every feature run owns exactly one lane. Allocate it through
+    # ticket 03's allocator so the lane-graph references a real, persisted,
+    # audited id rather than a placeholder string (ticket 05).
+    lane_id = allocate_id(feature_root, "LANE")
+    seed_artifact_templates(feature_root, feature_id, lane_id)
     return feature_id

@@ -91,3 +91,40 @@ class TestCreateFeatureRun:
         create_feature_run(repo_root, multi)
         text = _feature_path(repo_root, "FEATURE-001", "00-intent.md").read_text()
         assert multi in text
+
+    def test_seeds_all_four_artifact_templates(self, repo_root: Path) -> None:
+        # Ticket 05: create-time seeding of the §7 templates.
+        create_feature_run(repo_root, INTENT)
+
+        for name in (
+            "01-requirements.md",
+            "01-requirements.json",
+            "02-design.md",
+            "02-design.json",
+            "03-tasks.md",
+            "04-lane-graph.yml",
+        ):
+            assert _feature_path(repo_root, "FEATURE-001", name).is_file(), name
+
+    def test_lane_graph_references_allocated_lane_id(self, repo_root: Path) -> None:
+        # Ticket 05: the lane-graph's LANE-001 is the id allocated by ticket 03,
+        # not a placeholder — the per-type counter records LANE: 1, and the audit
+        # log carries the allocate_id event.
+        create_feature_run(repo_root, INTENT)
+
+        graph = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "04-lane-graph.yml").read_text()
+        )
+        assert graph["lanes"][0]["id"] == "LANE-001"
+
+        counters = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "id-counters.yml").read_text()
+        )
+        assert counters == {"LANE": 1}
+
+        records = json.loads(
+            _feature_path(repo_root, "FEATURE-001", AUDIT_LOG_JSON).read_text()
+        )
+        # create precedes the lane allocation in audit order.
+        assert [r["event"] for r in records] == ["create", "allocate_id"]
+        assert records[1]["payload"] == {"id": "LANE-001", "type": "LANE", "seq": 1}
