@@ -33,6 +33,16 @@ v0.1 additions:
   (the §14 ``validate-run`` decides PASS/FAIL) - and ``1`` when the profile
   cannot load or the run cannot start (missing token / run directory, §24.2).
 
+* ``ai-dev validate-run <FEATURE> <RUN-ID>`` (run-adapter ticket 04) - run the
+  §14 deterministic three-check validation (schema §14.1 + file boundary §14.2
+  + frozen artifact §14.3) against a captured run and print ``VALIDATE PASS`` /
+  ``VALIDATE FAIL`` with a readable issue list. Pure and side-effect-free beyond
+  one ``validate`` audit record: it reads what ``run-headless`` wrote and judges
+  it, spawning no subprocess. Exits ``0`` on PASS, ``1`` on FAIL or when the run
+  directory is missing (§24.2 fail loud). The §14.1/§24.3 retry-once is a
+  library seam (``validate_with_retry``), not this command - the standalone
+  ``validate-run`` re-checks an already-captured run.
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -55,6 +65,7 @@ from ai_dev.profiles import (
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
+from ai_dev.validate import validate_run
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -150,6 +161,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "enforces the file boundary post-hoc, §14.2).",
     )
     run.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    validate = subparsers.add_parser(
+        "validate-run",
+        help="Run the §14 deterministic validation (schema + boundary + frozen) "
+        "on a captured run (ticket 04).",
+    )
+    validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    validate.add_argument("run_id", help="The RUN-NNN id to validate.")
+    validate.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -273,6 +297,36 @@ def _run_run_headless(
     return 0
 
 
+def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
+    """Run the §14 three checks and print VALIDATE PASS/FAIL (ticket 04).
+
+    Delegates to ``validate_run`` (pure: reads the captured artifacts, judges
+    them, appends one audit record). Prints ``VALIDATE PASS`` on a clean run and
+    ``VALIDATE FAIL`` with one readable line per issue otherwise. Returns ``0``
+    on PASS, ``1`` on FAIL - and ``1`` with an ``error:`` line when the run
+    directory is missing (§24.2 fail loud), so a missing run is distinguishable
+    from a failed run in the message even though both exit ``1`` (the ticket
+    fixes the exit code at 0=PASS / 1=FAIL).
+    """
+    try:
+        result = validate_run(repo_root, feature_id, run_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.passed:
+        print(
+            f"VALIDATE PASS - {run_id} (schema + boundary + frozen OK)"
+        )
+        return 0
+    print(f"VALIDATE FAIL - {run_id} ({len(result.issues)} problem(s)):")
+    for issue in result.issues:
+        line = f"  - [{issue.severity}] {issue.check}: {issue.message}"
+        if issue.path:
+            line += f" (path={issue.path})"
+        print(line)
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -303,6 +357,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.max_turns,
             args.permission_mode,
         )
+
+    if args.command == "validate-run":
+        return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get
     # here (required=True). error() is NoReturn, so this ends the function.

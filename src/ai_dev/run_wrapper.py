@@ -39,7 +39,13 @@ from pathlib import Path
 from typing import Mapping
 
 from ai_dev.audit import append_audit_event
-from ai_dev.paths import OUTPUT_DIR, WORKSPACE_DIR, feature_dir, run_dir
+from ai_dev.paths import (
+    METADATA_JSON,
+    OUTPUT_DIR,
+    WORKSPACE_DIR,
+    feature_dir,
+    run_dir,
+)
 from ai_dev.profiles import AgentProfile, token_source_var
 from ai_dev.timeutil import utc_now_iso
 
@@ -392,10 +398,10 @@ def build_prompt(run_id: str, run_dir: Path) -> str:
 
 # §12.1 run-directory subdirs. ``prepare_run`` (ticket 02) creates these; the
 # wrapper re-ensures them so it is robust to a run directory prepared by hand.
-# The dir names live in ``paths`` (shared with ``run_prepare``).
+# The dir names live in ``paths`` (shared with ``run_prepare``); the §13.2
+# metadata filename lives there too (shared with ``validate``).
 _STDOUT_LOG = "stdout.log"
 _STDERR_LOG = "stderr.log"
-_METADATA_JSON = "metadata.json"
 _ENV_SNAPSHOT = "env-snapshot.txt"
 _RUN_SETTINGS = ".run-settings.json"
 
@@ -543,7 +549,7 @@ def run_headless(
     after = snapshot_tree(run_root)
     changed_files = compute_changed_files(before, after, WRAPPER_OWNED_RE)
 
-    metadata_path = output_dir / _METADATA_JSON
+    metadata_path = output_dir / METADATA_JSON
     write_metadata(
         metadata_path,
         run_id=run_id,

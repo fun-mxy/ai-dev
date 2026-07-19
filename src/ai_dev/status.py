@@ -113,6 +113,52 @@ def _load_feature_status(feature_root: Path) -> dict[str, Any]:
     return yaml.safe_load(_feature_status_path(feature_root).read_text())
 
 
+def frozen_artifacts_status(feature_root: Path) -> Mapping[str, bool]:
+    """Return the ``frozen_artifacts`` map read from ``feature-status.yml``.
+
+    Maps each §4.2 artifact name (``requirements`` / ``design`` / ``tasks`` /
+    ``lane_graph``) to its frozen bool - the read-side complement to
+    ``freeze_artifact``. Used by the §14.3 frozen-artifact validator (ticket 04)
+    to decide whether touching a given artifact is a violation: only *frozen*
+    artifacts are protected (§14.3: "如果这些 artifact 已冻结，则任何直接修改都失败").
+
+    Fails loud (§24.2) if the status file is missing or malformed: a real
+    feature run always has a valid status file (``create_feature_run`` writes
+    it, ``freeze_artifact`` mutates it deterministically), so an unreadable file
+    is genuine corruption the caller must surface - not silently treat as
+    "nothing frozen", which could hide a broken run. This mirrors the sibling
+    ``_load_feature_status`` (which raises via ``read_text``) and preserves the
+    §14.3 no-false-positive guarantee: the frozen check never *asserts* a
+    violation it cannot verify - it refuses to run rather than guessing.
+    """
+    path = _feature_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"feature-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"feature-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"feature-status.yml at {path} is not a mapping (§24.2)"
+        )
+    feature = doc.get("feature")
+    if not isinstance(feature, dict):
+        raise ValueError(
+            f"feature-status.yml at {path} has no 'feature' mapping (§24.2)"
+        )
+    frozen = feature.get("frozen_artifacts")
+    if not isinstance(frozen, dict):
+        raise ValueError(
+            f"feature-status.yml at {path} has no 'frozen_artifacts' mapping (§24.2)"
+        )
+    return frozen
+
+
 def _mutate_feature_status(
     feature_root: Path,
     mutate: Any,

@@ -21,6 +21,14 @@ INPUT_DIR = "input"
 OUTPUT_DIR = "output"
 WORKSPACE_DIR = "workspace"
 
+# §13 output-contract filenames: the agent-written result (§13.1) and the
+# wrapper-written metadata (§13.2). Centralised here so the writer
+# (``run_wrapper``) and the reader (``validate``, ticket 04) share one source of
+# truth for the on-disk contract names - previously the wrapper held
+# ``metadata.json`` as a private constant and the validator re-spelled it.
+RESULT_JSON = "result.json"
+METADATA_JSON = "metadata.json"
+
 
 def ai_dev_root(repo_root: Path) -> Path:
     """``<repo_root>/.ai-dev``."""

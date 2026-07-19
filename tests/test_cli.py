@@ -6,6 +6,7 @@ subprocess; the real subprocess path is covered by the manual end-to-end run.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -582,4 +583,132 @@ class TestCliRunHeadless:
 
         assert code == 1
         assert "agent-profiles.yml" in capsys.readouterr().err
+
+
+# A schema-valid result.json for the validate-run CLI tests.
+_VALID_RESULT = {
+    "status": "proposed_done",
+    "summary": "Wrote workspace/hello.py for the run.",
+    "tasks": [
+        {"id": "TASK-001", "status": "proposed_done", "evidence": ["workspace/hello.py"]}
+    ],
+}
+
+
+def _write_run_outputs(
+    repo_root: Path, feature_id: str, run_id: str, result: object, changed_files: list[str]
+) -> None:
+    """Write a result.json + a minimal metadata.json into a prepared run dir."""
+    from ai_dev.paths import run_dir
+
+    out = run_dir(repo_root, feature_id, run_id) / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "result.json").write_text(
+        result if isinstance(result, str) else json.dumps(result, indent=2) + "\n"
+    )
+    (out / "metadata.json").write_text(
+        json.dumps({"run_id": run_id, "changed_files": changed_files}) + "\n"
+    )
+
+
+class TestCliValidateRun:
+    """``ai-dev validate-run`` - the §14 three-check entry (ticket 04).
+
+    Exercises the CLI wiring (argparse + dispatch + PASS/FAIL print) against real
+    on-disk run artifacts. ``validate_run`` itself is covered exhaustively in
+    ``test_validate.py``; here we pin the exit codes and the readable output.
+    """
+
+    @staticmethod
+    def _prepare_run(repo_root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Create FEATURE-001 + prepare RUN-001 (draining intermediate stdout)."""
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()  # drain create/prepare output
+
+    def test_validate_pass_exits_zero(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        self._prepare_run(repo_root, capsys)
+        _write_run_outputs(
+            repo_root, "FEATURE-001", "RUN-001", _VALID_RESULT,
+            ["output/result.json", "output/result.md"],
+        )
+
+        code = main([
+            "validate-run", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "VALIDATE PASS" in out
+        assert "RUN-001" in out
+
+    def test_validate_fail_schema_exits_one(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        self._prepare_run(repo_root, capsys)
+        _write_run_outputs(
+            repo_root, "FEATURE-001", "RUN-001",
+            dict(_VALID_RESULT, status="done"),  # bad enum -> schema violation
+            ["output/result.json", "output/result.md"],
+        )
+
+        code = main([
+            "validate-run", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "VALIDATE FAIL" in out
+        # Readable issue line: severity + check + message.
+        assert "[P1] schema:" in out
+
+    def test_validate_fail_boundary_exits_one(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        self._prepare_run(repo_root, capsys)
+        # workspace/hello.py is not in the seeded allowed-files -> boundary breach.
+        _write_run_outputs(
+            repo_root, "FEATURE-001", "RUN-001", _VALID_RESULT,
+            ["output/result.json", "workspace/hello.py"],
+        )
+
+        code = main([
+            "validate-run", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "VALIDATE FAIL" in out
+        assert "[P0] boundary:" in out
+        assert "workspace/hello.py" in out
+
+    def test_missing_run_dir_exits_one_with_error(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        capsys.readouterr()
+
+        code = main([
+            "validate-run", "FEATURE-001", "RUN-999", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "RUN-999" in err
+
+
 
