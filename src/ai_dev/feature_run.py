@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ai_dev.audit import append_audit_record
+from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import next_feature_id
 from ai_dev.paths import feature_dir
 from ai_dev.status import write_initial_feature_status
@@ -79,9 +79,9 @@ def create_feature_run(repo_root: Path, intent: str) -> str:
     _write_intent(feature_root, feature_id, intent)
     write_initial_feature_status(feature_root / "status", feature_id)
     _write_final_report_placeholders(feature_root, feature_id)
-    append_audit_record(
-        feature_root / "audit.log.md",
+    append_audit_event(
+        feature_root,
         event="create",
-        fields={"feature": feature_id},
+        payload={"feature": feature_id},
     )
     return feature_id

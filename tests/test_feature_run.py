@@ -8,10 +8,12 @@ the initial canonical status, seeds the final-report placeholders, and appends a
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
 
+from ai_dev.audit import AUDIT_LOG_JSON, AUDIT_LOG_MD
 from ai_dev.feature_run import create_feature_run
 
 INTENT = "As a user I want to export reports so I can share them."
@@ -59,16 +61,20 @@ class TestCreateFeatureRun:
         assert md.is_file()
         assert js.is_file()
         # JSON placeholder must still parse.
-        import json
-
         json.loads(js.read_text())
 
     def test_audit_logs_create_event(self, repo_root: Path) -> None:
         create_feature_run(repo_root, INTENT)
 
-        audit = _feature_path(repo_root, "FEATURE-001", "audit.log.md").read_text()
+        audit = _feature_path(repo_root, "FEATURE-001", AUDIT_LOG_MD).read_text()
         assert "create" in audit
         assert "FEATURE-001" in audit
+        # §4.4 double product: the machine-readable mirror lands alongside.
+        records = json.loads(
+            _feature_path(repo_root, "FEATURE-001", AUDIT_LOG_JSON).read_text()
+        )
+        assert records[0]["event"] == "create"
+        assert records[0]["payload"]["feature"] == "FEATURE-001"
 
     def test_second_run_gets_own_isolated_skeleton(self, repo_root: Path) -> None:
         create_feature_run(repo_root, INTENT)

@@ -358,6 +358,7 @@ Feature run 的建议目录结构：
       final-report.json
 
       audit.log.md
+      audit.log.json
 ```
 
 ---

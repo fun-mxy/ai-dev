@@ -1,42 +1,84 @@
-"""Audit log appender — v0.0 minimal slice (ticket 01).
+"""Structured audit log appender — the §2.1 traceability backbone (ticket 02).
 
-Ticket 02 will replace this with a structured, append-only, Markdown+JSON
-double-product component (§4.4). For the tracer bullet we only need to land a
-human-readable ``create`` line in ``audit.log.md``; this tiny appender is the
-seam ticket 02 swaps out.
-
-The timestamp is injectable so callers (and tests) get determinism; the default
-is the current UTC time in the spec's ISO-8601 UTC shape (cf. the
-``metadata.json`` stamp shown in §13.2 — the closest spec precedent; §13.2 does
-not itself define an audit timestamp format).
+Every canonical-state change, gate verdict, decision and run lifecycle event
+flows through ``append_audit_event`` as a timestamped ``event`` with a
+structured ``payload``; later tickets reuse this one seam. One append writes the
+§4.4 double product — ``audit.log.md`` (human) + ``audit.log.json`` (machine) —
+from a single record; the log is content append-only (entries never mutated or
+removed). The timestamp defaults to the spec's ISO-8601 UTC shape (cf. §13.2)
+and is injectable for deterministic tests.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from ai_dev.timeutil import utc_now_iso
 
+AUDIT_LOG_MD = "audit.log.md"
+AUDIT_LOG_JSON = "audit.log.json"
 
-def append_audit_record(
-    audit_path: Path,
+
+def _render_value(value: Any) -> str:
+    """Render a payload value for the markdown product.
+
+    Strings render bare (``- key: value``); any other JSON-serialisable type
+    renders as compact JSON, so the markdown stays single-line while the JSON
+    product keeps the native type (§2.1 structured records, §4.4).
+    """
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _read_records(json_path: Path) -> list[dict[str, Any]]:
+    """Load the existing JSON record array, or start empty when no file yet."""
+    if not json_path.exists():
+        return []
+    return json.loads(json_path.read_text())
+
+
+def append_audit_event(
+    audit_dir: Path,
     event: str,
-    fields: Mapping[str, str],
+    payload: Mapping[str, Any],
     *,
     timestamp: str | None = None,
 ) -> None:
-    """Append one ``event`` record to ``audit_path`` as markdown.
+    """Append one timestamped ``event`` record to the audit log in ``audit_dir``.
 
-    The file is opened in append mode so prior records are never rewritten
-    (append-only). Each record is a ``## <timestamp> · <event>`` heading
-    followed by one ``- key: value`` bullet per field, in insertion order.
+    Writes ``audit.log.md`` and ``audit.log.json`` from the same record so the
+    two stay consistent. ``payload`` values may be any JSON-serialisable type —
+    strings render bare in the markdown, other types as compact JSON, while the
+    JSON product keeps their native type.
+
+    Append-only is a content invariant: the markdown is byte-appended, and the
+    JSON array is only ever lengthened — existing records are read back verbatim
+    and a new one pushed. v0 is single-writer with no crash recovery (§23.3), so
+    the array rewrite is safe; byte-level durability/concurrency is deferred.
     """
-    stamp = timestamp if timestamp is not None else utc_now_iso()
-    lines = [f"## {stamp} · {event}", ""]
-    for key, value in fields.items():
-        lines.append(f"- {key}: {value}")
-    lines.append("")  # blank line separating records
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    md_path = audit_dir / AUDIT_LOG_MD
+    json_path = audit_dir / AUDIT_LOG_JSON
 
-    with audit_path.open("a") as f:
+    stamp = timestamp if timestamp is not None else utc_now_iso()
+    record: dict[str, Any] = {
+        "timestamp": stamp,
+        "event": event,
+        "payload": dict(payload),
+    }
+
+    lines = [f"## {stamp} · {event}", ""]
+    for key, value in payload.items():
+        lines.append(f"- {key}: {_render_value(value)}")
+    lines.append("")
+    with md_path.open("a") as f:
         f.write("\n".join(lines) + "\n")
+
+    records = _read_records(json_path)
+    records.append(record)
+    with json_path.open("w") as f:
+        json.dump(records, f, indent=2)
+        f.write("\n")
