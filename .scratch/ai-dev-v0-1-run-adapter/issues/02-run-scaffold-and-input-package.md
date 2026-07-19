@@ -6,8 +6,8 @@
 
 **Status:** ready-for-agent
 
-- [ ] 递增 RUN-NNN（复用 v0.0 分配器，重启不重复），落在 feature run 的 `runs/RUN-NNN/`
-- [ ] input package 含 §12.2 全部文件，output-schema.json 可解析、allowed-files 非空
-- [ ] system.md 含 §12.2 全局约束（不写 canonical status / 不改 frozen / 只写允许文件 / 必出 result.json）
-- [ ] 连续 prepare 两次得 RUN-001、RUN-002
-- [ ] 单测：目录结构 + input package 内容
+- [x] 递增 RUN-NNN（复用 v0.0 分配器，重启不重复），落在 feature run 的 `runs/RUN-NNN/`
+- [x] input package 含 §12.2 全部文件，output-schema.json 可解析、allowed-files 非空
+- [x] system.md 含 §12.2 全局约束（不写 canonical status / 不改 frozen / 只写允许文件 / 必出 result.json）
+- [x] 连续 prepare 两次得 RUN-001、RUN-002
+- [x] 单测：目录结构 + input package 内容
