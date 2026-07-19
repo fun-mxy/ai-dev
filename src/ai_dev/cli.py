@@ -17,11 +17,16 @@ v0.1 additions:
   (§10.2, invariant #11). Exits non-zero when the profile is missing or its
   token source is unset (§24.2 fail loud).
 
-* ``ai-dev prepare-run <FEATURE> --role <role> --task <task>`` (run-adapter
-  ticket 02) - allocate ``RUN-NNN`` under the feature run's ``runs/`` and write
-  the §12.2 input package. The run id is minted by the deterministic stable-id
-  allocator (no model involvement), and printed to stdout. Exits non-zero when
-  the feature run is missing or ``--role`` / ``--task`` is empty (§24.2).
+* ``ai-dev prepare-run <FEATURE> --role <role> --task <task> [--allowed-file PATH ...]``
+  (run-adapter ticket 02, extended by ticket 05) - allocate ``RUN-NNN`` under the
+  feature run's ``runs/`` and write the §12.2 input package. The run id is minted
+  by the deterministic stable-id allocator (no model involvement), and printed to
+  stdout. ``--allowed-file`` (repeatable) declares the task-specific RUN-relative
+  paths the run may write, appended to the mandatory-output seed in
+  ``allowed-files.txt`` so the §14.2 boundary check passes on a real run that
+  writes workspace files (ticket 05 integration seam). Exits non-zero when the
+  feature run is missing, ``--role`` / ``--task`` is empty, or an
+  ``--allowed-file`` entry is blank (§24.2).
 
 * ``ai-dev run-headless <FEATURE> <RUN-ID> [--profile cc-glm52]`` (run-adapter
   ticket 03) - run a prepared ``RUN-NNN`` headless via a profile and capture it:
@@ -131,6 +136,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The task text for this run (written verbatim into task-package.md).",
     )
     prepare.add_argument(
+        "--allowed-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="A RUN-relative path the run may create or modify (§14.2), in "
+        "addition to output/result.json and output/result.md. Repeatable: "
+        "--allowed-file workspace/hello.py --allowed-file workspace/util.py. "
+        "Declare every task-specific workspace file so validate-run's boundary "
+        "check passes (ticket 05 integration seam).",
+    )
+    prepare.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -238,16 +254,22 @@ def _run_show_profile(repo_root: Path, name: str) -> int:
 
 
 def _run_prepare_run(
-    repo_root: Path, feature_id: str, role: str, task: str
+    repo_root: Path,
+    feature_id: str,
+    role: str,
+    task: str,
+    allowed_files: list[str],
 ) -> int:
     """Allocate RUN-NNN and scaffold its input package (§12); print the run id.
 
-    Returns ``0`` on success, ``1`` if the feature run is missing or
-    ``role`` / ``task`` is empty (§24.2 fail loud) - both surface as a clean
-    ``ValueError`` message rather than a traceback.
+    Returns ``0`` on success, ``1`` if the feature run is missing, ``role`` /
+    ``task`` is empty, or an ``allowed_files`` entry is blank (§24.2 fail loud)
+    - all surface as a clean ``ValueError`` message rather than a traceback.
     """
     try:
-        run_id = prepare_run(repo_root, feature_id, role, task)
+        run_id = prepare_run(
+            repo_root, feature_id, role, task, allowed_files=allowed_files
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -345,7 +367,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "prepare-run":
         return _run_prepare_run(
-            Path(args.repo_root), args.feature_id, args.role, args.task
+            Path(args.repo_root),
+            args.feature_id,
+            args.role,
+            args.task,
+            args.allowed_file,
         )
 
     if args.command == "run-headless":

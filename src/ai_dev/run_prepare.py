@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Sequence
 
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
@@ -119,15 +120,37 @@ _OUTPUT_SCHEMA: dict[str, object] = {
 
 # §14.2 allow-list seed: the §13.1 mandatory agent outputs (exact RUN-relative
 # paths, matching the prototype's exact-match convention). Non-empty by
-# construction; task-specific workspace files are appended by the Planner /
-# caller before the run.
-_ALLOWED_FILES_MD = """\
-# Agent may ONLY create or modify these paths (relative to the RUN directory).
-# Anything else is a file-boundary violation (spec §14.2).
-# Task-specific workspace files must be added here before the run.
-output/result.json
-output/result.md
-"""
+# construction. Task-specific workspace files are NOT in the seed - the caller
+# declares them via ``prepare_run(..., allowed_files=...)`` (ticket 05 seam) so
+# the §14.2 boundary check passes on a run that writes workspace files.
+_ALLOWED_FILES_SEED: tuple[str, ...] = ("output/result.json", "output/result.md")
+
+# Header comment block for allowed-files.txt (the prototype's seed header).
+_ALLOWED_FILES_HEADER = (
+    "# Agent may ONLY create or modify these paths (relative to the RUN directory).\n"
+    "# Anything else is a file-boundary violation (spec §14.2).\n"
+    "# Task-specific workspace files must be added here before the run.\n"
+)
+
+
+def _allowed_files_md(extra: Sequence[str] = ()) -> str:
+    """Render ``allowed-files.txt``: the seed + caller-declared extras (sorted).
+
+    The two §13.1 mandatory outputs are always present. ``extra`` carries the
+    task-specific RUN-relative paths the Planner / caller declared for this run
+    (ticket 05 seam); they are deduped against the seed and each other, then the
+    whole list is sorted so two prepares of the same task produce byte-identical
+    output (diff-stable, matching the changed_files sort convention). Blank /
+    whitespace entries are rejected by ``prepare_run`` before reaching here.
+    """
+    combined: list[str] = list(_ALLOWED_FILES_SEED)
+    seen = set(combined)
+    for path in extra:
+        if path not in seen:
+            seen.add(path)
+            combined.append(path)
+    combined.sort()
+    return _ALLOWED_FILES_HEADER + "\n".join(combined) + "\n"
 
 
 def _role_md(role: str, run_id: str) -> str:
@@ -237,7 +260,12 @@ def _context_md(feature_id: str, run_id: str, role: str) -> str:
 
 
 def _write_input_package(
-    feature_id: str, run_id: str, role: str, task: str, input_dir: Path
+    feature_id: str,
+    run_id: str,
+    role: str,
+    task: str,
+    input_dir: Path,
+    allowed_files: Sequence[str] = (),
 ) -> None:
     """Write the six §12.2 input-package files under ``input_dir``."""
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -251,7 +279,7 @@ def _write_input_package(
     (input_dir / OUTPUT_SCHEMA_FILE).write_text(
         json.dumps(_OUTPUT_SCHEMA, indent=2, ensure_ascii=False) + "\n"
     )
-    (input_dir / ALLOWED_FILES_FILE).write_text(_ALLOWED_FILES_MD)
+    (input_dir / ALLOWED_FILES_FILE).write_text(_allowed_files_md(allowed_files))
 
     context_dir = input_dir / CONTEXT_DIR
     context_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +289,12 @@ def _write_input_package(
 
 
 def prepare_run(
-    repo_root: Path, feature_id: str, role: str, task: str
+    repo_root: Path,
+    feature_id: str,
+    role: str,
+    task: str,
+    *,
+    allowed_files: Sequence[str] = (),
 ) -> str:
     """Allocate ``RUN-NNN`` and scaffold its directory + input package.
 
@@ -272,14 +305,33 @@ def prepare_run(
     prototype. Appends a ``prepare_run`` audit record associating the run with
     its role, and returns the allocated run id.
 
+    ``allowed_files`` is the ticket-05 integration seam: the task-specific
+    RUN-relative paths (e.g. ``workspace/hello.py``) the run is permitted to
+    write, appended to the mandatory-output seed in ``allowed-files.txt``. The
+    Planner / caller declares them at prepare time so the §14.2 boundary check
+    passes on a real run that writes workspace files. Defaults to empty - the
+    ticket-02 behaviour (mandatory outputs only).
+
     Raises ``ValueError`` (§24.2 fail loud) if the feature run does not exist,
-    or if ``role`` / ``task`` is empty - and does so before allocating an id or
-    creating any directory, so a failed prepare leaves no partial run behind.
+    if ``role`` / ``task`` is empty, or if an ``allowed_files`` entry is blank -
+    and does so before allocating an id or creating any directory, so a failed
+    prepare leaves no partial run behind.
     """
     if not role:
         raise ValueError("role must be a non-empty string")
     if not task:
         raise ValueError("task must be a non-empty string")
+    # §24.2 fail loud: a blank allowed_files entry is a config error (it would
+    # imply "any path" if silently coerced to empty). Reject before allocating -
+    # same shape as the role/task checks above (typed API, trust the contract).
+    normalised_allowed: list[str] = []
+    for entry in allowed_files:
+        stripped = entry.strip()
+        if not stripped:
+            raise ValueError(
+                "allowed_files entries must be non-empty strings (§14.2)"
+            )
+        normalised_allowed.append(stripped)
 
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
@@ -296,7 +348,9 @@ def prepare_run(
     for sub in (INPUT_DIR, OUTPUT_DIR, WORKSPACE_DIR):
         (run_root / sub).mkdir(parents=True, exist_ok=True)
 
-    _write_input_package(feature_id, run_id, role, task, run_root / INPUT_DIR)
+    _write_input_package(
+        feature_id, run_id, role, task, run_root / INPUT_DIR, normalised_allowed
+    )
 
     append_audit_event(
         feature_root,

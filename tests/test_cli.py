@@ -397,6 +397,73 @@ class TestCliPrepareRun:
             tmp_path / ".ai-dev" / "features" / "FEATURE-001" / "runs" / "RUN-001"
         ).is_dir()
 
+    def test_allowed_file_flag_appends_to_allow_list(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Ticket 05 seam: --allowed-file (repeatable) declares task-specific
+        # workspace paths so validate-run's §14.2 boundary check passes on a
+        # run that writes them.
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        code = main(
+            [
+                "prepare-run",
+                "FEATURE-001",
+                "--role",
+                "Implementer",
+                "--task",
+                "Create workspace/hello.py.",
+                "--allowed-file",
+                "workspace/hello.py",
+                "--allowed-file",
+                "workspace/util.py",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+
+        assert code == 0
+        capsys.readouterr()  # drain the run id
+        allowed = (
+            repo_root
+            / ".ai-dev"
+            / "features"
+            / "FEATURE-001"
+            / "runs"
+            / "RUN-001"
+            / "input"
+            / "allowed-files.txt"
+        ).read_text()
+        assert "workspace/hello.py" in allowed
+        assert "workspace/util.py" in allowed
+        # The mandatory outputs are still present alongside the extras.
+        assert "output/result.json" in allowed
+        assert "output/result.md" in allowed
+
+    def test_blank_allowed_file_exits_nonzero(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # §24.2 fail loud: a blank --allowed-file is a config error.
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        code = main(
+            [
+                "prepare-run",
+                "FEATURE-001",
+                "--role",
+                "Implementer",
+                "--task",
+                "x",
+                "--allowed-file",
+                "   ",
+                "--repo-root",
+                str(repo_root),
+            ]
+        )
+
+        assert code == 1
+        assert "allowed_files" in capsys.readouterr().err
+
 
 class TestCliRunHeadless:
     """``ai-dev run-headless`` - the v0.1 headless-wrapper entry (§11, ticket 03).

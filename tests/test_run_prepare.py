@@ -196,6 +196,105 @@ class TestInputPackage:
         assert run_id in text
 
 
+class TestAllowedFilesSeam:
+    """Task-specific workspace files must be declarable (ticket 05 integration seam).
+
+    ``prepare_run`` seeds ``allowed-files.txt`` with the two §13.1 mandatory
+    outputs only. A real Implementer run also writes workspace files, and
+    §14.2's boundary check rejects any changed file not on the allow-list - so
+    without a way to declare them, every workspace-writing run fails validation.
+    The ``allowed_files`` parameter is that seam: the Planner / caller declares
+    the task's RUN-relative paths at prepare time, and they land in
+    ``allowed-files.txt`` next to the seed.
+    """
+
+    def test_default_keeps_only_mandatory_outputs(self, repo_root: Path) -> None:
+        # Backward-compatible: no allowed_files -> the ticket-02 seed unchanged.
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(repo_root, feature_id, ROLE, TASK)
+
+        entries = _read_allowed_files(
+            _input_dir(repo_root, feature_id, run_id) / ALLOWED_FILES_FILE
+        )
+        assert entries == ["output/result.json", "output/result.md"]
+
+    def test_extra_files_appended_to_seed(self, repo_root: Path) -> None:
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(
+            repo_root,
+            feature_id,
+            ROLE,
+            TASK,
+            allowed_files=["workspace/hello.py"],
+        )
+
+        entries = _read_allowed_files(
+            _input_dir(repo_root, feature_id, run_id) / ALLOWED_FILES_FILE
+        )
+        assert "workspace/hello.py" in entries
+        # The mandatory outputs are still present.
+        assert "output/result.json" in entries
+        assert "output/result.md" in entries
+
+    def test_extra_files_sorted_for_diff_stable_output(
+        self, repo_root: Path
+    ) -> None:
+        # Multiple extras land in deterministic (sorted) order so two prepares
+        # of the same task produce byte-identical allowed-files.txt.
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(
+            repo_root,
+            feature_id,
+            ROLE,
+            TASK,
+            allowed_files=["workspace/zeta.py", "workspace/alpha.py"],
+        )
+
+        entries = _read_allowed_files(
+            _input_dir(repo_root, feature_id, run_id) / ALLOWED_FILES_FILE
+        )
+        # Seed first (already sorted), then extras sorted.
+        assert entries == [
+            "output/result.json",
+            "output/result.md",
+            "workspace/alpha.py",
+            "workspace/zeta.py",
+        ]
+
+    def test_duplicate_extras_deduped(self, repo_root: Path) -> None:
+        # A caller re-declaring a seed path (or the same extra twice) must not
+        # duplicate the line - §14.2 reads a set, but the file should stay clean.
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(
+            repo_root,
+            feature_id,
+            ROLE,
+            TASK,
+            allowed_files=["workspace/hello.py", "workspace/hello.py",
+                           "output/result.json"],
+        )
+
+        entries = _read_allowed_files(
+            _input_dir(repo_root, feature_id, run_id) / ALLOWED_FILES_FILE
+        )
+        assert entries.count("workspace/hello.py") == 1
+        assert entries.count("output/result.json") == 1
+
+    def test_empty_allowed_file_entry_rejected(self, repo_root: Path) -> None:
+        # §24.2 fail loud: a blank/whitespace entry is a config error, not a
+        # silent no-op (it would imply "any path" if mis-parsed).
+        feature_id = _make_feature(repo_root)
+
+        with pytest.raises(ValueError, match="allowed_files"):
+            prepare_run(
+                repo_root, feature_id, ROLE, TASK, allowed_files=["   "]
+            )
+
+
 class TestRunIdAllocation:
     """RUN-NNN via the v0.0 allocator: monotonic, restart-safe, counter-persisted."""
 
