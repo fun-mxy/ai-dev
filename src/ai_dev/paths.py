@@ -11,11 +11,17 @@ from pathlib import Path
 
 AI_DEV_DIR = ".ai-dev"
 FEATURES_DIR = "features"
+AGENT_PROFILES_FILE = "agent-profiles.yml"
 
 
 def ai_dev_root(repo_root: Path) -> Path:
     """``<repo_root>/.ai-dev``."""
     return repo_root / AI_DEV_DIR
+
+
+def agent_profiles_path(repo_root: Path) -> Path:
+    """``<repo_root>/.ai-dev/agent-profiles.yml`` - the §10.1 profile registry."""
+    return ai_dev_root(repo_root) / AGENT_PROFILES_FILE
 
 
 def features_dir(repo_root: Path) -> Path:

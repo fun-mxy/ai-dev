@@ -7,6 +7,7 @@ subprocess; the real subprocess path is covered by the manual end-to-end run.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import pytest
 import yaml
@@ -108,4 +109,140 @@ class TestCliFreeze:
         with pytest.raises(SystemExit) as exc:
             main(["freeze", "FEATURE-001", "bogus", "--repo-root", str(repo_root)])
         assert exc.value.code == 2
+
+
+class TestCliShowProfile:
+    """``ai-dev show-profile`` - the v0.1 run-adapter profile inspector (§10).
+
+    Prints the resolved profile with the token value redacted (source name +
+    set/unset only); exits non-zero when the profile is missing or its token
+    source is unset (§24.2 fail loud). The canonical profile shape comes from the
+    shared ``write_profiles`` fixture (conftest), so the CLI tests exercise the
+    same env_strip_pattern / multi-entry extra_env the module tests do.
+    """
+
+    def test_prints_resolved_profile_and_returns_zero_when_token_set(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "live-token-value")
+
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "profile: cc-glm52" in out
+        assert "cli: claude" in out
+        assert "auth_env: CC_GLM52_TOKEN" in out
+        assert "token_source: CC_GLM52_TOKEN" in out
+        assert "token_set: true" in out
+
+    def test_fallback_token_set_returns_zero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # auth_env unset -> the fallback source satisfies the token requirement.
+        write_profiles(repo_root)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "fallback-token-value")
+
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "token_source: ANTHROPIC_AUTH_TOKEN" in out
+        assert "token_set: true" in out
+
+    def test_token_value_redacted_in_all_output(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # §10.2 / invariant #11: the token value must not appear in stdout or
+        # stderr under any branch. A distinctive sentinel makes a leak visible.
+        sentinel = "tok-CLI-LEAK-CHECK-7d2a9f"
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+
+        main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+        captured_set = capsys.readouterr()
+
+        monkeypatch.setenv("CC_GLM52_TOKEN", "")  # force unset path
+        main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+        captured_unset = capsys.readouterr()
+
+        assert sentinel not in captured_set.out
+        assert sentinel not in captured_set.err
+        assert sentinel not in captured_unset.out
+        assert sentinel not in captured_unset.err
+
+    def test_missing_token_source_exits_nonzero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # §24.2: profile is valid config but its token source is unset - the
+        # command still prints the profile, then signals non-readiness.
+        write_profiles(repo_root)
+
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 1
+        out = capsys.readouterr()
+        assert "token_set: false" in out.out
+        assert "token source not set" in out.err
+
+    def test_missing_profile_exits_nonzero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        write_profiles(repo_root)
+
+        code = main(["show-profile", "no-such-profile", "--repo-root", str(repo_root)])
+
+        assert code == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_missing_profiles_file_exits_nonzero(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # No .ai-dev/agent-profiles.yml at all -> fail loud (§24.2), not a
+        # default/empty profile.
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 1
+        assert "agent-profiles.yml" in capsys.readouterr().err
+
+    def test_malformed_yaml_exits_nonzero_with_clean_error(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # §24.2: a corrupt registry surfaces a ProfileError message (not a raw
+        # yaml traceback) and exits non-zero.
+        write_profiles(repo_root, "agent_profiles: {")
+
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "not valid YAML" in err
+        # No Python traceback leaks to the user.
+        assert "Traceback" not in err
 

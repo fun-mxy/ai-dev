@@ -9,6 +9,14 @@ v0.0 surface:
   ``status.freeze_artifact``), no model ever writes canonical freeze state
   (§4.3 cardinal rule).
 
+v0.1 additions:
+
+* ``ai-dev show-profile <name>`` (run-adapter ticket 01) - load and display a
+  resolved agent profile (§10.1). The token value is never printed: the output
+  carries the source/target variable *names* plus a redacted placeholder
+  (§10.2, invariant #11). Exits non-zero when the profile is missing or its
+  token source is unset (§24.2 fail loud).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -22,6 +30,12 @@ from typing import Sequence
 
 from ai_dev.feature_run import create_feature_run
 from ai_dev.paths import feature_dir
+from ai_dev.profiles import (
+    ProfileError,
+    load_profile,
+    render_profile,
+    token_source_var,
+)
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
 
 
@@ -59,6 +73,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Repository root holding .ai-dev/ (default: current directory).",
     )
 
+    show = subparsers.add_parser(
+        "show-profile",
+        help="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
+    )
+    show.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
+    show.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/agent-profiles.yml (default: current dir).",
+    )
+
     return parser
 
 
@@ -86,6 +111,37 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
     return 0
 
 
+def _run_show_profile(repo_root: Path, name: str) -> int:
+    """Load and display a resolved profile (§10.1); fail loud on missing
+    profile or missing token source (§24.2).
+
+    Prints the profile config and token-source status to stdout. The token
+    *value* is never printed - ``render_profile`` takes only the source NAME
+    (§10.2, invariant #11). Returns ``0`` when the profile loads and its token
+    source is set; ``1`` if the profile/file is missing or the token source is
+    unset (the latter still prints the profile so the operator can see what is
+    configured, then signals non-readiness via the exit code).
+    """
+    try:
+        profile = load_profile(repo_root, name)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    source = token_source_var(profile)
+    print(render_profile(profile, source))
+
+    if source is None:
+        print(
+            f"error: token source not set for profile {name!r} "
+            f"({profile.token_source_description()} is unset); "
+            f"set it before running (§24.2)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -98,6 +154,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "freeze":
         return _run_freeze(Path(args.repo_root), args.feature_id, args.artifact)
+
+    if args.command == "show-profile":
+        return _run_show_profile(Path(args.repo_root), args.name)
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get
     # here (required=True). error() is NoReturn, so this ends the function.
