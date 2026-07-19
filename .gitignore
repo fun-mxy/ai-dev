@@ -1,0 +1,13 @@
+# Secrets — never commit local credentials
+.claude/settings.local.json
+
+# Throwaway adapter prototype (de-risk artifact). Kept on disk as a v0.1
+# reference, NOT project code — see prototype/adapter/run.sh header "Do NOT promote".
+prototype/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
