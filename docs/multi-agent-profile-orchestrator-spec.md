@@ -958,6 +958,10 @@ output/metadata.json
 - 是否触碰 exclusive files；
 - 是否修改 forbidden files。
 
+**"changed files" 的定义**：仅指 repo 工作区文件（feature run 目录及 `allowed-files.txt` 覆盖范围）。Claude Code 自身的 harness 状态——会话 transcript、memory 目录，写在 `~/.claude/projects/<cwd-encoded>/`——属于 **out-of-band harness 态**，不在 repo 内，不计入边界检查，也不视为违规。Prototype 的 `metadata.json.changed_files` 即按此语义（RUN 目录 mtime diff）计算，天然只含 repo 文件。
+
+**额外卫生**：wrapper 通过 `--settings` 传入关闭 auto-memory 的配置，把 out-of-band 写入降到只剩 session transcript（`--bare` 能进一步抑制但强制 `ANTHROPIC_API_KEY` 鉴权，与第三方 token 方式不兼容，v0 不用）。
+
 失败：run `failed`，进入 Human Triage。
 
 ### 14.3 Frozen Artifact Validation
