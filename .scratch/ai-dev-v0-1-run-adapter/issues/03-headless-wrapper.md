@@ -8,10 +8,10 @@
 
 **Status:** ready-for-agent
 
-- [ ] §10.3：注入 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL，剥离父 CC 身份/别名变量；子进程 env 快照仅含目标变量（值脱敏）
-- [ ] §11.1：headless 调用含全部硬性 flag（含 `--verbose`）
-- [ ] §13.1：产出 output/result.{md,json}（agent 写）+ output/{stdout.log,stderr.log,metadata.json}（wrapper 写）
-- [ ] §13.2：metadata.json 字段齐全；changed_files 仅含 repo 工作区文件（扣除 wrapper 自有产物；CC harness 态 out-of-band 不计，§14.2）
-- [ ] §14.2 卫生：`--settings` 关闭 auto-memory
-- [ ] 实跑一次 cc-glm52（ark）run，exit_code 与 result.json 一致；token 不落盘
-- [ ] 单测：env 隔离、changed_files 计算、metadata 字段
+- [x] §10.3：注入 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL，剥离父 CC 身份/别名变量；子进程 env 快照仅含目标变量（值脱敏）
+- [x] §11.1：headless 调用含全部硬性 flag（含 `--verbose`）
+- [x] §13.1：产出 output/result.{md,json}（agent 写）+ output/{stdout.log,stderr.log,metadata.json}（wrapper 写）
+- [x] §13.2：metadata.json 字段齐全；changed_files 仅含 repo 工作区文件（扣除 wrapper 自有产物；CC harness 态 out-of-band 不计，§14.2）
+- [x] §14.2 卫生：`--settings` 关闭 auto-memory
+- [x] 实跑一次 cc-glm52（ark）run，exit_code 与 result.json 一致；token 不落盘
+- [x] 单测：env 隔离、changed_files 计算、metadata 字段
