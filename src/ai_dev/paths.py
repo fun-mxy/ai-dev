@@ -14,6 +14,13 @@ FEATURES_DIR = "features"
 AGENT_PROFILES_FILE = "agent-profiles.yml"
 RUNS_DIR = "runs"
 
+# §12.1 run-directory subdirectories. Shared by ``run_prepare`` (creates them)
+# and ``run_wrapper`` (writes capture artifacts / reads the workspace) so the
+# on-disk layout has one source of truth.
+INPUT_DIR = "input"
+OUTPUT_DIR = "output"
+WORKSPACE_DIR = "workspace"
+
 
 def ai_dev_root(repo_root: Path) -> Path:
     """``<repo_root>/.ai-dev``."""

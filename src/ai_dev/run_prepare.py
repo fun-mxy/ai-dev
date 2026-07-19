@@ -36,7 +36,7 @@ from pathlib import Path
 
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
-from ai_dev.paths import feature_dir, run_dir
+from ai_dev.paths import INPUT_DIR, OUTPUT_DIR, WORKSPACE_DIR, feature_dir, run_dir
 
 # §12.2 input-package file names (public so tests / later tickets reference one
 # source of truth for the on-disk layout).
@@ -49,11 +49,9 @@ CONTEXT_DIR = "context"
 
 # §12.1 run-directory subdirectories. §12.1 lists input/run.sh/output; the
 # ticket and the prototype add workspace/ (where the agent does its task work),
-# and run.sh is the wrapper's concern (ticket 03), not the prepare seam.
-_INPUT_DIR = "input"
-_OUTPUT_DIR = "output"
-_WORKSPACE_DIR = "workspace"
-
+# and run.sh is the wrapper's concern (ticket 03), not the prepare seam. The
+# dir names live in ``paths`` (shared with ``run_wrapper``) so the layout has
+# one source of truth.
 _PREPARE_EVENT = "prepare_run"
 
 # §12.2 global constraints, as the agent-facing system prompt. Every §12.2
@@ -295,10 +293,10 @@ def prepare_run(
     run_id = allocate_id(feature_root, "RUN")
     run_root = run_dir(repo_root, feature_id, run_id)
 
-    for sub in (_INPUT_DIR, _OUTPUT_DIR, _WORKSPACE_DIR):
+    for sub in (INPUT_DIR, OUTPUT_DIR, WORKSPACE_DIR):
         (run_root / sub).mkdir(parents=True, exist_ok=True)
 
-    _write_input_package(feature_id, run_id, role, task, run_root / _INPUT_DIR)
+    _write_input_package(feature_id, run_id, role, task, run_root / INPUT_DIR)
 
     append_audit_event(
         feature_root,

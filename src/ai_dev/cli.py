@@ -23,6 +23,16 @@ v0.1 additions:
   allocator (no model involvement), and printed to stdout. Exits non-zero when
   the feature run is missing or ``--role`` / ``--task`` is empty (§24.2).
 
+* ``ai-dev run-headless <FEATURE> <RUN-ID> [--profile cc-glm52]`` (run-adapter
+  ticket 03) - run a prepared ``RUN-NNN`` headless via a profile and capture it:
+  isolate the child env (§10.3), invoke ``claude -p`` with the §11.1 hard flags,
+  capture stdout/stderr, compute ``changed_files`` (§13.2), and write
+  ``metadata.json``. The token is read from the environment by source name and
+  never persisted (§10.2). Exits ``0`` on a successful capture - including a
+  non-zero claude exit, which is a captured run failure, not a wrapper failure
+  (the §14 ``validate-run`` decides PASS/FAIL) - and ``1`` when the profile
+  cannot load or the run cannot start (missing token / run directory, §24.2).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -43,6 +53,7 @@ from ai_dev.profiles import (
     token_source_var,
 )
 from ai_dev.run_prepare import prepare_run
+from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
 
 
@@ -109,6 +120,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The task text for this run (written verbatim into task-package.md).",
     )
     prepare.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    run = subparsers.add_parser(
+        "run-headless",
+        help="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
+    )
+    run.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    run.add_argument("run_id", help="The RUN-NNN id to invoke.")
+    run.add_argument(
+        "--profile",
+        default="cc-glm52",
+        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
+        "profile, §23.4).",
+    )
+    run.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    run.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+    run.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -190,6 +231,48 @@ def _run_prepare_run(
     return 0
 
 
+def _run_run_headless(
+    repo_root: Path,
+    feature_id: str,
+    run_id: str,
+    profile_name: str,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run a prepared RUN-NNN headless via a profile and capture it (§11/§13).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_headless`` (env isolation, invocation, capture, metadata), and prints a
+    one-line summary. Returns ``0`` on a successful *capture* - including when
+    the claude subprocess itself exited non-zero, since a captured run failure is
+    not a wrapper failure (the §14 ``validate-run`` decides PASS/FAIL). Returns
+    ``1`` when the profile cannot load or the run cannot start (missing token /
+    run directory), surfacing the message rather than a traceback.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        result = run_headless(
+            repo_root,
+            feature_id,
+            run_id,
+            profile,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"{result.run_id}: profile={result.profile} exit_code={result.exit_code} "
+        f"changed_files={len(result.changed_files)}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -209,6 +292,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "prepare-run":
         return _run_prepare_run(
             Path(args.repo_root), args.feature_id, args.role, args.task
+        )
+
+    if args.command == "run-headless":
+        return _run_run_headless(
+            Path(args.repo_root),
+            args.feature_id,
+            args.run_id,
+            args.profile,
+            args.max_turns,
+            args.permission_mode,
         )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get

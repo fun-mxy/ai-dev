@@ -13,6 +13,8 @@ import pytest
 import yaml
 
 from ai_dev.cli import main
+from ai_dev.profiles import AgentProfile
+from ai_dev.run_wrapper import RunResult
 
 INTENT = "export reports for sharing"
 
@@ -393,4 +395,191 @@ class TestCliPrepareRun:
         assert (
             tmp_path / ".ai-dev" / "features" / "FEATURE-001" / "runs" / "RUN-001"
         ).is_dir()
+
+
+class TestCliRunHeadless:
+    """``ai-dev run-headless`` - the v0.1 headless-wrapper entry (§11, ticket 03).
+
+    Exercises the CLI wiring (argparse + dispatch + summary print) without
+    spawning the real ``claude`` subprocess: ``run_headless`` is monkeypatched
+    to a stub returning a fixed ``RunResult``, matching the convention that the
+    real subprocess path is covered by the manual end-to-end run. Error paths
+    (missing profile / token / run dir) fail loud with a non-zero exit (§24.2).
+    """
+
+    def _stub_result(self, repo_root: Path, exit_code: int = 0) -> RunResult:
+        run_root = repo_root / ".ai-dev" / "features" / "FEATURE-001" / "runs" / "RUN-001"
+        return RunResult(
+            run_id="RUN-001",
+            feature_id="FEATURE-001",
+            profile="cc-glm52",
+            exit_code=exit_code,
+            changed_files=["output/result.json", "output/result.md"],
+            started_at="2026-07-19T10:00:00Z",
+            ended_at="2026-07-19T10:00:05Z",
+            stdout_path=run_root / "output" / "stdout.log",
+            stderr_path=run_root / "output" / "stderr.log",
+            metadata_path=run_root / "output" / "metadata.json",
+        )
+
+    def test_prints_summary_and_returns_zero_on_capture(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A captured run (claude exited 0) prints a summary and exits 0. The
+        # wrapper captures; consistency with result.json is ticket 04's call.
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok")
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()  # drain prepare-run output
+        captured = {"called": False}
+
+        def _fake_run_headless(*args: object, **kwargs: object) -> RunResult:
+            captured["called"] = True
+            return self._stub_result(repo_root)
+
+        monkeypatch.setattr("ai_dev.cli.run_headless", _fake_run_headless)
+
+        code = main([
+            "run-headless", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 0
+        assert captured["called"] is True
+        out = capsys.readouterr().out
+        assert "RUN-001" in out
+        assert "exit_code=0" in out
+
+    def test_returns_zero_even_when_claude_exits_nonzero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A captured claude failure is still a successful *capture* - the CLI
+        # exits 0 and surfaces the non-zero exit_code; validate-run decides
+        # PASS/FAIL. This keeps the create->prepare->run->validate chain running.
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok")
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()
+        monkeypatch.setattr(
+            "ai_dev.cli.run_headless",
+            lambda *a, **k: self._stub_result(repo_root, exit_code=2),
+        )
+
+        code = main([
+            "run-headless", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 0
+        assert "exit_code=2" in capsys.readouterr().out
+
+    def test_passes_profile_and_max_turns_to_wrapper(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # ``--profile`` and ``--max-turns`` flow through to run_headless.
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok")
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()
+        seen: dict[str, object] = {}
+
+        def _capture(
+            repo_root: Path,
+            feature_id: str,
+            run_id: str,
+            profile: AgentProfile,
+            **kwargs: object,
+        ) -> RunResult:
+            seen["feature_id"] = feature_id
+            seen["run_id"] = run_id
+            seen["profile_name"] = profile.name
+            seen.update(kwargs)
+            return self._stub_result(repo_root)
+
+        monkeypatch.setattr("ai_dev.cli.run_headless", _capture)
+
+        main([
+            "run-headless", "FEATURE-001", "RUN-001",
+            "--profile", "cc-glm52", "--max-turns", "7",
+            "--repo-root", str(repo_root),
+        ])
+
+        assert seen["max_turns"] == 7
+        assert seen["feature_id"] == "FEATURE-001"
+        assert seen["run_id"] == "RUN-001"
+        assert seen["profile_name"] == "cc-glm52"
+
+    def test_missing_token_exits_nonzero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # §24.2: token source unset -> run_headless raises ValueError -> exit 1.
+        write_profiles(repo_root)
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()
+
+        code = main([
+            "run-headless", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        assert "token" in capsys.readouterr().err
+
+    def test_missing_profile_exits_nonzero(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        write_profiles(repo_root)
+
+        code = main([
+            "run-headless", "FEATURE-001", "RUN-001",
+            "--profile", "no-such-profile", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_missing_profiles_file_exits_nonzero(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main([
+            "run-headless", "FEATURE-001", "RUN-001", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        assert "agent-profiles.yml" in capsys.readouterr().err
 
