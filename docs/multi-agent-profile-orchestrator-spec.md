@@ -630,8 +630,10 @@ agent_profiles:
   cc-glm52:
     cli: claude
     backend: glm
-    base_url: "https://<glm-anthropic-compatible-endpoint>"
-    auth_env: "CC_GLM52_TOKEN"
+    base_url: "https://api.z.ai/api/anthropic"
+    auth_env: "CC_GLM52_TOKEN"                  # 来源变量名（不变量 #11）
+    auth_env_fallback: "ANTHROPIC_AUTH_TOKEN"   # dev 回退（来源未设时）
+    auth_target: "ANTHROPIC_AUTH_TOKEN"         # wrapper 注入目标（CC 实际读取）
     model: "glm-5.2"
     invocation: headless
     extra_env:
@@ -666,6 +668,13 @@ agent_profiles:
     invocation: headless
     extra_env: {}
 ```
+
+> **认证字段语义**（补充 §10.2 的"只用变量名"规则）：
+> - `auth_env`：token 的**来源**变量名（profile 自己的 secret 名）。
+> - `auth_env_fallback`（可选）：来源未设置时的回退来源（dev 环境常为 `ANTHROPIC_AUTH_TOKEN`）。
+> - `auth_target`：wrapper 实际**注入**的目标变量——即 CLI 真正读取的那个。`cli: claude` 的第三方 Anthropic-compatible 后端读的是 `ANTHROPIC_AUTH_TOKEN`（非 `ANTHROPIC_API_KEY`）。
+>
+> Wrapper 规则：从 `${auth_env}`（未设则 `${auth_env_fallback}`）取 token，export 为 `${auth_target}`；同时把 profile `base_url` export 为 `ANTHROPIC_BASE_URL`（详见 §10.3）。这样 profile 作者只声明"secret 叫什么、CLI 读什么"，token 永不进配置文件（不变量 #11），且消解了 `CC_GLM52_TOKEN` 与 `ANTHROPIC_AUTH_TOKEN` 的偏差。
 
 ### 10.2 Secret 规则
 
