@@ -128,3 +128,88 @@ class TestCreateFeatureRun:
         # create precedes the lane allocation in audit order.
         assert [r["event"] for r in records] == ["create", "allocate_id"]
         assert records[1]["payload"] == {"id": "LANE-001", "type": "LANE", "seq": 1}
+
+
+class TestCreateFeatureRunSeedsLaneAndTaskStatus:
+    """Ticket 04: create_feature_run seeds the §8.2/§8.1 status files too.
+
+    A freshly created feature run carries the full §6 ``status/`` set —
+    ``feature-status.yml`` (ticket 01) plus ``lane-status.yml`` and
+    ``task-status.yml`` (ticket 04). The lane-status references the *same*
+    allocated ``LANE-001`` the lane-graph (ticket 05) uses, not a second id.
+    """
+
+    def test_status_dir_has_all_three_status_files(self, repo_root: Path) -> None:
+        create_feature_run(repo_root, INTENT)
+
+        status = _feature_path(repo_root, "FEATURE-001", "status")
+        for name in ("feature-status.yml", "lane-status.yml", "task-status.yml"):
+            assert (status / name).is_file(), name
+
+    def test_lane_status_references_the_allocated_lane_id(
+        self, repo_root: Path
+    ) -> None:
+        create_feature_run(repo_root, INTENT)
+
+        doc = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "status", "lane-status.yml").read_text()
+        )
+        assert list(doc["lanes"]) == ["LANE-001"]
+        assert doc["lanes"]["LANE-001"]["status"] == "pending"
+
+    def test_lane_status_reuses_lane_graphs_lane_id_not_a_second_one(
+        self, repo_root: Path
+    ) -> None:
+        # Both the lane-graph (ticket 05) and the lane-status (ticket 04) point
+        # at the same single LANE-001 allocation; the counter was bumped once.
+        create_feature_run(repo_root, INTENT)
+
+        graph = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "04-lane-graph.yml").read_text()
+        )["lanes"][0]["id"]
+        lane_status = list(
+            yaml.safe_load(
+                _feature_path(
+                    repo_root, "FEATURE-001", "status", "lane-status.yml"
+                ).read_text()
+            )["lanes"]
+        )
+        assert graph == "LANE-001"
+        assert lane_status == ["LANE-001"]
+
+        counters = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "id-counters.yml").read_text()
+        )
+        assert counters == {"LANE": 1}
+
+    def test_task_status_starts_empty(self, repo_root: Path) -> None:
+        create_feature_run(repo_root, INTENT)
+
+        doc = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "status", "task-status.yml").read_text()
+        )
+        assert doc == {"tasks": {}}
+
+    def test_lane_status_seeding_adds_no_audit_records(
+        self, repo_root: Path
+    ) -> None:
+        # lane/task writers are pure (no audit); the audit order ticket 05
+        # pins (create → allocate_id) is unchanged by ticket 04's seeding.
+        create_feature_run(repo_root, INTENT)
+
+        records = json.loads(
+            _feature_path(repo_root, "FEATURE-001", AUDIT_LOG_JSON).read_text()
+        )
+        assert [r["event"] for r in records] == ["create", "allocate_id"]
+
+    def test_each_feature_run_gets_their_own_lane_001(self, repo_root: Path) -> None:
+        # Lane ids are scoped per feature run (§5.3 single-lane v0), so both
+        # feature runs independently own a LANE-001 in their lane-status.
+        create_feature_run(repo_root, INTENT)
+        create_feature_run(repo_root, "second intent")
+
+        for fid in ("FEATURE-001", "FEATURE-002"):
+            doc = yaml.safe_load(
+                _feature_path(repo_root, fid, "status", "lane-status.yml").read_text()
+            )
+            assert list(doc["lanes"]) == ["LANE-001"]

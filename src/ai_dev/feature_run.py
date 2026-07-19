@@ -10,7 +10,11 @@ id allocation, status, templates and audit (the five concerns tickets 02–05
 each build out for real). Ticket 05 extends it to also seed the four §7
 artifact templates: after the ``create`` record, the single MVP lane is
 allocated through ticket 03's allocator (``LANE-001``) and the templates are
-seeded with that id so the lane-graph references a real allocated id.
+seeded with that id so the lane-graph references a real allocated id. Ticket 04
+extends it once more: that same allocated lane id seeds the §8.2
+``lane-status.yml`` (and the empty §8.1 ``task-status.yml``), so the full §6
+``status/`` set is present at creation and the lane-status references the same
+real id as the lane-graph.
 """
 
 from __future__ import annotations
@@ -21,7 +25,11 @@ from pathlib import Path
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id, next_feature_id
 from ai_dev.paths import feature_dir
-from ai_dev.status import write_initial_feature_status
+from ai_dev.status import (
+    write_initial_feature_status,
+    write_initial_lane_status,
+    write_initial_task_status,
+)
 from ai_dev.templates import seed_artifact_templates
 from ai_dev.timeutil import utc_now_iso
 
@@ -98,4 +106,9 @@ def create_feature_run(repo_root: Path, intent: str) -> str:
     # audited id rather than a placeholder string (ticket 05).
     lane_id = allocate_id(feature_root, "LANE")
     seed_artifact_templates(feature_root, feature_id, lane_id)
+    # Ticket 04: seed the §8.2 lane-status with that same allocated lane id and
+    # the empty §8.1 task-status, completing the §6 ``status/`` set. These are
+    # pure writers (no audit) so the audit order is unchanged: create, allocate.
+    write_initial_lane_status(feature_root / "status", lane_id)
+    write_initial_task_status(feature_root / "status")
     return feature_id

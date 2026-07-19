@@ -1,25 +1,81 @@
-"""Canonical status writer — v0.0 minimal slice (ticket 01).
+"""Canonical status writer — v0.0 (tickets 01 + 04).
 
 This module is the *only* place canonical status files are written (§4.3: models
-never write canonical state; only deterministic code does). Ticket 01 writes just
-the initial ``feature-status.yml`` for a freshly created feature run. Ticket 04
-will extend this with the freeze operation and the ``lane-status.yml`` /
-``task-status.yml`` writers; the initial-state writer here is the seed.
+never write canonical state; only deterministic code does). Ticket 01 wrote the
+initial ``feature-status.yml``; ticket 04 extends the writer with:
+
+* the freeze operation (§4.2) — flips a ``frozen_artifacts`` flag ``false → true``
+  monotonically, audited, and rejects re-freezing an already-frozen artifact;
+* ``set_current_gate`` — moves ``current_gate`` to a known §18 gate, audited;
+* the minimal §8.2 ``lane-status.yml`` (single lane) and §8.1 ``task-status.yml``
+  (empty) writers, seeded at feature-run creation.
+
+Two scopes, by design:
+
+* The **initial writers** (``write_initial_feature_status`` /
+  ``write_initial_lane_status`` / ``write_initial_task_status``) take the
+  ``status/`` directory — they write one status file and emit no audit record.
+* The **mutating operations** (``freeze_artifact``, ``set_current_gate``) take
+  the **feature-run root**, because they both rewrite ``status/feature-status.yml``
+  *and* append to the run-level audit log at the feature root — the same scope
+  as the ticket-03 ``allocate_id`` allocator. ``status_dir = feature_root/"status"``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
-FEATURE_STATUS_FILE = "feature-status.yml"
+from ai_dev.audit import append_audit_event
 
-# §18 gate order; a new feature starts at the front of the pipeline.
-_INITIAL_GATE = "requirements_gate"
+FEATURE_STATUS_FILE = "feature-status.yml"
+LANE_STATUS_FILE = "lane-status.yml"
+TASK_STATUS_FILE = "task-status.yml"
+
+# §18.1–§18.5 gates in pipeline order; a new feature starts at the head.
+GATES: tuple[str, ...] = (
+    "requirements_gate",
+    "design_gate",
+    "task_gate",
+    "lane_gate",
+    "feature_coherence_gate",
+)
+_INITIAL_GATE = GATES[0]
 # §8.3 — the four artifacts that freezing toggles, all unfrozen at creation.
-_FROZEN_ARTIFACTS = ("requirements", "design", "tasks", "lane_graph")
+# Public so the CLI's argparse ``choices`` (and future callers) share one source
+# of truth for the canonical artifact names.
+FROZEN_ARTIFACTS: tuple[str, ...] = ("requirements", "design", "tasks", "lane_graph")
+
+_FREEZE_EVENT = "freeze"
+_ADVANCE_GATE_EVENT = "advance_gate"
+
+
+class FrozenArtifactError(ValueError):
+    """An already-frozen artifact was written again (§4.2 monotonic freeze).
+
+    Freezing is one-way: once an artifact's ``frozen_artifacts`` flag is true,
+    the only sanctioned path to change the underlying artifact is a Change
+    Proposal (§4.2) — not a second call to this writer. Subclasses ``ValueError``
+    so callers may catch either.
+    """
+
+
+def _dump_yaml(path: Path, doc: dict[str, Any]) -> None:
+    """Dump ``doc`` to ``path`` with stable, human-friendly formatting.
+
+    Sorted insertion order (spec field order) + block style, so the file reads
+    identically for humans and machines across read-modify-write cycles.
+    """
+    with path.open("w") as f:
+        yaml.safe_dump(
+            doc,
+            f,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=True,
+        )
 
 
 def _initial_feature_status(feature_id: str) -> dict[str, Any]:
@@ -28,7 +84,7 @@ def _initial_feature_status(feature_id: str) -> dict[str, Any]:
         "feature": {
             "id": feature_id,
             "status": "planning",
-            "frozen_artifacts": {name: False for name in _FROZEN_ARTIFACTS},
+            "frozen_artifacts": {name: False for name in FROZEN_ARTIFACTS},
             "current_gate": _INITIAL_GATE,
             "final_verdict": None,
         }
@@ -44,12 +100,144 @@ def write_initial_feature_status(status_dir: Path, feature_id: str) -> Path:
     """
     status_dir.mkdir(parents=True, exist_ok=True)
     path = status_dir / FEATURE_STATUS_FILE
-    with path.open("w") as f:
-        yaml.safe_dump(
-            _initial_feature_status(feature_id),
-            f,
-            sort_keys=False,
-            default_flow_style=False,
-            allow_unicode=True,
+    _dump_yaml(path, _initial_feature_status(feature_id))
+    return path
+
+
+def _feature_status_path(feature_root: Path) -> Path:
+    return feature_root / "status" / FEATURE_STATUS_FILE
+
+
+def _load_feature_status(feature_root: Path) -> dict[str, Any]:
+    """Load and parse the feature-status document from the feature run root."""
+    return yaml.safe_load(_feature_status_path(feature_root).read_text())
+
+
+def _mutate_feature_status(
+    feature_root: Path,
+    mutate: Any,
+    *,
+    event: str,
+    payload: Mapping[str, Any],
+    timestamp: str | None,
+) -> None:
+    """Shared load → mutate → dump → audit spine for feature-status edits.
+
+    ``mutate`` receives the parsed ``feature`` mapping and applies the edit in
+    place; if it raises, the file is *not* rewritten and no audit record is
+    appended — so a rejected mutation (e.g. re-freezing) leaves state untouched
+    by construction, not just by convention. On a clean mutation the document is
+    flushed and the ``event``/``payload`` audit record appended.
+    """
+    doc = _load_feature_status(feature_root)
+    mutate(doc["feature"])
+    _dump_yaml(_feature_status_path(feature_root), doc)
+    append_audit_event(
+        feature_root, event=event, payload=payload, timestamp=timestamp
+    )
+
+
+def freeze_artifact(
+    feature_root: Path, artifact: str, *, timestamp: str | None = None
+) -> None:
+    """Flip ``artifact``'s frozen flag ``false → true`` and audit it (§4.2).
+
+    Reads ``status/feature-status.yml``, sets
+    ``frozen_artifacts[artifact] = True``, writes it back, and appends a
+    ``freeze`` audit record. Freeze is monotonic: if the artifact is already
+    frozen this raises ``FrozenArtifactError`` (a ``ValueError``) — re-freezing
+    is not an idempotent no-op, it is rejected, because the frozen flag must
+    never be cleared or re-set by this writer (only a Change Proposal may change
+    a frozen artifact). ``ValueError`` is raised for an unknown artifact name.
+    """
+    if artifact not in FROZEN_ARTIFACTS:
+        raise ValueError(
+            f"unknown frozen artifact {artifact!r}; expected one of {FROZEN_ARTIFACTS}"
         )
+
+    def _flip(feature: dict[str, Any]) -> None:
+        if feature["frozen_artifacts"][artifact]:
+            raise FrozenArtifactError(
+                f"artifact {artifact!r} is already frozen; use a Change Proposal "
+                f"to change it (§4.2)"
+            )
+        feature["frozen_artifacts"][artifact] = True
+
+    _mutate_feature_status(
+        feature_root,
+        _flip,
+        event=_FREEZE_EVENT,
+        payload={"artifact": artifact, "frozen": True},
+        timestamp=timestamp,
+    )
+
+
+def set_current_gate(
+    feature_root: Path, gate: str, *, timestamp: str | None = None
+) -> None:
+    """Move ``current_gate`` to a known §18 gate and audit the advance.
+
+    Validates ``gate`` against ``GATES`` (raises ``ValueError`` otherwise), then
+    rewrites ``status/feature-status.yml`` and appends an ``advance_gate`` audit
+    record. This is a low-level deterministic primitive: it records *that* the
+    gate moved, not *whether* the move is sequenced — gate ordering is the
+    orchestrator's concern (later tickets), not the writer's.
+    """
+    if gate not in GATES:
+        raise ValueError(f"unknown gate {gate!r}; expected one of {GATES}")
+
+    def _set_gate(feature: dict[str, Any]) -> None:
+        feature["current_gate"] = gate
+
+    _mutate_feature_status(
+        feature_root,
+        _set_gate,
+        event=_ADVANCE_GATE_EVENT,
+        payload={"current_gate": gate},
+        timestamp=timestamp,
+    )
+
+
+def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:
+    """Write the minimal §8.2 ``lane-status.yml`` with one lane, ``lane_id``.
+
+    The single lane starts ``pending`` / ``not_started`` with every run slot
+    null — a schema-correct initial state. v0 is single-lane (§5.3), so one lane
+    is the whole document; the mapping keeps the structure for the multi-lane
+    future. ``lane_id`` is expected to come from the ticket-03 allocator
+    (``allocate_id(feature_root, "LANE")``) at the call site, not a hardcoded
+    string, so the seeded lane references a real allocated id.
+    """
+    status_dir.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = {
+        "lanes": {
+            lane_id: {
+                "status": "pending",
+                "current_phase": "not_started",
+                "worktree": None,
+                "implement_run": None,
+                "review_run": None,
+                "spec_gap_run": None,
+                "verification_run": None,
+                "gate_verdict": None,
+            }
+        }
+    }
+    path = status_dir / LANE_STATUS_FILE
+    _dump_yaml(path, doc)
+    return path
+
+
+def write_initial_task_status(status_dir: Path) -> Path:
+    """Write the minimal §8.1 ``task-status.yml`` with an empty task mapping.
+
+    No tasks exist at feature-run creation (the Planner elaborates them during
+    the requirements phase, §9.1/§18.1), so the minimal schema-correct document
+    is ``tasks: {}``. Task rows are added later by this deterministic writer as
+    tasks are generated — never derived from markdown checkboxes (§8.1).
+    """
+    status_dir.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = {"tasks": {}}
+    path = status_dir / TASK_STATUS_FILE
+    _dump_yaml(path, doc)
     return path
