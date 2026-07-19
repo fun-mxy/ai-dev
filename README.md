@@ -11,8 +11,11 @@ minimal intent → final-report loop, built up ticket by ticket under
 
 ## Status
 
-v0.0 — local artifact skeleton (§26.1). Currently implements ticket 01: the
-`create-feature-run` tracer bullet.
+v0.0 — local artifact skeleton (§26.1) complete: feature-run directory generator, structured audit appender,
+stable ID allocator, canonical status writer + freeze, and
+requirements/design/tasks/lane-graph templates (tickets 01-05).
+
+Next: v0.1 — single profile run adapter (§26.2).
 
 ## Usage
 
