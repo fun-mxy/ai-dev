@@ -6,8 +6,8 @@
 
 **Status:** ready-for-agent
 
-- [ ] §14.1 schema 全检；失败 retry once 再失败标 failed
-- [ ] §14.2 changed_files 全在 allowed-files.txt 内，越界即 FAIL；out-of-band 不计
-- [ ] §14.3 frozen seam：触碰已冻结 artifact 即 FAIL（v0.1 不触发，但不误报）
-- [ ] validate-run 退出码 0=PASS / 1=FAIL，输出可读
-- [ ] 单测：合法 PASS、schema 破坏 FAIL、越界 FAIL、retry once 语义
+- [x] §14.1 schema 全检；失败 retry once 再失败标 failed
+- [x] §14.2 changed_files 全在 allowed-files.txt 内，越界即 FAIL；out-of-band 不计
+- [x] §14.3 frozen seam：触碰已冻结 artifact 即 FAIL（v0.1 不触发，但不误报）
+- [x] validate-run 退出码 0=PASS / 1=FAIL，输出可读
+- [x] 单测：合法 PASS、schema 破坏 FAIL、越界 FAIL、retry once 语义
