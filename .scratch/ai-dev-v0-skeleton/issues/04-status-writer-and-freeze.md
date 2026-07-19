@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] 确定性写入器按 §8 schema 更新 `feature-status.yml`（frozen_artifacts、current_gate）
-- [ ] 维护最小 schema-correct 的 `lane-status.yml`（单 LANE-001）与 `task-status.yml`
-- [ ] freeze 操作：对某 artifact 执行后翻转其 frozen 标志并经 audit 记录
-- [ ] 已 frozen 的 artifact 被再次写入时拒绝（守住 §4.2）
-- [ ] 代码路径中不存在模型 / 非确定性写入 canonical status 的入口（§4.3 cardinal rule）
-- [ ] 引用的 ID（如 LANE-001）来自 03 的分配器
+- [x] 确定性写入器按 §8 schema 更新 `feature-status.yml`（frozen_artifacts、current_gate）
+- [x] 维护最小 schema-correct 的 `lane-status.yml`（单 LANE-001）与 `task-status.yml`
+- [x] freeze 操作：对某 artifact 执行后翻转其 frozen 标志并经 audit 记录
+- [x] 已 frozen 的 artifact 被再次写入时拒绝（守住 §4.2）
+- [x] 代码路径中不存在模型 / 非确定性写入 canonical status 的入口（§4.3 cardinal rule）
+- [x] 引用的 ID（如 LANE-001）来自 03 的分配器
