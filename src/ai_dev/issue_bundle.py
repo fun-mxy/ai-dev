@@ -29,6 +29,7 @@ from ai_dev.checking_legs import (
     SPEC_GAP_REPORT_JSON,
 )
 from ai_dev.feature_ids import allocate_id
+from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.paths import feature_dir, lane_dir
 
 ISSUES_DIR = "issues"
@@ -50,18 +51,9 @@ class IssueBundleResult:
     bundle_json_path: Path
 
 
-def _read_json_object(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
 
 def _require_report(path: Path) -> dict[str, Any]:
-    report = _read_json_object(path)
+    report = read_json_object(path)
     if report is None:
         raise ValueError(f"required checking report missing or invalid: {path}")
     return report
@@ -103,14 +95,14 @@ def _existing_issue_ids_by_fingerprint(feature_root: Path, lane_root: Path) -> d
     issue_root = feature_root / ISSUES_DIR
     if issue_root.is_dir():
         for path in sorted(issue_root.glob("ISSUE-*.json")):
-            issue = _read_json_object(path)
+            issue = read_json_object(path)
             if issue is None:
                 continue
             issue_id = issue.get("id")
             if isinstance(issue_id, str) and issue_id:
                 found.setdefault(_fingerprint(issue), issue_id)
 
-    bundle = _read_json_object(lane_root / ISSUE_BUNDLE_JSON)
+    bundle = read_json_object(lane_root / ISSUE_BUNDLE_JSON)
     if bundle is not None:
         for issue in _extract_report_issues(bundle):
             issue_id = issue.get("id")
@@ -223,12 +215,6 @@ def _bundle_md(bundle: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
 
 def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> IssueBundleResult:
     """Collect reviewer + spec-gap report issues into stable issue artifacts.
@@ -262,13 +248,13 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
     issue_root = feature_root / ISSUES_DIR
     for issue in issues:
         issue_id = str(issue["id"])
-        _write_json(issue_root / f"{issue_id}.json", issue)
+        write_json(issue_root / f"{issue_id}.json", issue)
         (issue_root / f"{issue_id}.md").write_text(_issue_md(issue))
 
     bundle = _bundle_json(feature_id, lane_id, issues)
     bundle_json_path = lane_root / ISSUE_BUNDLE_JSON
     bundle_md_path = lane_root / ISSUE_BUNDLE_MD
-    _write_json(bundle_json_path, bundle)
+    write_json(bundle_json_path, bundle)
     bundle_md_path.write_text(_bundle_md(bundle))
 
     issue_ids = [str(issue["id"]) for issue in issues]

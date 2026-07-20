@@ -87,6 +87,7 @@ from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_g
 from ai_dev.feature_run import create_feature_run
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import IssueBundleResult, collect_issue_bundle
+from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.paths import feature_dir
 from ai_dev.profiles import (
     ProfileError,
@@ -377,6 +378,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The LANE-NNN id whose checking reports should be collected.",
     )
     collect.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    lane_gate = subparsers.add_parser(
+        "lane-gate",
+        help="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
+        "(v0.2 ticket 05).",
+    )
+    lane_gate.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has implement/verify/bundle artifacts.",
+    )
+    lane_gate.add_argument(
+        "lane_id",
+        help="The LANE-NNN id whose gate should be evaluated.",
+    )
+    lane_gate.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -712,6 +732,36 @@ def _run_collect_issues(
     return 0
 
 
+def _run_lane_gate(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> int:
+    """Evaluate the deterministic §18.4 lane gate and print PASS/FAIL.
+
+    Delegates to ``evaluate_lane_gate`` (implement-result + verification-report +
+    issue-bundle -> ``lane-decision.{md,json}``) and returns the process-level
+    contract the ticket names: ``0`` for PASS, ``1`` for FAIL or fail-loud missing
+    prerequisite artifacts.
+    """
+    try:
+        result: LaneDecisionResult = evaluate_lane_gate(repo_root, feature_id, lane_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.passed:
+        print(
+            f"LANE-GATE PASS - lane={result.lane_id} "
+            f"conditions={result.condition_count}/{result.condition_count} "
+            f"decision={result.decision_json_path}"
+        )
+        return 0
+    failed = ",".join(result.failed_conditions)
+    print(
+        f"LANE-GATE FAIL - lane={result.lane_id} "
+        f"failed_conditions={failed} decision={result.decision_json_path}"
+    )
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -794,6 +844,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "collect-issues":
         return _run_collect_issues(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+        )
+
+    if args.command == "lane-gate":
+        return _run_lane_gate(
             Path(args.repo_root),
             args.feature_id,
             args.lane_id,

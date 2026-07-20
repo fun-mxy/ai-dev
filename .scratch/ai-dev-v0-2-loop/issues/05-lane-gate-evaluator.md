@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 03, 04
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] §18.4 五条件评估：`proposed_done` ✓、verification 通过、review 无 P0/P1、gap 无 P0/P1、issue bundle 已生成
-- [ ] P0 存在必 FAIL、P1 默认 FAIL（§15.2 gate rule）；v0.2 不做 override（留 v0.3）
-- [ ] 产出 lane 级 `lane-decision.{md,json}`（md+json 双产物），PASS/FAIL + 逐条件原因
-- [ ] 纯 deterministic（读 artifact、判规则、写 decision），不调模型
-- [ ] 退出码 0=PASS / 1=FAIL；缺前置 artifact fail loud（§24.2）
-- [ ] 单测：全 PASS、P0 FAIL、P1 FAIL、verification 失败 FAIL、缺 artifact fail-loud
+- [x] §18.4 五条件评估：`proposed_done` ✓、verification 通过、review 无 P0/P1、gap 无 P0/P1、issue bundle 已生成
+- [x] P0 存在必 FAIL、P1 默认 FAIL（§15.2 gate rule）；v0.2 不做 override（留 v0.3）
+- [x] 产出 lane 级 `lane-decision.{md,json}`（md+json 双产物），PASS/FAIL + 逐条件原因
+- [x] 纯 deterministic（读 artifact、判规则、写 decision），不调模型
+- [x] 退出码 0=PASS / 1=FAIL；缺前置 artifact fail loud（§24.2）
+- [x] 单测：全 PASS、P0 FAIL、P1 FAIL、verification 失败 FAIL、缺 artifact fail-loud

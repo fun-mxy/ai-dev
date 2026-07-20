@@ -1,0 +1,279 @@
+"""Lane gate evaluator (v0.2 ticket 05, spec §18.4).
+
+This module is the deterministic final gate for a v0.2 lane. It reads only the
+existing lane artifacts (implement result, shell verification report, and issue
+bundle), applies the §18.4 conditions plus the §15.2 P0/P1 blocking rule, and
+writes the lane-level ``lane-decision.{json,md}`` double product. No model is
+called here.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+from ai_dev.audit import append_audit_event
+from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON
+from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON
+from ai_dev.json_artifact import read_json_object, write_json
+from ai_dev.paths import feature_dir, lane_dir
+from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON
+
+LANE_DECISION_MD = "lane-decision.md"
+LANE_DECISION_JSON = "lane-decision.json"
+
+_LANE_GATE_EVENT = "lane_gate"
+_BLOCKING_SEVERITIES = {"P0", "P1"}
+
+
+@dataclass(frozen=True)
+class LaneDecisionResult:
+    """Summary of one deterministic lane gate evaluation."""
+
+    feature_id: str
+    lane_id: str
+    decision: str
+    conditions: list[dict[str, Any]]
+    blocking_issues: list[dict[str, Any]]
+    decision_md_path: Path
+    decision_json_path: Path
+
+    @property
+    def passed(self) -> bool:
+        """True when all lane-gate conditions passed."""
+        return self.decision == "pass"
+
+    @property
+    def condition_count(self) -> int:
+        """Number of §18.4 conditions evaluated."""
+        return len(self.conditions)
+
+    @property
+    def failed_conditions(self) -> list[str]:
+        """Condition names whose result was failing."""
+        return [str(c["name"]) for c in self.conditions if not c.get("passed")]
+
+
+
+def _require_artifact(path: Path) -> dict[str, Any]:
+    artifact = read_json_object(path)
+    if artifact is None:
+        raise ValueError(f"required lane gate artifact missing or invalid: {path}")
+    return artifact
+
+
+def _extract_issues(bundle: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw = bundle.get("issues")
+    if not isinstance(raw, list):
+        return []
+    return [dict(issue) for issue in raw if isinstance(issue, dict)]
+
+
+def _issue_source(issue: Mapping[str, Any]) -> str:
+    source = issue.get("source")
+    return source if isinstance(source, str) else ""
+
+
+def _issue_severity(issue: Mapping[str, Any]) -> str:
+    severity = issue.get("severity")
+    return severity if isinstance(severity, str) else ""
+
+
+def _blocking_issues(issues: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    return [
+        issue
+        for issue in issues
+        if _issue_source(issue) == source and _issue_severity(issue) in _BLOCKING_SEVERITIES
+    ]
+
+
+def _summarize_issue(issue: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": issue.get("id"),
+        "source": issue.get("source"),
+        "severity": issue.get("severity"),
+        "title": issue.get("title"),
+        "requires_change_proposal": issue.get("requires_change_proposal", False),
+    }
+
+
+def _condition(name: str, passed: bool, reason: str) -> dict[str, Any]:
+    return {"name": name, "passed": passed, "reason": reason}
+
+
+def _proposed_done_condition(implement_result: Mapping[str, Any]) -> dict[str, Any]:
+    status = implement_result.get("status")
+    if status == "proposed_done":
+        tasks = implement_result.get("tasks")
+        proposed = [
+            task.get("id")
+            for task in tasks
+            if isinstance(task, Mapping) and task.get("status") == "proposed_done"
+        ] if isinstance(tasks, list) else []
+        detail = f"; tasks={proposed}" if proposed else ""
+        return _condition(
+            "proposed_done",
+            True,
+            f"implement result status is proposed_done{detail}",
+        )
+    return _condition(
+        "proposed_done",
+        False,
+        f"implement result status is {status!r}, expected 'proposed_done'",
+    )
+
+
+def _verification_condition(report: Mapping[str, Any]) -> dict[str, Any]:
+    verdict = report.get("verdict")
+    passed_count = report.get("passed_count", 0)
+    command_count = report.get("command_count", 0)
+    if verdict == "pass":
+        return _condition(
+            "verification_passed",
+            True,
+            f"verification verdict is pass ({passed_count}/{command_count} commands passed)",
+        )
+    return _condition(
+        "verification_passed",
+        False,
+        f"verification verdict is {verdict} ({passed_count}/{command_count} commands passed)",
+    )
+
+
+def _no_blocking_condition(name: str, label: str, blockers: list[dict[str, Any]]) -> dict[str, Any]:
+    if not blockers:
+        return _condition(name, True, f"no P0/P1 blocking {label} issues")
+    severities = ", ".join(str(issue.get("severity", "")) for issue in blockers)
+    return _condition(
+        name,
+        False,
+        f"P0/P1 blocking {label} issue(s): {len(blockers)} "
+        f"({severities}); v0.2 has no triage override",
+    )
+
+
+def _decision_json(
+    feature_id: str,
+    lane_id: str,
+    conditions: list[dict[str, Any]],
+    blocking_issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    decision = "pass" if all(c.get("passed") for c in conditions) else "fail"
+    return {
+        "feature": feature_id,
+        "lane": lane_id,
+        "decision": decision,
+        "conditions": conditions,
+        "blocking_issue_count": len(blocking_issues),
+        "blocking_issues": blocking_issues,
+    }
+
+
+def _decision_md(decision: Mapping[str, Any]) -> str:
+    raw_conditions = decision.get("conditions")
+    conditions = raw_conditions if isinstance(raw_conditions, list) else []
+    raw_blockers = decision.get("blocking_issues")
+    blockers = raw_blockers if isinstance(raw_blockers, list) else []
+    lines = [
+        f"# Lane Decision - {decision.get('lane', '')}",
+        "",
+        f"- feature: {decision.get('feature', '')}",
+        f"- lane: {decision.get('lane', '')}",
+        f"- decision: **{decision.get('decision', '')}**",
+        f"- blocking_issue_count: {decision.get('blocking_issue_count', 0)}",
+        "",
+        "## Conditions",
+        "",
+    ]
+    for condition in conditions:
+        if not isinstance(condition, Mapping):
+            continue
+        mark = "PASS" if condition.get("passed") else "FAIL"
+        lines.append(
+            f"- {mark} `{condition.get('name', '')}` - {condition.get('reason', '')}"
+        )
+    lines.extend(["", "## Blocking Issues", ""])
+    if not blockers:
+        lines.append("No P0/P1 review or spec-gap blocking issues.")
+    else:
+        for issue in blockers:
+            if not isinstance(issue, Mapping):
+                continue
+            lines.append(
+                f"- [{issue.get('severity', '')}] {issue.get('id', '')}: "
+                f"{issue.get('title', '')} ({issue.get('source', '')})"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+
+def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDecisionResult:
+    """Evaluate §18.4 for one lane and write ``lane-decision.{json,md}``.
+
+    Missing or invalid prerequisite artifacts fail loud (§24.2) before any decision
+    product is written. A normal gate failure (e.g. P1 issue or failed verifier)
+    still writes the decision artifacts and returns a FAIL result.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    lane_root = lane_dir(repo_root, feature_id, lane_id)
+    if not lane_root.is_dir():
+        raise ValueError(f"lane {lane_id} not found under feature {feature_id}")
+
+    implement_result = _require_artifact(lane_root / IMPLEMENT_RESULT_JSON)
+    verification_report = _require_artifact(
+        lane_root / VERIFICATION_DIR / VERIFICATION_REPORT_JSON
+    )
+    issue_bundle = _require_artifact(lane_root / ISSUE_BUNDLE_JSON)
+
+    issues = _extract_issues(issue_bundle)
+    review_blockers = _blocking_issues(issues, "code_review")
+    gap_blockers = _blocking_issues(issues, "spec_gap")
+    blocking_issues = [_summarize_issue(issue) for issue in review_blockers + gap_blockers]
+
+    conditions = [
+        _proposed_done_condition(implement_result),
+        _verification_condition(verification_report),
+        _no_blocking_condition(
+            "review_no_blocking_issues", "review", review_blockers
+        ),
+        _no_blocking_condition(
+            "spec_gap_no_blocking_issues", "spec-gap", gap_blockers
+        ),
+        _condition(
+            "issue_bundle_generated",
+            True,
+            f"issue bundle generated with {len(issues)} issue(s)",
+        ),
+    ]
+    decision = _decision_json(feature_id, lane_id, conditions, blocking_issues)
+    decision_json_path = lane_root / LANE_DECISION_JSON
+    decision_md_path = lane_root / LANE_DECISION_MD
+    write_json(decision_json_path, decision)
+    decision_md_path.write_text(_decision_md(decision))
+
+    failed = [str(c["name"]) for c in conditions if not c.get("passed")]
+    append_audit_event(
+        feature_root,
+        _LANE_GATE_EVENT,
+        payload={
+            "feature": feature_id,
+            "lane": lane_id,
+            "decision": decision["decision"],
+            "failed_conditions": failed,
+            "blocking_issue_count": len(blocking_issues),
+        },
+    )
+    return LaneDecisionResult(
+        feature_id=feature_id,
+        lane_id=lane_id,
+        decision=str(decision["decision"]),
+        conditions=conditions,
+        blocking_issues=blocking_issues,
+        decision_md_path=decision_md_path,
+        decision_json_path=decision_json_path,
+    )
