@@ -50,6 +50,7 @@ FROZEN_ARTIFACTS: tuple[str, ...] = ("requirements", "design", "tasks", "lane_gr
 
 _FREEZE_EVENT = "freeze"
 _ADVANCE_GATE_EVENT = "advance_gate"
+_MARK_TASK_PROPOSED_DONE_EVENT = "mark_task_proposed_done"
 
 
 class FrozenArtifactError(ValueError):
@@ -287,3 +288,116 @@ def write_initial_task_status(status_dir: Path) -> Path:
     path = status_dir / TASK_STATUS_FILE
     _dump_yaml(path, doc)
     return path
+
+
+# ---------------------------------------------------------------------------
+# §8.1 task-status mutation: the §9.2 Implementer writeback (v0.2 ticket 01).
+# ---------------------------------------------------------------------------
+
+
+def _task_status_path(feature_root: Path) -> Path:
+    return feature_root / "status" / TASK_STATUS_FILE
+
+
+def _load_task_status(feature_root: Path) -> dict[str, Any]:
+    """Load and parse the task-status document, fail-loud on corruption (§24.2).
+
+    Mirrors ``frozen_artifacts_status``: a real feature run always has a valid
+    ``task-status.yml`` (``create_feature_run`` writes it), so an unreadable or
+    mis-shaped file is genuine corruption the caller must surface - not silently
+    treated as "no tasks", which could hide a broken run.
+    """
+    path = _task_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"task-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"task-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"task-status.yml at {path} is not a mapping (§24.2)")
+    tasks = doc.get("tasks")
+    if not isinstance(tasks, dict):
+        raise ValueError(
+            f"task-status.yml at {path} has no 'tasks' mapping (§24.2)"
+        )
+    return doc
+
+
+def mark_task_proposed_done(
+    feature_root: Path,
+    task_id: str,
+    *,
+    lane_id: str,
+    run_id: str,
+    timestamp: str | None = None,
+) -> None:
+    """Write ``task_id``'s status back to ``proposed_done`` (§9.2, v0.2 ticket 01).
+
+    The Implementer's ``result.json`` declares a task ``proposed_done``; this is
+    the deterministic runtime that makes it canonical (§4.3 - models never write
+    canonical state, only this code does). It is the *one* sanctioned canonical
+    write of the implementer leg: every other §9.2 limit (no final done, no
+    frozen edits, no boundary breach) is enforced by ``validate-run`` gating this
+    call, not by the model's good behaviour.
+
+    Loads ``status/task-status.yml``, registers the task row with the full §8.1
+    shape if it is not already present (the Planner would normally do this at the
+    task gate; the runtime registers on first ``proposed_done`` so the leg is
+    self-contained), then sets ``status: proposed_done`` and
+    ``proposed_done_by: <run_id>``. ``accepted_done`` is forced to ``false`` -
+    invariant #7: the Implementer can only ever propose, never accept final done.
+    Existing ``lane`` / ``related_requirements`` / ``related_acceptance_criteria``
+    on a Planner-registered row are preserved (only the proposal fields move).
+    Audited as ``mark_task_proposed_done`` so the canonical change is traceable.
+    """
+    if not task_id:
+        raise ValueError("task_id must be a non-empty string")
+    if not lane_id:
+        raise ValueError("lane_id must be a non-empty string")
+    if not run_id:
+        raise ValueError("run_id must be a non-empty string")
+
+    doc = _load_task_status(feature_root)
+    tasks: dict[str, Any] = doc["tasks"]
+    if task_id not in tasks:
+        # §8.1 row shape, seeded pending. The runtime flips it to proposed_done
+        # below; accepted_done starts and stays false (invariant #7).
+        tasks[task_id] = {
+            "status": "pending",
+            "lane": lane_id,
+            "owner_run": None,
+            "proposed_done_by": None,
+            "accepted_done": False,
+            "related_requirements": [],
+            "related_acceptance_criteria": [],
+        }
+    row = tasks[task_id]
+    if not isinstance(row, dict):
+        raise ValueError(
+            f"task-status.yml row {task_id!r} is not a mapping (§24.2)"
+        )
+    row["status"] = "proposed_done"
+    row["proposed_done_by"] = run_id
+    row["owner_run"] = run_id
+    # §9.2 / invariant #7: the Implementer may only propose, never accept final
+    # done. Forced here (not just defaulted) so a row left accepted_done=true by
+    # some other path cannot survive an Implementer writeback.
+    row["accepted_done"] = False
+
+    _dump_yaml(_task_status_path(feature_root), doc)
+    append_audit_event(
+        feature_root,
+        event=_MARK_TASK_PROPOSED_DONE_EVENT,
+        payload={
+            "task": task_id,
+            "lane": lane_id,
+            "run": run_id,
+            "status": "proposed_done",
+        },
+        timestamp=timestamp,
+    )

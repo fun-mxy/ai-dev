@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ai_dev.feature_run import create_feature_run
+from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.paths import feature_dir
 from ai_dev.profiles import (
     ProfileError,
@@ -70,7 +71,20 @@ from ai_dev.profiles import (
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
-from ai_dev.validate import validate_run
+from ai_dev.validate import ValidationIssue, validate_run
+
+
+def _print_validation_issues(issues: Sequence[ValidationIssue]) -> None:
+    """Print one readable line per §14 validation issue.
+
+    Shared by ``validate-run`` and ``implement`` so the issue format stays in
+    one place (``[severity] check: message (path=...)`` per issue).
+    """
+    for issue in issues:
+        line = f"  - [{issue.severity}] {issue.check}: {issue.message}"
+        if issue.path:
+            line += f" (path={issue.path})"
+        print(line)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -190,6 +204,37 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
     validate.add_argument("run_id", help="The RUN-NNN id to validate.")
     validate.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    implement = subparsers.add_parser(
+        "implement",
+        help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
+        "rollup (v0.2 ticket 01, §9.2).",
+    )
+    implement.add_argument("feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen.")
+    implement.add_argument("lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml).")
+    implement.add_argument(
+        "--profile",
+        default="cc-glm52",
+        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
+        "profile, §23.4).",
+    )
+    implement.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    implement.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+    implement.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -341,11 +386,58 @@ def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
         )
         return 0
     print(f"VALIDATE FAIL - {run_id} ({len(result.issues)} problem(s)):")
-    for issue in result.issues:
-        line = f"  - [{issue.severity}] {issue.check}: {issue.message}"
-        if issue.path:
-            line += f" (path={issue.path})"
-        print(line)
+    _print_validation_issues(result.issues)
+    return 1
+
+
+def _run_implement(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    profile_name: str,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Implementer leg end to end (v0.2 ticket 01, §9.2).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_implementer_leg`` (prepare from frozen artifacts -> run headless ->
+    validate -> ``proposed_done`` writeback gated on validation -> lane rollup),
+    and prints a one-line summary. Returns ``0`` when the run validated and the
+    ``proposed_done`` writeback landed; ``1`` when validation failed (a captured
+    run failure is reported, not raised - the rollup still records it) or when
+    the leg cannot start (missing feature/lane, unfrozen artifacts, missing
+    token). The §9.2 limits are enforced inside the leg (``validate-run`` gates
+    the writeback), so this command never writes canonical status for a failed
+    run.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        result = run_implementer_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    status = (
+        f"IMPLEMENT PASS - {result.run_id} lane={result.lane_id} "
+        f"status={result.result_status} tasks_marked={result.task_ids_marked}"
+    )
+    if result.validation.passed:
+        print(status)
+        return 0
+    print(f"IMPLEMENT FAIL - {result.run_id} lane={result.lane_id} "
+          f"({len(result.validation.issues)} problem(s)):")
+    _print_validation_issues(result.validation.issues)
     return 1
 
 
@@ -386,6 +478,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "validate-run":
         return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
+
+    if args.command == "implement":
+        return _run_implement(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+            args.profile,
+            args.max_turns,
+            args.permission_mode,
+        )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get
     # here (required=True). error() is NoReturn, so this ends the function.

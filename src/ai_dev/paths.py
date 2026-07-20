@@ -13,6 +13,7 @@ AI_DEV_DIR = ".ai-dev"
 FEATURES_DIR = "features"
 AGENT_PROFILES_FILE = "agent-profiles.yml"
 RUNS_DIR = "runs"
+LANES_DIR = "lanes"
 
 # §12.1 run-directory subdirectories. Shared by ``run_prepare`` (creates them)
 # and ``run_wrapper`` (writes capture artifacts / reads the workspace) so the
@@ -63,3 +64,24 @@ def runs_dir(repo_root: Path, feature_id: str) -> Path:
 def run_dir(repo_root: Path, feature_id: str, run_id: str) -> Path:
     """``<repo_root>/.ai-dev/features/<feature_id>/runs/<run_id>`` (§12.1)."""
     return runs_dir(repo_root, feature_id) / run_id
+
+
+def lanes_dir(repo_root: Path, feature_id: str) -> Path:
+    """``<repo_root>/.ai-dev/features/<feature_id>/lanes`` (§6 skeleton).
+
+    One ``LANE-NNN`` directory per implementation lane lives beneath this; the
+    v0.0 ``create-feature-run`` seeds it empty, and the v0.2 implementer leg
+    fills ``LANE-001/implement-result.{md,json}`` after a run.
+    """
+    return feature_dir(repo_root, feature_id) / LANES_DIR
+
+
+def lane_dir(repo_root: Path, feature_id: str, lane_id: str) -> Path:
+    """``<repo_root>/.ai-dev/features/<feature_id>/lanes/<lane_id>`` (§6).
+
+    The lane-level artifact home: ``implement-result.{md,json}`` (ticket 01),
+    ``review-report.{md,json}`` / ``spec-gap-report.{md,json}`` (ticket 02),
+    ``verification-report.{md,json}`` (ticket 03), ``issue-bundle`` (ticket 04)
+    and ``lane-decision`` (ticket 05) all land here.
+    """
+    return lanes_dir(repo_root, feature_id) / lane_id
