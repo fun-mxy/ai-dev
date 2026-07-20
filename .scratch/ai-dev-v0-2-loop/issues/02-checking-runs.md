@@ -4,11 +4,11 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 新增 issues output-schema（§15：id/source/severity/title/description/related_tasks/related_requirements/related_acceptance_criteria/evidence/recommendation/requires_change_proposal），reviewer 与 gap 共用
-- [ ] Reviewer input package 含 implement run 的 `changed_files`/diff + task 上下文；`run-headless` 跑完、`validate-run` 用 issues schema 通过
-- [ ] Spec-Gap input package 含 requirements/design/tasks + implement diff；`run-headless` 跑完、`validate-run` 用 issues schema 通过
-- [ ] 产出 lane 级 `review-report.{md,json}` 与 `spec-gap-report.{md,json}`，各含 `issues[]`（md+json 双产物）
-- [ ] 职责边界守住：reviewer 不判规格偏离、gap 不做风格审查（§9.3/§9.4）
-- [ ] 单测：issues schema 校验、两角色 input-package 组装、report rollup
+- [x] 新增 issues output-schema（§15：id/source/severity/title/description/related_tasks/related_requirements/related_acceptance_criteria/evidence/recommendation/requires_change_proposal），reviewer 与 gap 共用
+- [x] Reviewer input package 含 implement run 的 `changed_files`/diff + task 上下文；`run-headless` 跑完、`validate-run` 用 issues schema 通过
+- [x] Spec-Gap input package 含 requirements/design/tasks + implement diff；`run-headless` 跑完、`validate-run` 用 issues schema 通过
+- [x] 产出 lane 级 `review-report.{md,json}` 与 `spec-gap-report.{md,json}`，各含 `issues[]`（md+json 双产物）
+- [x] 职责边界守住：reviewer 不判规格偏离、gap 不做风格审查（§9.3/§9.4）
+- [x] 单测：issues schema 校验、两角色 input-package 组装、report rollup
