@@ -20,7 +20,12 @@ prepare-run scaffold + input package, Claude Code headless wrapper (env isolatio
 deterministic three-check validation (schema + boundary + frozen), and end-to-end
 create->prepare->run->validate integration on ark (tickets 01-05).
 
-Next: v0.2 — implement -> review -> gap -> verify loop (§26.3).
+v0.2 - implement -> review -> gap -> verify loop (§26.3) complete: implementer leg,
+code-reviewer + spec-gap-analyst checking runs (shared §15 issues contract), shell verifier,
+issue normalization + bundle, and the §18.4 lane-gate evaluator, with PASS + FAIL
+end-to-end evidence on ark (tickets 01-06).
+
+Next: v0.3 - human triage + fix loop (§26.4).
 
 ## Usage
 
