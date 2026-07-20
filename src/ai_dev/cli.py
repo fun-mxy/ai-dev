@@ -86,6 +86,7 @@ from typing import Callable, Sequence
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.feature_run import create_feature_run
 from ai_dev.implement_leg import run_implementer_leg
+from ai_dev.issue_bundle import IssueBundleResult, collect_issue_bundle
 from ai_dev.paths import feature_dir
 from ai_dev.profiles import (
     ProfileError,
@@ -357,6 +358,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "recorded as a verification failure, not raised, §24.1).",
     )
     verify.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    collect = subparsers.add_parser(
+        "collect-issues",
+        help="Collect reviewer + spec-gap issues into feature issues and the "
+        "lane issue-bundle (v0.2 ticket 04, §15).",
+    )
+    collect.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has checking reports.",
+    )
+    collect.add_argument(
+        "lane_id",
+        help="The LANE-NNN id whose checking reports should be collected.",
+    )
+    collect.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -669,6 +689,29 @@ def _run_verify(
     return 1
 
 
+def _run_collect_issues(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> int:
+    """Collect reviewer + spec-gap findings into stable issue artifacts.
+
+    Deterministic collector - no profile, no token, no verifier ingestion. It
+    delegates to ``collect_issue_bundle`` (review-report + spec-gap-report ->
+    feature ``issues/ISSUE-NNN`` files + lane ``issue-bundle``) and prints a
+    compact summary. Returns ``1`` for missing feature/lane/report preconditions
+    with a clean ``error:`` line (§24.2).
+    """
+    try:
+        result: IssueBundleResult = collect_issue_bundle(repo_root, feature_id, lane_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"COLLECT-ISSUES PASS - lane={result.lane_id} "
+        f"issues={result.issue_count} bundle={result.bundle_json_path}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -747,6 +790,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.feature_id,
             args.lane_id,
             args.timeout,
+        )
+
+    if args.command == "collect-issues":
+        return _run_collect_issues(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
         )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get
