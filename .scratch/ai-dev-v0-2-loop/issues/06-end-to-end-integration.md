@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 02, 03, 04, 05
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 从一条 intent 起步：冻结 tasks/lane-graph -> implement -> review+gap+verify -> collect-issues -> lane-gate 五段依次跑通，无手动干预
-- [ ] 产出完整 lane artifact 链：`implement-result` / `review-report` / `spec-gap-report` / `verification-report` / `issue-bundle` / `lane-decision`（各 md+json）
-- [ ] 捕获 PASS 场景（全绿 -> `lane-decision` PASS）与 FAIL 场景（注入一个 P0/P1 或 verification 失败 -> FAIL）各一次作证据
-- [ ] `ISSUE-NNN` / `RUN-NNN` / `LANE-001` ID 在 v0.0/v0.1/v0.2 间正确衔接，无重号/错位
-- [ ] token 全程不落盘（lane artifact 与 run 目录内 grep 不到 token 值）
-- [ ] 集成暴露的接缝问题（路径/ID/接口对齐）本票内修复
+- [x] 从一条 intent 起步：冻结 tasks/lane-graph -> implement -> review+gap+verify -> collect-issues -> lane-gate 五段依次跑通，无手动干预
+- [x] 产出完整 lane artifact 链：`implement-result` / `review-report` / `spec-gap-report` / `verification-report` / `issue-bundle` / `lane-decision`（各 md+json）
+- [x] 捕获 PASS 场景（全绿 -> `lane-decision` PASS）与 FAIL 场景（注入一个 P0/P1 或 verification 失败 -> FAIL）各一次作证据
+- [x] `ISSUE-NNN` / `RUN-NNN` / `LANE-001` ID 在 v0.0/v0.1/v0.2 间正确衔接，无重号/错位
+- [x] token 全程不落盘（lane artifact 与 run 目录内 grep 不到 token 值）
+- [x] 集成暴露的接缝问题（路径/ID/接口对齐）本票内修复
