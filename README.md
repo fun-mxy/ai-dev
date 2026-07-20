@@ -15,7 +15,12 @@ v0.0 — local artifact skeleton (§26.1) complete: feature-run directory genera
 stable ID allocator, canonical status writer + freeze, and
 requirements/design/tasks/lane-graph templates (tickets 01-05).
 
-Next: v0.1 — single profile run adapter (§26.2).
+v0.1 — single profile run adapter (§26.2) complete: agent-profiles.yml loader + show-profile,
+prepare-run scaffold + input package, Claude Code headless wrapper (env isolation + capture + metadata),
+deterministic three-check validation (schema + boundary + frozen), and end-to-end
+create->prepare->run->validate integration on ark (tickets 01-05).
+
+Next: v0.2 — implement -> review -> gap -> verify loop (§26.3).
 
 ## Usage
 
