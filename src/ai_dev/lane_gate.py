@@ -51,6 +51,11 @@ class LaneDecisionResult:
         return len(self.conditions)
 
     @property
+    def passed_condition_count(self) -> int:
+        """Number of §18.4 conditions that passed."""
+        return sum(1 for c in self.conditions if c.get("passed"))
+
+    @property
     def failed_conditions(self) -> list[str]:
         """Condition names whose result was failing."""
         return [str(c["name"]) for c in self.conditions if not c.get("passed")]
@@ -229,6 +234,13 @@ def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDe
         lane_root / VERIFICATION_DIR / VERIFICATION_REPORT_JSON
     )
     issue_bundle = _require_artifact(lane_root / ISSUE_BUNDLE_JSON)
+    # §24.2 fail-loud: a structurally invalid bundle (valid JSON dict but no
+    # ``issues`` list) must not silently yield zero issues and a wrong PASS.
+    if not isinstance(issue_bundle.get("issues"), list):
+        raise ValueError(
+            f"issue bundle {lane_root / ISSUE_BUNDLE_JSON} is structurally "
+            "invalid: missing 'issues' list (§24.2 fail-loud)"
+        )
 
     issues = _extract_issues(issue_bundle)
     review_blockers = _blocking_issues(issues, "code_review")
@@ -256,19 +268,7 @@ def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDe
     write_json(decision_json_path, decision)
     decision_md_path.write_text(_decision_md(decision))
 
-    failed = [str(c["name"]) for c in conditions if not c.get("passed")]
-    append_audit_event(
-        feature_root,
-        _LANE_GATE_EVENT,
-        payload={
-            "feature": feature_id,
-            "lane": lane_id,
-            "decision": decision["decision"],
-            "failed_conditions": failed,
-            "blocking_issue_count": len(blocking_issues),
-        },
-    )
-    return LaneDecisionResult(
+    result = LaneDecisionResult(
         feature_id=feature_id,
         lane_id=lane_id,
         decision=str(decision["decision"]),
@@ -277,3 +277,15 @@ def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDe
         decision_md_path=decision_md_path,
         decision_json_path=decision_json_path,
     )
+    append_audit_event(
+        feature_root,
+        _LANE_GATE_EVENT,
+        payload={
+            "feature": feature_id,
+            "lane": lane_id,
+            "decision": decision["decision"],
+            "failed_conditions": result.failed_conditions,
+            "blocking_issue_count": len(blocking_issues),
+        },
+    )
+    return result

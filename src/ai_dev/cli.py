@@ -750,7 +750,7 @@ def _run_lane_gate(
     if result.passed:
         print(
             f"LANE-GATE PASS - lane={result.lane_id} "
-            f"conditions={result.condition_count}/{result.condition_count} "
+            f"conditions={result.passed_condition_count}/{result.condition_count} "
             f"decision={result.decision_json_path}"
         )
         return 0

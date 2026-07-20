@@ -57,6 +57,7 @@ from typing import Any, Mapping, Sequence
 
 from ai_dev.audit import append_audit_event
 from ai_dev.implement_leg import read_lane_entry
+from ai_dev.json_artifact import read_json_object
 from ai_dev.paths import (
     LANES_DIR,
     WORKSPACE_DIR,
@@ -183,22 +184,6 @@ def read_verification_commands(
 # ---------------------------------------------------------------------------
 
 
-def _read_json_object(path: Path) -> dict[str, Any] | None:
-    """Read a JSON object from ``path``, or ``None`` if missing/invalid.
-
-    Tolerant on purpose (mirrors ``implement_leg`` / ``checking_legs``): a
-    missing or malformed artifact should not crash the reader - the caller
-    decides whether the absence is a hard error.
-    """
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def read_implement_run_id(feature_root: Path, lane_id: str) -> str:
     """Return the implement run id backing the lane (from implement-result.json).
 
@@ -212,7 +197,7 @@ def read_implement_run_id(feature_root: Path, lane_id: str) -> str:
     implement_result_path = (
         feature_root / LANES_DIR / lane_id / "implement-result.json"
     )
-    implement_result = _read_json_object(implement_result_path)
+    implement_result = read_json_object(implement_result_path)
     if implement_result is None:
         raise ValueError(
             f"no implement-result.json under lanes/{lane_id}/ for feature "

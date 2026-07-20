@@ -13,7 +13,7 @@ from typing import Any
 
 from ai_dev.checking_legs import write_review_report, write_spec_gap_report
 from ai_dev.cli import main
-from ai_dev.issue_bundle import collect_issue_bundle
+from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, collect_issue_bundle
 from ai_dev.lane_gate import (
     LANE_DECISION_JSON,
     LANE_DECISION_MD,
@@ -197,6 +197,24 @@ class TestEvaluateLaneGate:
         assert "issue-bundle.json" in message
         assert not (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).exists()
 
+    def test_corrupt_issue_bundle_fails_loud(self, repo_root: Path) -> None:
+        # §24.2: a valid-JSON bundle missing its `issues` list must fail loud,
+        # not silently yield zero issues and a wrong PASS.
+        feature_id, lane_id = _stage_lane_gate_inputs(repo_root)
+        bundle_path = lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON
+        bundle_path.write_text(json.dumps({"feature": feature_id, "lane": lane_id}))
+
+        try:
+            evaluate_lane_gate(repo_root, feature_id, lane_id)
+        except ValueError as exc:
+            message = str(exc)
+        else:  # pragma: no cover - assertion branch
+            raise AssertionError("corrupt issue-bundle should fail loud")
+
+        assert "structurally invalid" in message
+        assert "issues" in message
+        assert not (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).exists()
+
 
 class TestLaneGateCli:
     """CLI seam: ``ai-dev lane-gate <FEATURE> <LANE>``."""
@@ -210,6 +228,7 @@ class TestLaneGateCli:
         out = capsys.readouterr().out
         assert "LANE-GATE PASS" in out
         assert f"lane={lane_id}" in out
+        assert "conditions=5/5" in out
         assert (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).is_file()
 
     def test_lane_gate_command_exits_one_on_fail(self, repo_root: Path, capsys: Any) -> None:

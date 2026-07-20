@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from ai_dev.json_artifact import read_json_object
 from ai_dev.implement_leg import read_task_text
 from ai_dev.paths import (
     LANES_DIR,
@@ -192,22 +193,6 @@ class ImplementRunFacts:
     task_text: str
 
 
-def _read_json_object(path: Path) -> dict[str, Any] | None:
-    """Read a JSON object from ``path``, or ``None`` if missing/invalid.
-
-    Tolerant on purpose (mirrors ``implement_leg._read_json_object``): a missing
-    or malformed artifact should not crash the fact-gatherer - the caller
-    decides whether the absence is a hard error.
-    """
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def _read_changed_file_contents(
     implement_run_root: Path, changed_files: list[str]
 ) -> dict[str, str]:
@@ -246,7 +231,7 @@ def read_implement_run_facts(
     implement_result_path = (
         feature_root / LANES_DIR / lane_id / "implement-result.json"
     )
-    implement_result = _read_json_object(implement_result_path)
+    implement_result = read_json_object(implement_result_path)
     if implement_result is None:
         raise ValueError(
             f"no implement-result.json under lanes/{lane_id}/ for feature "
@@ -261,7 +246,7 @@ def read_implement_run_facts(
         )
 
     implement_run_root = run_dir(repo_root, feature_id, implement_run_id)
-    metadata = _read_json_object(implement_run_root / OUTPUT_DIR / METADATA_JSON)
+    metadata = read_json_object(implement_run_root / OUTPUT_DIR / METADATA_JSON)
     if metadata is None:
         raise ValueError(
             f"implement run {implement_run_id} has no metadata.json at "
@@ -772,8 +757,8 @@ def _run_checking_leg(
 
     feature_root = feature_dir(repo_root, feature_id)
     run_root = run_dir(repo_root, feature_id, run_id)
-    result = _read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
-    metadata = _read_json_object(run_root / OUTPUT_DIR / METADATA_JSON)
+    result = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
+    metadata = read_json_object(run_root / OUTPUT_DIR / METADATA_JSON)
     issue_count = len(_extract_issues(result))
 
     md_path, json_path = _write_report(

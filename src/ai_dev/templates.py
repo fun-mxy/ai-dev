@@ -29,11 +29,12 @@ Two cross-cutting requirements shape every template:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from ai_dev.json_artifact import write_json
 
 REQUIREMENTS_MD = "01-requirements.md"
 REQUIREMENTS_JSON = "01-requirements.json"
@@ -53,15 +54,6 @@ _DEFAULT_MERGE_POLICY: dict[str, Any] = {
     "allowed_mechanical_resolutions": [],
     "semantic_conflict_policy": "human_triage",
 }
-
-
-def _write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write ``data`` as pretty JSON (indent 2), trailing newline, unicode-safe.
-
-    Mirrors the §4.4 machine-readable product shape used by the audit and
-    final-report writers.
-    """
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def _requirements_payload(feature_id: str) -> dict[str, Any]:
@@ -255,12 +247,12 @@ def seed_artifact_templates(
 
     (feature_root / REQUIREMENTS_MD).write_text(_requirements_md(feature_id))
     paths.append(feature_root / REQUIREMENTS_MD)
-    _write_json(feature_root / REQUIREMENTS_JSON, _requirements_payload(feature_id))
+    write_json(feature_root / REQUIREMENTS_JSON, _requirements_payload(feature_id))
     paths.append(feature_root / REQUIREMENTS_JSON)
 
     (feature_root / DESIGN_MD).write_text(_design_md(feature_id))
     paths.append(feature_root / DESIGN_MD)
-    _write_json(feature_root / DESIGN_JSON, _design_payload(feature_id))
+    write_json(feature_root / DESIGN_JSON, _design_payload(feature_id))
     paths.append(feature_root / DESIGN_JSON)
 
     (feature_root / TASKS_MD).write_text(_tasks_md(feature_id))

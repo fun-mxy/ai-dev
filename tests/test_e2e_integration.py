@@ -267,10 +267,8 @@ def _assert_v02_artifact_chain(repo_root: Path, feature_id: str, lane_id: str) -
 
 
 def _assert_no_token_in_feature_artifacts(repo_root: Path, feature_id: str, sentinel: str) -> None:
-    root = _feature_root(repo_root, feature_id)
-    for path in root.rglob("*"):
-        if path.is_file():
-            assert sentinel not in path.read_text(errors="ignore"), f"token leaked into {path}"
+    """§10.2 / invariant #11 across the whole feature run tree."""
+    _assert_no_token_leak(_feature_root(repo_root, feature_id), sentinel)
 
 
 def _write_fake_claude(bin_dir: Path) -> Path:
@@ -304,12 +302,11 @@ def _read_allowed(repo_root: Path, feature_id: str, run_id: str) -> set[str]:
     return entries
 
 
-def _assert_no_token_leak(run_root: Path, sentinel: str) -> None:
-    """§10.2 / invariant #11: the token value must not appear in any file the
-    wrapper wrote inside the run directory. A distinctive sentinel makes a leak
-    visible across every wrapper-written artifact.
+def _assert_no_token_leak(root: Path, sentinel: str) -> None:
+    """§10.2 / invariant #11: the token value must not appear in any file under
+    ``root``. A distinctive sentinel makes a leak visible across every artifact.
     """
-    for path in run_root.rglob("*"):
+    for path in root.rglob("*"):
         if path.is_file():
             assert sentinel not in path.read_text(errors="ignore"), (
                 f"token leaked into {path}"

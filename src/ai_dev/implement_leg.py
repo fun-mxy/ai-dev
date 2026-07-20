@@ -39,6 +39,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ai_dev.json_artifact import read_json_object
 from ai_dev.paths import (
     LANES_DIR,
     METADATA_JSON,
@@ -293,22 +294,6 @@ def build_implementer_input_package(
 # ---------------------------------------------------------------------------
 
 
-def _read_json_object(path: Path) -> dict[str, Any] | None:
-    """Read a JSON object from ``path``, or ``None`` if missing/invalid.
-
-    Tolerant on purpose: a failed run may have no ``result.json`` (schema check
-    already failed in ``validate_run``). The rollup reports what it can rather
-    than crashing - the validation verdict already carries the failure.
-    """
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def _serialize_validation(validation: ValidationResult) -> dict[str, Any]:
     """Render a ``ValidationResult`` as a JSON-serialisable dict for the rollup."""
     return {
@@ -560,8 +545,8 @@ def run_implementer_leg(
 
     feature_root = feature_dir(repo_root, feature_id)
     run_root = run_dir(repo_root, feature_id, run_id)
-    result = _read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
-    metadata = _read_json_object(run_root / OUTPUT_DIR / METADATA_JSON)
+    result = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
+    metadata = read_json_object(run_root / OUTPUT_DIR / METADATA_JSON)
     result_status = result.get("status") if result else None
 
     # §9.2: the proposed_done writeback happens ONLY when validation passed AND
