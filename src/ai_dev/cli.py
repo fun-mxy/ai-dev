@@ -48,6 +48,30 @@ v0.1 additions:
   library seam (``validate_with_retry``), not this command - the standalone
   ``validate-run`` re-checks an already-captured run.
 
+v0.2 additions (the implement -> review/gap -> verify -> bundle -> lane-gate
+loop, §26.3):
+
+* ``ai-dev implement <FEATURE> <LANE> [--profile cc-glm52]`` (ticket 01) - run
+  the Implementer leg: prepare from frozen artifacts -> run headless -> validate
+  -> ``proposed_done`` writeback gated on validation -> lane ``implement-result``.
+
+* ``ai-dev review <FEATURE> <LANE>`` / ``ai-dev spec-gap <FEATURE> <LANE>``
+  (ticket 02) - run the Code Reviewer (§9.3) / Spec Gap Analyst (§9.4) legs:
+  build the issues-schema input package -> run headless -> validate -> lane
+  ``review-report`` / ``spec-gap-report``. The checking legs write no canonical
+  status (§4.3).
+
+* ``ai-dev verify <FEATURE> <LANE> [--timeout 300]`` (ticket 03) - run the shell
+  Verifier leg (§9.5): execute the lane's declared verify command set
+  (pytest/mypy/build, from the frozen lane-graph's ``verification_commands``)
+  against the implement run's workspace, one by one, and roll up a lane
+  ``verification-report.{md,json}`` with a pass/fail verdict. **Deterministic
+  shell - no ``--profile``, no token, no model** (a non-agent run kind, §9.5).
+  The verifier emits a report, NOT ``issues[]`` (§9.5 vs §15); the verdict is an
+  independent condition the §18.4 lane gate consumes. Exits ``0`` on verdict
+  pass, ``1`` when any command failed or the leg cannot start (unfrozen, no
+  verify commands declared, no implement-result - §24.2 fail loud).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -71,6 +95,7 @@ from ai_dev.profiles import (
 )
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
+from ai_dev.shell_verifier import CommandResult, run_verifier
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
 from ai_dev.validate import ValidationIssue, validate_run
 
@@ -306,6 +331,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "enforces the file boundary post-hoc, §14.2).",
     )
     spec_gap.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    verify = subparsers.add_parser(
+        "verify",
+        help="Run the shell Verifier leg: execute the lane's declared verify "
+        "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
+    )
+    verify.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has an implement-result to verify.",
+    )
+    verify.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to verify (must declare verification_commands).",
+    )
+    verify.add_argument(
+        "--timeout",
+        type=float,
+        default=300,
+        help="Per-command timeout in seconds (default: 300; a hung command is "
+        "recorded as a verification failure, not raised, §24.1).",
+    )
+    verify.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -566,6 +617,58 @@ def _run_checking(
     return 1
 
 
+def _print_command_results(results: Sequence[CommandResult]) -> None:
+    """Print one readable line per verify command (the verifier's analog of
+    ``_print_validation_issues``). Shows the verdict + exit code per command,
+    with a compact stderr excerpt where the command wrote one (the failure
+    detail)."""
+    for r in results:
+        line = f"  - {r.name}: {'PASS' if r.passed else 'FAIL'} (exit_code={r.exit_code})"
+        if r.stderr.strip():
+            line += f" :: {r.stderr.strip()[:200]}"
+        print(line)
+
+
+def _run_verify(
+    repo_root: Path, feature_id: str, lane_id: str, timeout: float
+) -> int:
+    """Run the shell Verifier leg end to end (v0.2 ticket 03, §9.5).
+
+    Deterministic shell - no profile, no token (unlike the agent legs). Delegates
+    to ``run_verifier`` (read declared commands from the frozen lane-graph ->
+    find the implement workspace -> run each command -> roll up the lane
+    ``verification-report.{md,json}`` -> ``verify`` audit), and prints a one-line
+    summary. Returns ``0`` when every command passed (verdict pass); ``1`` when
+    any command failed (a captured verification failure is reported, not raised
+    - the report still records it, §24.1) or when the leg cannot start (missing
+    feature/lane, unfrozen artifacts, no verify commands declared, no
+    implement-result - all §24.2 fail-loud preconditions surfaced as a clean
+    ``error:`` line rather than a traceback)."""
+    try:
+        result = run_verifier(
+            repo_root, feature_id, lane_id, timeout=timeout
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    passed = sum(1 for r in result.command_results if r.passed)
+    total = len(result.command_results)
+    if result.verdict == "pass":
+        print(
+            f"VERIFY PASS - lane={result.lane_id} "
+            f"implement_run={result.implement_run_id} "
+            f"commands={passed}/{total} passed"
+        )
+        return 0
+    print(
+        f"VERIFY FAIL - lane={result.lane_id} "
+        f"implement_run={result.implement_run_id} "
+        f"commands={passed}/{total} passed:"
+    )
+    _print_command_results(result.command_results)
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -636,6 +739,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.permission_mode,
             leg=run_spec_gap_leg,
             label="SPEC-GAP",
+        )
+
+    if args.command == "verify":
+        return _run_verify(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+            args.timeout,
         )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get

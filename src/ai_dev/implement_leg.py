@@ -33,7 +33,7 @@ the multi-lane repo-relative future (§27.2) and is out of scope here.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -92,6 +92,15 @@ class LaneEntry:
     consumes: list[str]
     verification_scope: list[str]
     merge_policy: dict[str, Any] | None
+    # §9.5/§7.5: the lane's declared verify commands (pytest/mypy/build), the
+    # source the shell Verifier (ticket 03) executes. Carried as raw dicts
+    # (``[{"name": ..., "command": ...}, ...]``) so the lane-graph parser only
+    # validates *shape* here; the verifier module parses each dict into a typed
+    # ``VerifyCommand`` and validates the name/command strings (keeping the
+    # semantic validation next to the role that consumes it, and avoiding an
+    # import cycle - this module must not import the verifier). Defaults to
+    # empty so existing lanes / direct constructions stay valid.
+    verification_commands: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _require_str_list(raw: Any, name: str, lane_id: str) -> list[str]:
@@ -109,6 +118,32 @@ def _require_str_list(raw: Any, name: str, lane_id: str) -> list[str]:
             f"lane {lane_id!r} field {name!r} in {LANE_GRAPH_YML} must be a list"
         )
     return [str(item) for item in raw]
+
+
+def _require_dict_list(
+    raw: Any, name: str, lane_id: str
+) -> list[dict[str, Any]]:
+    """Return a lane-entry list-of-mappings field, fail-loud on bad shape.
+
+    ``verification_commands`` (§9.5/§7.5) is a list of ``{name, command}``
+    mappings; a missing field is an empty list (the lane declares no verify
+    commands), but a present non-list or non-mapping element is a config error
+    (§24.2). Only shape is validated here - the verifier module parses each
+    mapping into a typed ``VerifyCommand`` and checks the name/command strings.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"lane {lane_id!r} field {name!r} in {LANE_GRAPH_YML} must be a list"
+        )
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"lane {lane_id!r} field {name!r}[{i}] in {LANE_GRAPH_YML} "
+                f"must be a mapping (§9.5)"
+            )
+    return [dict(item) for item in raw]
 
 
 def read_lane_entry(feature_root: Path, lane_id: str) -> LaneEntry:
@@ -152,6 +187,11 @@ def read_lane_entry(feature_root: Path, lane_id: str) -> LaneEntry:
                     raw.get("verification_scope"), "verification_scope", lane_id
                 ),
                 merge_policy=merge_policy if isinstance(merge_policy, dict) else None,
+                verification_commands=_require_dict_list(
+                    raw.get("verification_commands"),
+                    "verification_commands",
+                    lane_id,
+                ),
             )
     raise ValueError(
         f"lane {lane_id!r} not found in {LANE_GRAPH_YML}; "
