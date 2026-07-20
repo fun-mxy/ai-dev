@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
@@ -266,6 +266,7 @@ def _write_input_package(
     task: str,
     input_dir: Path,
     allowed_files: Sequence[str] = (),
+    output_schema: Mapping[str, Any] | None = None,
 ) -> None:
     """Write the six §12.2 input-package files under ``input_dir``."""
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -276,8 +277,12 @@ def _write_input_package(
         _task_package_md(feature_id, run_id, role, task)
     )
     # json.dumps guarantees a parseable file (ticket 02: output-schema 可解析).
+    # ``output_schema`` (v0.2 seam) lets a checking leg substitute the §15 issues
+    # schema for the implementer default, so ``validate-run`` checks the role's
+    # own result.json contract (§14.1) without a new run mechanism.
+    schema = output_schema if output_schema is not None else _OUTPUT_SCHEMA
     (input_dir / OUTPUT_SCHEMA_FILE).write_text(
-        json.dumps(_OUTPUT_SCHEMA, indent=2, ensure_ascii=False) + "\n"
+        json.dumps(schema, indent=2, ensure_ascii=False) + "\n"
     )
     (input_dir / ALLOWED_FILES_FILE).write_text(_allowed_files_md(allowed_files))
 
@@ -295,6 +300,7 @@ def prepare_run(
     task: str,
     *,
     allowed_files: Sequence[str] = (),
+    output_schema: Mapping[str, Any] | None = None,
 ) -> str:
     """Allocate ``RUN-NNN`` and scaffold its directory + input package.
 
@@ -311,6 +317,14 @@ def prepare_run(
     Planner / caller declares them at prepare time so the §14.2 boundary check
     passes on a real run that writes workspace files. Defaults to empty - the
     ticket-02 behaviour (mandatory outputs only).
+
+    ``output_schema`` is the v0.2 checking-leg seam: a JSON Schema written to
+    ``input/output-schema.json`` in place of the implementer default
+    (``_OUTPUT_SCHEMA``). The reviewer / spec-gap legs pass the shared §15
+    issues schema so their ``result.json`` (``{"issues": [...]}``) is the
+    contract ``validate-run`` checks (§14.1), reusing the run mechanism rather
+    than building a new one. Defaults to ``None`` = the implementer schema, so
+    v0.1 behaviour is unchanged.
 
     Raises ``ValueError`` (§24.2 fail loud) if the feature run does not exist,
     if ``role`` / ``task`` is empty, or if an ``allowed_files`` entry is blank -
@@ -349,7 +363,8 @@ def prepare_run(
         (run_root / sub).mkdir(parents=True, exist_ok=True)
 
     _write_input_package(
-        feature_id, run_id, role, task, run_root / INPUT_DIR, normalised_allowed
+        feature_id, run_id, role, task, run_root / INPUT_DIR, normalised_allowed,
+        output_schema=output_schema,
     )
 
     append_audit_event(

@@ -57,8 +57,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
+from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.feature_run import create_feature_run
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.paths import feature_dir
@@ -235,6 +236,76 @@ def _build_parser() -> argparse.ArgumentParser:
         "enforces the file boundary post-hoc, §14.2).",
     )
     implement.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    review = subparsers.add_parser(
+        "review",
+        help="Run the Code Reviewer leg: build -> run -> validate -> "
+        "review-report (v0.2 ticket 02, §9.3).",
+    )
+    review.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    review.add_argument(
+        "lane_id", help="The LANE-NNN id to review (must have an implement-result)."
+    )
+    review.add_argument(
+        "--profile",
+        default="cc-glm52",
+        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
+        "profile, §23.4).",
+    )
+    review.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    review.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+    review.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    spec_gap = subparsers.add_parser(
+        "spec-gap",
+        help="Run the Spec Gap Analyst leg: build -> run -> validate -> "
+        "spec-gap-report (v0.2 ticket 02, §9.4).",
+    )
+    spec_gap.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    spec_gap.add_argument(
+        "lane_id", help="The LANE-NNN id to gap-analyse (must have an implement-result)."
+    )
+    spec_gap.add_argument(
+        "--profile",
+        default="cc-glm52",
+        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
+        "profile, §23.4).",
+    )
+    spec_gap.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    spec_gap.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+    spec_gap.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -441,6 +512,60 @@ def _run_implement(
     return 1
 
 
+def _run_checking(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    profile_name: str,
+    max_turns: int,
+    permission_mode: str,
+    *,
+    leg: Callable[..., CheckingLegResult],
+    label: str,
+) -> int:
+    """Run a checking leg (Code Reviewer or Spec Gap Analyst) end to end
+    (v0.2 ticket 02, §9.3/§9.4).
+
+    Shared by the ``review`` and ``spec-gap`` commands: loads the profile (fail
+    loud on a missing file/profile, §24.2), delegates to the leg (build input
+    package from the lane's implement run -> run headless -> validate against the
+    §15 issues schema -> roll up the lane report), and prints a one-line summary.
+    Returns ``0`` when the run validated; ``1`` when validation failed (a
+    captured run failure is reported, not raised - the report still records it)
+    or when the leg cannot start (missing feature/lane, unfrozen artifacts, no
+    implement-result, missing token). The checking legs write no canonical
+    status (§4.3), so this command never mutates ``task-status.yml``.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        result = leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    status = (
+        f"{label} PASS - {result.run_id} lane={result.lane_id} "
+        f"role={result.role} issues={result.issue_count}"
+    )
+    if result.validation.passed:
+        print(status)
+        return 0
+    print(f"{label} FAIL - {result.run_id} lane={result.lane_id} "
+          f"({len(result.validation.issues)} problem(s)):")
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -487,6 +612,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.profile,
             args.max_turns,
             args.permission_mode,
+        )
+
+    if args.command == "review":
+        return _run_checking(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+            args.profile,
+            args.max_turns,
+            args.permission_mode,
+            leg=run_reviewer_leg,
+            label="REVIEW",
+        )
+
+    if args.command == "spec-gap":
+        return _run_checking(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+            args.profile,
+            args.max_turns,
+            args.permission_mode,
+            leg=run_spec_gap_leg,
+            label="SPEC-GAP",
         )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get

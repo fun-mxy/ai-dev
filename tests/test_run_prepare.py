@@ -196,6 +196,55 @@ class TestInputPackage:
         assert run_id in text
 
 
+class TestCustomOutputSchema:
+    """The v0.2 checking legs (reviewer / spec-gap) emit ``issues[]`` in
+    result.json, not the implementer's ``status``/``summary``/``tasks``. They
+    reuse ``prepare_run`` unchanged by passing their own ``output-schema.json``
+    via the ``output_schema`` seam, so ``validate-run`` checks the run's
+    result.json against the role's contract (§14.1) without a new run mechanism.
+    """
+
+    _ISSUES_SCHEMA: dict[str, object] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "IssuesReport",
+        "type": "object",
+        "required": ["issues"],
+        "additionalProperties": True,
+        "properties": {
+            "issues": {"type": "array", "items": {"type": "object"}},
+        },
+    }
+
+    def test_custom_schema_is_written_verbatim(self, repo_root: Path) -> None:
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(
+            repo_root, feature_id, "Code Reviewer", TASK,
+            output_schema=self._ISSUES_SCHEMA,
+        )
+
+        schema = json.loads(
+            (_input_dir(repo_root, feature_id, run_id) / OUTPUT_SCHEMA_FILE).read_text()
+        )
+        # The caller's schema is the contract on disk, not the implementer default.
+        assert schema["title"] == "IssuesReport"
+        assert schema["required"] == ["issues"]
+        assert "status" not in schema.get("properties", {})
+
+    def test_default_keeps_implementer_schema(self, repo_root: Path) -> None:
+        # Omitting ``output_schema`` preserves the v0.1 implementer behaviour
+        # (status / summary / tasks) - the v0.2 seam is purely additive.
+        feature_id = _make_feature(repo_root)
+
+        run_id = prepare_run(repo_root, feature_id, ROLE, TASK)
+
+        schema = json.loads(
+            (_input_dir(repo_root, feature_id, run_id) / OUTPUT_SCHEMA_FILE).read_text()
+        )
+        assert "status" in schema["required"]
+        assert "issues" not in schema.get("properties", {})
+
+
 class TestAllowedFilesSeam:
     """Task-specific workspace files must be declarable (ticket 05 integration seam).
 

@@ -79,9 +79,12 @@ def lanes_dir(repo_root: Path, feature_id: str) -> Path:
 def lane_dir(repo_root: Path, feature_id: str, lane_id: str) -> Path:
     """``<repo_root>/.ai-dev/features/<feature_id>/lanes/<lane_id>`` (§6).
 
-    The lane-level artifact home: ``implement-result.{md,json}`` (ticket 01),
-    ``review-report.{md,json}`` / ``spec-gap-report.{md,json}`` (ticket 02),
-    ``verification-report.{md,json}`` (ticket 03), ``issue-bundle`` (ticket 04)
-    and ``lane-decision`` (ticket 05) all land here.
+    The lane-level artifact home. Per §6 the lane's reports nest in role
+    subdirs: ``review/review-report.{md,json}`` (ticket 02),
+    ``spec-gap/spec-gap-report.{md,json}`` (ticket 02),
+    ``verification/verification-report.{md,json}`` (ticket 03). The remaining
+    lane artifacts sit flat: ``implement-result.{md,json}`` (ticket 01),
+    ``issue-bundle.{md,json}`` (ticket 04) and ``lane-decision.{md,json}``
+    (ticket 05).
     """
     return lanes_dir(repo_root, feature_id) / lane_id
