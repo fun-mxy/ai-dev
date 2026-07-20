@@ -30,17 +30,32 @@ import os
 import stat
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import pytest
+import yaml
 
 from ai_dev.audit import AUDIT_LOG_JSON
+from ai_dev.checking_legs import (
+    REVIEW_DIR,
+    REVIEW_REPORT_JSON,
+    REVIEW_REPORT_MD,
+    SPEC_GAP_DIR,
+    SPEC_GAP_REPORT_JSON,
+    SPEC_GAP_REPORT_MD,
+)
 from ai_dev.cli import main
 from ai_dev.feature_run import create_feature_run
-from ai_dev.paths import run_dir
+from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON, IMPLEMENT_RESULT_MD, run_implementer_leg
+from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, ISSUE_BUNDLE_MD, collect_issue_bundle
+from ai_dev.lane_gate import LANE_DECISION_JSON, LANE_DECISION_MD, evaluate_lane_gate
+from ai_dev.paths import lane_dir, run_dir
 from ai_dev.profiles import load_profile
 from ai_dev.run_prepare import ALLOWED_FILES_FILE, prepare_run
 from ai_dev.run_wrapper import run_headless
+from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON, VERIFICATION_REPORT_MD, run_verifier
+from ai_dev.status import freeze_artifact
+from ai_dev.templates import LANE_GRAPH_YML, TASKS_MD
 from ai_dev.validate import validate_run
 
 # A fake ``claude`` binary: ignores argv, writes the §13.1 agent outputs
@@ -84,6 +99,178 @@ _EXPECTED_CHANGED_FILES = [
 ]
 
 _TASK = "Create workspace/hello.py defining answer() returning 42."
+
+
+_V02_TASK_BODY = "Create workspace/hello.py defining answer() returning 42."
+_V02_REVIEW_PASS_PAYLOAD: dict[str, Any] = {"issues": []}
+_V02_GAP_PASS_PAYLOAD: dict[str, Any] = {"issues": []}
+_V02_REVIEW_FAIL_PAYLOAD: dict[str, Any] = {
+    "issues": [
+        {
+            "id": "agent-review-p1",
+            "source": "code_review",
+            "severity": "P1",
+            "title": "Injected review blocker",
+            "description": "Deliberate P1 blocker for the v0.2 FAIL evidence path.",
+            "related_tasks": ["TASK-001"],
+            "related_requirements": [],
+            "related_acceptance_criteria": [],
+            "evidence": [{"file": "workspace/hello.py", "line": 1}],
+            "recommendation": "Address the injected blocker before passing the lane gate.",
+            "requires_change_proposal": False,
+        }
+    ]
+}
+
+
+def _feature_root(repo_root: Path, feature_id: str) -> Path:
+    return repo_root / ".ai-dev" / "features" / feature_id
+
+
+def _fill_v02_artifacts(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    verification_command: str,
+) -> None:
+    """Fill the seeded task + lane-graph artifacts with a runnable v0.2 lane."""
+    root = _feature_root(repo_root, feature_id)
+    (root / TASKS_MD).write_text(
+        f"# Tasks - {feature_id}\n"
+        f"\n"
+        f"Frozen: false\n"
+        f"\n"
+        f"> Canonical task state lives in `status/task-status.yml`.\n"
+        f"\n"
+        f"## Tasks (TASK-NNN)\n"
+        f"\n"
+        f"{_V02_TASK_BODY}\n"
+    )
+    lane_graph = {
+        "feature": feature_id,
+        "frozen": False,
+        "lanes": [
+            {
+                "id": lane_id,
+                "purpose": "End-to-end v0.2 walking skeleton lane",
+                "tasks": ["TASK-001"],
+                "depends_on": [],
+                "expected_files": ["workspace/hello.py"],
+                "exclusive_files": ["workspace/hello.py"],
+                "provides": [],
+                "consumes": [],
+                "verification_scope": ["workspace/hello.py"],
+                "verification_commands": [
+                    {"name": "answer-returns-42", "command": verification_command}
+                ],
+                "merge_policy": {
+                    "auto_merge": False,
+                    "allowed_mechanical_resolutions": [],
+                    "semantic_conflict_policy": "human_triage",
+                },
+            }
+        ],
+    }
+    with (root / LANE_GRAPH_YML).open("w") as f:
+        yaml.safe_dump(
+            lane_graph,
+            f,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=True,
+        )
+
+
+def _freeze_v02_lane(repo_root: Path, feature_id: str, lane_id: str, *, verification_command: str) -> None:
+    _fill_v02_artifacts(
+        repo_root, feature_id, lane_id, verification_command=verification_command
+    )
+    root = _feature_root(repo_root, feature_id)
+    freeze_artifact(root, "tasks")
+    freeze_artifact(root, "lane_graph")
+
+
+def _write_fake_claude_sequence(bin_dir: Path, payloads: list[dict[str, Any]]) -> Path:
+    """Fake claude that emits one queued payload per invocation.
+
+    Invocation 1 is the Implementer (writes workspace/hello.py); invocation 2 is
+    the Code Reviewer; invocation 3 is the Spec Gap Analyst. The queue file lives
+    next to the fake binary, not under the repo/run tree, so no token-like test
+    sentinel can leak into lane artifacts.
+    """
+    import base64
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    queue_path = bin_dir / "payloads.json"
+    queue_path.write_text(json.dumps(payloads))
+    b64_queue = base64.b64encode(str(queue_path).encode("utf-8")).decode("ascii")
+    script = bin_dir / "claude"
+    script.write_text(
+        "#!__PY__\n"
+        "import base64, json, os, pathlib, sys\n"
+        f"queue = pathlib.Path(base64.b64decode({b64_queue!r}).decode('utf-8'))\n"
+        "payloads = json.loads(queue.read_text())\n"
+        "if not payloads:\n"
+        "    raise SystemExit('fake claude payload queue is empty')\n"
+        "payload = payloads.pop(0)\n"
+        "queue.write_text(json.dumps(payloads))\n"
+        "os.makedirs('output', exist_ok=True)\n"
+        "if 'tasks' in payload:\n"
+        "    os.makedirs('workspace', exist_ok=True)\n"
+        "    with open('workspace/hello.py', 'w') as f:\n"
+        "        f.write('# throwaway prototype module\\n')\n"
+        "        f.write('def answer():\\n    return 42\\n')\n"
+        "with open('output/result.md', 'w') as f:\n"
+        "    f.write('Fake claude completed this v0.2 leg.\\n')\n"
+        "with open('output/result.json', 'w') as f:\n"
+        "    json.dump(payload, f)\n"
+        "sys.stdout.write('{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\\n')\n"
+        "sys.exit(0)\n".replace("__PY__", sys.executable)
+    )
+    os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _v02_implement_payload() -> dict[str, Any]:
+    return {
+        "status": "proposed_done",
+        "summary": "Wrote workspace/hello.py for the run.",
+        "tasks": [
+            {
+                "id": "TASK-001",
+                "status": "proposed_done",
+                "evidence": ["workspace/hello.py"],
+            }
+        ],
+        "related_requirements": ["REQ-001"],
+        "related_acceptance_criteria": ["AC-001"],
+        "known_issues": [],
+        "change_proposals": [],
+    }
+
+
+def _assert_v02_artifact_chain(repo_root: Path, feature_id: str, lane_id: str) -> None:
+    lane_root = lane_dir(repo_root, feature_id, lane_id)
+    assert (lane_root / IMPLEMENT_RESULT_MD).is_file()
+    assert (lane_root / IMPLEMENT_RESULT_JSON).is_file()
+    assert (lane_root / REVIEW_DIR / REVIEW_REPORT_MD).is_file()
+    assert (lane_root / REVIEW_DIR / REVIEW_REPORT_JSON).is_file()
+    assert (lane_root / SPEC_GAP_DIR / SPEC_GAP_REPORT_MD).is_file()
+    assert (lane_root / SPEC_GAP_DIR / SPEC_GAP_REPORT_JSON).is_file()
+    assert (lane_root / VERIFICATION_DIR / VERIFICATION_REPORT_MD).is_file()
+    assert (lane_root / VERIFICATION_DIR / VERIFICATION_REPORT_JSON).is_file()
+    assert (lane_root / ISSUE_BUNDLE_MD).is_file()
+    assert (lane_root / ISSUE_BUNDLE_JSON).is_file()
+    assert (lane_root / LANE_DECISION_MD).is_file()
+    assert (lane_root / LANE_DECISION_JSON).is_file()
+
+
+def _assert_no_token_in_feature_artifacts(repo_root: Path, feature_id: str, sentinel: str) -> None:
+    root = _feature_root(repo_root, feature_id)
+    for path in root.rglob("*"):
+        if path.is_file():
+            assert sentinel not in path.read_text(errors="ignore"), f"token leaked into {path}"
 
 
 def _write_fake_claude(bin_dir: Path) -> Path:
@@ -360,6 +547,175 @@ class TestEndToEndCli:
 
         run_root = run_dir(repo_root, "FEATURE-001", "RUN-001")
         _assert_no_token_leak(run_root, sentinel)
+
+
+class TestV02EndToEndIntegration:
+    """Ticket 06: v0.2 walking skeleton over one real feature run.
+
+    Freezes tasks/lane-graph, then executes the five v0.2 stages in sequence:
+    implement -> review + spec-gap + verify -> collect-issues -> lane-gate. The
+    PASS and FAIL scenarios prove the full lane artifact chain and final decision
+    behavior without manual intervention between stages.
+    """
+
+    def test_library_pipeline_passes_lane_gate_and_writes_full_artifact_chain(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root)
+        profile = load_profile(repo_root, "cc-glm52")
+        sentinel = "tok-V02-PASS-LEAK-CHECK-4d7c2a"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        py = sys.executable
+        verify_command = (
+            f'{py} -c "import hello; import sys; '
+            f'sys.exit(0 if hello.answer()==42 else 1)"'
+        )
+        fake = _write_fake_claude_sequence(
+            tmp_path / "bin-pass",
+            [_v02_implement_payload(), _V02_REVIEW_PASS_PAYLOAD, _V02_GAP_PASS_PAYLOAD],
+        )
+
+        # 1. intent -> FEATURE-001, then freeze filled tasks + lane-graph.
+        feature_id = create_feature_run(repo_root, "ship the v0.2 lane loop")
+        assert feature_id == "FEATURE-001"
+        lane_id = "LANE-001"
+        _freeze_v02_lane(
+            repo_root, feature_id, lane_id, verification_command=verify_command
+        )
+
+        # 2. implement(01) -> implement-result.{md,json}.
+        implement = run_implementer_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-20T10:00:00Z",
+            ended_at="2026-07-20T10:00:05Z",
+        )
+        assert implement.run_id == "RUN-001"
+        assert implement.validation.passed
+        assert implement.task_ids_marked == ["TASK-001"]
+
+        # 3. review + spec-gap(02) + verify(03).
+        from ai_dev.checking_legs import run_reviewer_leg, run_spec_gap_leg
+
+        review = run_reviewer_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-20T10:01:00Z",
+            ended_at="2026-07-20T10:01:05Z",
+        )
+        gap = run_spec_gap_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-20T10:02:00Z",
+            ended_at="2026-07-20T10:02:05Z",
+        )
+        verification = run_verifier(
+            repo_root,
+            feature_id,
+            lane_id,
+            started_at="2026-07-20T10:03:00Z",
+            ended_at="2026-07-20T10:03:01Z",
+        )
+        assert review.run_id == "RUN-002"
+        assert gap.run_id == "RUN-003"
+        assert verification.verdict == "pass"
+
+        # 4. collect-issues(04) -> issue-bundle, then lane-gate(05) -> PASS.
+        bundle = collect_issue_bundle(repo_root, feature_id, lane_id)
+        decision = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert bundle.issue_ids == []
+        assert decision.decision == "pass"
+        _assert_v02_artifact_chain(repo_root, feature_id, lane_id)
+
+        lane_root = lane_dir(repo_root, feature_id, lane_id)
+        decision_json = json.loads((lane_root / LANE_DECISION_JSON).read_text())
+        assert decision_json["decision"] == "pass"
+        assert all(c["passed"] for c in decision_json["conditions"])
+        # RUN/LANE/ISSUE ids remain correctly scoped: three agent RUNs under this
+        # feature, the seeded lane id, and no issue ids allocated in the green path.
+        assert sorted(p.name for p in (_feature_root(repo_root, feature_id) / "runs").iterdir()) == [
+            "RUN-001",
+            "RUN-002",
+            "RUN-003",
+        ]
+        assert (lane_root).is_dir()
+        counters = (_feature_root(repo_root, feature_id) / "id-counters.yml").read_text()
+        assert "LANE: 1" in counters
+        assert "RUN: 3" in counters
+        assert "ISSUE:" not in counters
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+    def test_cli_pipeline_fail_decision_on_p1_review_issue(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        write_profiles(repo_root)
+        sentinel = "tok-V02-FAIL-LEAK-CHECK-1a9b8e"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        py = sys.executable
+        verify_command = (
+            f'{py} -c "import hello; import sys; '
+            f'sys.exit(0 if hello.answer()==42 else 1)"'
+        )
+        fake_bin = _write_fake_claude_sequence(
+            tmp_path / "bin-fail",
+            [_v02_implement_payload(), _V02_REVIEW_FAIL_PAYLOAD, _V02_GAP_PASS_PAYLOAD],
+        )
+        monkeypatch.setenv("PATH", f"{fake_bin.parent}{os.pathsep}{os.environ['PATH']}")
+
+        assert main(
+            ["create-feature-run", "v0.2 fail evidence", "--repo-root", str(repo_root)]
+        ) == 0
+        feature_id = "FEATURE-001"
+        lane_id = "LANE-001"
+        _freeze_v02_lane(
+            repo_root, feature_id, lane_id, verification_command=verify_command
+        )
+
+        assert main(["implement", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["review", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["spec-gap", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["verify", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["collect-issues", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["lane-gate", feature_id, lane_id, "--repo-root", str(repo_root)]) == 1
+        out = capsys.readouterr().out
+        assert "LANE-GATE FAIL" in out
+        assert "failed_conditions=review_no_blocking_issues" in out
+
+        _assert_v02_artifact_chain(repo_root, feature_id, lane_id)
+        lane_root = lane_dir(repo_root, feature_id, lane_id)
+        bundle = json.loads((lane_root / ISSUE_BUNDLE_JSON).read_text())
+        decision = json.loads((lane_root / LANE_DECISION_JSON).read_text())
+        assert [issue["id"] for issue in bundle["issues"]] == ["ISSUE-001"]
+        assert bundle["issues"][0]["severity"] == "P1"
+        assert decision["decision"] == "fail"
+        assert decision["blocking_issue_count"] == 1
+        assert decision["blocking_issues"][0]["id"] == "ISSUE-001"
+        counters = (_feature_root(repo_root, feature_id) / "id-counters.yml").read_text()
+        assert "LANE: 1" in counters
+        assert "RUN: 3" in counters
+        assert "ISSUE: 1" in counters
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
 
 
 class TestAllowedFilesSeamE2E:
