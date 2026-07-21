@@ -4,13 +4,13 @@
 
 **Blocked by:** 04, 06
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `ai-dev coherence-gate` 评估 3 条件，产 pass/fail
-- [ ] 原子写 current_gate=feature_coherence_gate + verdict + 派生 feature.status
-- [ ] verdict 可变：re-coherence 覆写（fail->pass 测试）
-- [ ] §18.5 删 "final report 是否完整" bullet
-- [ ] P0/P1 未全处理 -> verdict=fail（status=blocked）
-- [ ] 缺 DEC-NNN 的 disarmed issue -> verdict=fail
-- [ ] 退出码 0=pass / 1=fail；审计 verdict 写入
-- [ ] 单测：全 pass、P1 未处理 fail、缺 DEC fail、re-coherence 覆写
+- [x] `ai-dev coherence-gate` 评估 3 条件，产 pass/fail
+- [x] 原子写 current_gate=feature_coherence_gate + verdict + 派生 feature.status
+- [x] verdict 可变：re-coherence 覆写（fail->pass 测试）
+- [x] §18.5 删 "final report 是否完整" bullet
+- [x] P0/P1 未全处理 -> verdict=fail（status=blocked）
+- [x] 缺 DEC-NNN 的 disarmed issue -> verdict=fail
+- [x] 退出码 0=pass / 1=fail；审计 verdict 写入
+- [x] 单测：全 pass、P1 未处理 fail、缺 DEC fail、re-coherence 覆写
