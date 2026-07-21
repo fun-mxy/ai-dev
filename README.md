@@ -25,7 +25,13 @@ code-reviewer + spec-gap-analyst checking runs (shared §15 issues contract), sh
 issue normalization + bundle, and the §18.4 lane-gate evaluator, with PASS + FAIL
 end-to-end evidence on ark (tickets 01-06).
 
-Next: v0.3 - human triage + fix loop (§26.4).
+v0.3 — human triage + fix loop (§26.4) complete: verdict field rename, issue status state machine
+(raised|triaged|resolved|reappeared), freeze-driven current_gate advance + derived feature.status,
+apply_triage command + DEC promotion, lane-gate blocking formula, bounded fix-run loop (budget ≤ 1),
+coherence-gate evaluator (terminal verdict), and final-report generator, with PASS + FAIL end-to-end
+evidence on ark (tickets 01-10).
+
+Next: v0.4 — polish and dogfood (§26.5).
 
 ## Usage
 
