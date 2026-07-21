@@ -129,6 +129,20 @@ from typing import Callable, Sequence
 
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
+from ai_dev.dry_run import (
+    DryRunPlan,
+    plan_coherence_gate,
+    plan_final_report,
+    plan_fix_run,
+    plan_freeze,
+    plan_implement,
+    plan_lane_gate,
+    plan_review,
+    plan_run_headless,
+    plan_spec_gap,
+    plan_triage,
+    render_plan,
+)
 from ai_dev.feature_run import create_feature_run
 from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
@@ -562,7 +576,72 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Repository root holding .ai-dev/ (default: current directory).",
     )
 
+    # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
+    # rather than repeating the add_argument per command. Read-only commands are
+    # excluded (a dry-run flag on a command with no side effects is noise).
+    for name, sub in subparsers.choices.items():
+        if name in _DRY_RUN_COMMANDS:
+            _add_dry_run(sub)
+
     return parser
+
+
+# The side-effect commands that accept ``--dry-run`` (ADR-0004). Agent commands
+# spawn a claude subprocess; deterministic commands write canonical state.
+# Already-pure/read-only commands (show-profile, validate-run, the v0.4
+# read-only commands) are deliberately excluded - a dry-run flag on a command
+# with no side effects is noise.
+_DRY_RUN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "run-headless",
+        "implement",
+        "review",
+        "spec-gap",
+        "fix-run",
+        "freeze",
+        "triage",
+        "coherence-gate",
+        "final-report",
+        "lane-gate",
+    }
+)
+
+
+def _add_dry_run(subparser: argparse.ArgumentParser) -> None:
+    """Add the ``--dry-run`` flag to a side-effect subparser (ADR-0004).
+
+    ``--dry-run`` runs the command's full planning + §24.2 precondition + legality
+    check but skips the expensive/irreversible step (claude spawn for agent
+    commands; canonical-state write for deterministic commands). Dry-run never
+    mints a stable id and writes nothing - including no audit append.
+    """
+    subparser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan the run without spawning claude or writing canonical state "
+        "(ADR-0004). Prints what the command would do and exits 0; never mints "
+        "a stable id. Legality refusals are reported (would be refused) rather "
+        "than raised; precondition failures still exit 1.",
+    )
+
+
+def _run_dry_plan(planner: "Callable[[], DryRunPlan]") -> int:
+    """Run a dry-run planner and print its plan (ADR-0004).
+
+    Wraps the ``plan_*`` call so every dry-run dispatch shares one error shape:
+    a §24.2 precondition ``ValueError`` surfaces as a clean ``error:`` line +
+    exit 1 (same as the real commands), while a successful plan prints and exits
+    0. A *legality refusal* is returned inside the plan (``would be refused``),
+    not raised, so it exits 0 - dry-run answers "what would happen?" and "this
+    would be refused" is a successful answer.
+    """
+    try:
+        plan = planner()
+    except (ValueError, ProfileError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(render_plan(plan), end="")
+    return 0
 
 
 def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
@@ -1057,6 +1136,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "freeze":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_freeze(
+                    Path(args.repo_root), args.feature_id, args.artifact
+                )
+            )
         return _run_freeze(Path(args.repo_root), args.feature_id, args.artifact)
 
     if args.command == "show-profile":
@@ -1072,6 +1157,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "run-headless":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_run_headless(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.run_id,
+                    load_profile(Path(args.repo_root), args.profile),
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
         return _run_run_headless(
             Path(args.repo_root),
             args.feature_id,
@@ -1085,6 +1181,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
 
     if args.command == "implement":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_implement(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.lane_id,
+                    load_profile(Path(args.repo_root), args.profile),
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
         return _run_implement(
             Path(args.repo_root),
             args.feature_id,
@@ -1095,6 +1202,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "review":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_review(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.lane_id,
+                    load_profile(Path(args.repo_root), args.profile),
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
         return _run_checking(
             Path(args.repo_root),
             args.feature_id,
@@ -1107,6 +1225,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "spec-gap":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_spec_gap(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.lane_id,
+                    load_profile(Path(args.repo_root), args.profile),
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
         return _run_checking(
             Path(args.repo_root),
             args.feature_id,
@@ -1134,6 +1263,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "lane-gate":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_lane_gate(
+                    Path(args.repo_root), args.feature_id, args.lane_id
+                )
+            )
         return _run_lane_gate(
             Path(args.repo_root),
             args.feature_id,
@@ -1141,12 +1276,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "coherence-gate":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_coherence_gate(Path(args.repo_root), args.feature_id)
+            )
         return _run_coherence_gate(Path(args.repo_root), args.feature_id)
 
     if args.command == "final-report":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_final_report(Path(args.repo_root), args.feature_id)
+            )
         return _run_final_report(Path(args.repo_root), args.feature_id)
 
     if args.command == "fix-run":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_fix_run(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.lane_id,
+                    load_profile(Path(args.repo_root), args.profile),
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                    verify_timeout=args.verify_timeout,
+                )
+            )
         return _run_fix_run(
             Path(args.repo_root),
             args.feature_id,
@@ -1158,6 +1313,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "triage":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_triage(
+                    Path(args.repo_root),
+                    args.feature_id,
+                    args.issue,
+                    args.disposition,
+                    args.reason,
+                    args.by,
+                )
+            )
         return _run_triage(
             Path(args.repo_root),
             args.feature_id,

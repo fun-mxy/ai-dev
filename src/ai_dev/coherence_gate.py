@@ -375,22 +375,32 @@ def _coherence_decision_md(decision: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult:
-    """Evaluate §18.5 for a feature and write the terminal verdict (ADR-0003 D7).
+@dataclass(frozen=True)
+class CoherenceCompute:
+    """The pure read+compute half of the coherence gate (no writes).
 
-    Deterministically checks the three D1 input conditions, writes
-    ``coherence-decision.{json,md}`` at the feature root, and atomically writes
-    ``current_gate = feature_coherence_gate`` + ``verdict`` + derived
-    ``feature.status`` on ``feature-status.yml``. Missing or invalid
-    prerequisite artifacts (no lane-decision, corrupt feature-status, broken
-    sequencing) fail loud (§24.2) *before* any verdict is written; a normal
-    coherence failure (unhandled P0/P1, missing DEC) still writes the decision
-    artifacts and the verdict, and returns a FAIL result.
+    Extracted so ``--dry-run`` (ticket 04 / ADR-0004) can compute the would-be
+    verdict + condition breakdown without writing canonical state. The writer
+    (``evaluate_coherence_gate``) and the dry-run planner share this one
+    computation so they can never diverge.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
 
+    verdict: str
+    conditions: list[dict[str, Any]]
+    lane_decisions: list[dict[str, Any]]
+    issue_count: int
+
+
+def compute_coherence(feature_root: Path) -> CoherenceCompute:
+    """Run the §18.5 precondition + condition compute (ADR-0003 D1), no writes.
+
+    Loads ``feature-status.yml``, enforces the sequencing guard (coherence runs
+    only from ``lane_gate`` or ``feature_coherence_gate``), and evaluates the
+    three D1 input conditions -> a ``pass``/``fail`` verdict. Pure of side
+    effects: it reads status / lane-decisions / issues / decisions and returns
+    the verdict + conditions, writing nothing. Missing/corrupt prerequisites or
+    bad sequencing raise ``ValueError`` (§24.2) exactly as the writer does.
+    """
     feature = load_feature_status(feature_root)["feature"]
 
     # Sequencing guard: coherence runs from lane_gate (first coherence) or fcg
@@ -415,9 +425,40 @@ def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult
     decisions_condition = _decisions_recorded_condition(issues, feature_root)
     conditions = [status_condition, handled_condition, decisions_condition]
     verdict = "pass" if all(c.get("passed") for c in conditions) else "fail"
+    return CoherenceCompute(
+        verdict=verdict,
+        conditions=conditions,
+        lane_decisions=lane_decisions,
+        issue_count=len(issues),
+    )
+
+
+def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult:
+    """Evaluate §18.5 for a feature and write the terminal verdict (ADR-0003 D7).
+
+    Deterministically checks the three D1 input conditions, writes
+    ``coherence-decision.{json,md}`` at the feature root, and atomically writes
+    ``current_gate = feature_coherence_gate`` + ``verdict`` + derived
+    ``feature.status`` on ``feature-status.yml``. Missing or invalid
+    prerequisite artifacts (no lane-decision, corrupt feature-status, broken
+    sequencing) fail loud (§24.2) *before* any verdict is written; a normal
+    coherence failure (unhandled P0/P1, missing DEC) still writes the decision
+    artifacts and the verdict, and returns a FAIL result.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+
+    compute = compute_coherence(feature_root)
+    verdict = compute.verdict
+    conditions = compute.conditions
 
     decision = _coherence_decision_json(
-        feature_id, verdict, conditions, lane_decisions, len(issues)
+        feature_id,
+        verdict,
+        conditions,
+        compute.lane_decisions,
+        compute.issue_count,
     )
     decision_json_path = feature_root / COHERENCE_DECISION_JSON
     decision_md_path = feature_root / COHERENCE_DECISION_MD
@@ -438,7 +479,7 @@ def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult
                 str(c["name"]) for c in conditions if not c.get("passed")
             ],
             "condition_count": len(conditions),
-            "issue_count": len(issues),
+            "issue_count": compute.issue_count,
         },
     )
     write_json(decision_json_path, decision)

@@ -259,6 +259,30 @@ def _context_md(feature_id: str, run_id: str, role: str) -> str:
     )
 
 
+def write_input_package_to(
+    feature_id: str,
+    run_id: str,
+    role: str,
+    task: str,
+    input_dir: Path,
+    *,
+    allowed_files: Sequence[str] = (),
+    output_schema: Mapping[str, Any] | None = None,
+) -> None:
+    """Write the six §12.2 input-package files under an arbitrary ``input_dir``.
+
+    Public entry over ``_write_input_package`` for callers that render a package
+    **without minting a RUN-NNN** - notably ``--dry-run`` (ticket 04 / ADR-0004),
+    which renders the would-be package into a temp dir so the monotonic RUN
+    counter and the feature-run tree stay untouched. ``run_id`` here is a display
+    placeholder (e.g. ``RUN-DRYRUN``), never a real allocated id.
+    """
+    _write_input_package(
+        feature_id, run_id, role, task, input_dir, allowed_files,
+        output_schema=output_schema,
+    )
+
+
 def _write_input_package(
     feature_id: str,
     run_id: str,
