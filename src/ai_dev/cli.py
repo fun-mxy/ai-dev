@@ -105,6 +105,17 @@ v0.3 additions (Human Triage + fix loop, ADR-0001/0002):
   ``verdict`` is mutable (re-coherence overwrites). Exits ``0`` on pass, ``1``
   on fail or fail-loud missing/corrupt prerequisites (§24.2).
 
+* ``ai-dev final-report <FEATURE>`` (ticket 09) - the §23.5 step-21 projection
+  writer (ADR-0003 D5/D6/D7). Deterministic - no profile, no token, no model.
+  Reads the coherence ``verdict`` (never writes it) and the feature-run
+  artifacts and renders ``final-report.json`` (canonical, keyed by §2.1's five
+  audit questions + ``meta`` + failure-shape) and a deterministic
+  ``final-report.md`` skeleton from that JSON. A pure, non-audited render: it
+  touches no canonical state and appends no audit event, so it is independently
+  re-runnable. ``verdict == null`` (coherence has not run) fail-loud refuses
+  (§24.2 / D7-c). Exits ``0`` on a successful render for either verdict, ``1``
+  on fail-loud missing/corrupt prerequisites.
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -119,6 +130,7 @@ from typing import Callable, Sequence
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
 from ai_dev.feature_run import create_feature_run
+from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import IssueBundleResult, collect_issue_bundle
@@ -449,6 +461,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "the final coherence verdict.",
     )
     coherence_gate.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    final_report = subparsers.add_parser(
+        "final-report",
+        help="Generate final-report.{json,md} from the coherence verdict "
+        "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
+    )
+    final_report.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose coherence verdict should be projected "
+        "into the final report.",
+    )
+    final_report.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -925,6 +953,29 @@ def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
     return 1
 
 
+def _run_final_report(repo_root: Path, feature_id: str) -> int:
+    """Generate ``final-report.{json,md}`` and print a one-line summary.
+
+    Delegates to ``generate_final_report`` (a pure projection: reads the
+    coherence verdict + artifacts, writes the two report files, touches no
+    canonical state, appends no audit event - ADR-0003 D7 supplement b). Returns
+    ``0`` on a successful render for either verdict (the report exists for both
+    pass and fail, D6) and ``1`` with a clean ``error:`` line when a
+    required artifact is missing/corrupt or the verdict is null (coherence has
+    not run - §24.2 / D7 supplement c). Re-running is idempotent and non-audited.
+    """
+    try:
+        result: FinalReportResult = generate_final_report(repo_root, feature_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"FINAL-REPORT - feature={result.feature_id} verdict={result.verdict} "
+        f"failure_class={result.failure_class} report={result.report_json_path}"
+    )
+    return 0
+
+
 def _run_fix_run(
     repo_root: Path,
     feature_id: str,
@@ -1091,6 +1142,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "coherence-gate":
         return _run_coherence_gate(Path(args.repo_root), args.feature_id)
+
+    if args.command == "final-report":
+        return _run_final_report(Path(args.repo_root), args.feature_id)
 
     if args.command == "fix-run":
         return _run_fix_run(

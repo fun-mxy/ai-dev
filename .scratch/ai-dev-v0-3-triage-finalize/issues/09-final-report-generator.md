@@ -4,15 +4,15 @@
 
 **Blocked by:** 08
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `ai-dev final-report` 产 final-report.json + final-report.md
-- [ ] JSON 顶层五键 + meta + failure-shape 俱在（"五键俱在"机械可校验）
-- [ ] verdict==null 时 fail-loud 拒绝
-- [ ] failure_class: recoverable|terminal；blocking_reasons[] 带 issue_id/kind/resolution_path
-- [ ] 键永在、值可空；多值稳定 key 排序
-- [ ] code->requirement 索引存在，无 changed-files 时显式空 + known_gap 标记
-- [ ] verdict=pass 与 verdict=fail 各生成一次（FAIL 报告仍答五问）
-- [ ] MD 骨架从 JSON 渲染，无 narrative，spec/model 分 section
-- [ ] 缺 optional artifact（无 decisions/、无 fix run）不 crash；缺 required artifact fail-loud
-- [ ] final-report 可重算（同 artifact -> 同 JSON）；非冻结
+- [x] `ai-dev final-report` 产 final-report.json + final-report.md
+- [x] JSON 顶层五键 + meta + failure-shape 俱在（"五键俱在"机械可校验）
+- [x] verdict==null 时 fail-loud 拒绝
+- [x] failure_class: recoverable|terminal；blocking_reasons[] 带 issue_id/kind/resolution_path
+- [x] 键永在、值可空；多值稳定 key 排序
+- [x] code->requirement 索引存在，无 changed-files 时显式空 + known_gap 标记
+- [x] verdict=pass 与 verdict=fail 各生成一次（FAIL 报告仍答五问）
+- [x] MD 骨架从 JSON 渲染，无 narrative，spec/model 分 section
+- [x] 缺 optional artifact（无 decisions/、无 fix run）不 crash；缺 required artifact fail-loud
+- [x] final-report 可重算（同 artifact -> 同 JSON）；非冻结
