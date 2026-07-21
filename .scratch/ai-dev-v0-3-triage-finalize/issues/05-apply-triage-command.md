@@ -4,13 +4,13 @@
 
 **Blocked by:** 02, 03
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `ai-dev triage --issue ISSUE-NNN --disposition <d> [--reason ...]` 写 `ISSUE-NNN.json.triage`
-- [ ] 升格规则：override×P1 / reject×{P0,P1} 产 DEC-NNN；其余不升格
-- [ ] disposition×severity 合法性矩阵全 cell 覆盖（合法通过 + 非法 fail-loud）
-- [ ] P0×override 写层拒绝（两层防御第一层）
-- [ ] reject-disarming（P0/P1 reject）缺 reason fail-loud
-- [ ] `request_change_proposal` 记 `request_cp`，不产 CP-NNN（clean deferral）
-- [ ] 纯 deterministic（不调模型），审计 triage 事件
-- [ ] status 置 `triaged`（调用 03 helper）
+- [x] `ai-dev triage --issue ISSUE-NNN --disposition <d> [--reason ...]` 写 `ISSUE-NNN.json.triage`
+- [x] 升格规则：override×P1 / reject×{P0,P1} 产 DEC-NNN；其余不升格
+- [x] disposition×severity 合法性矩阵全 cell 覆盖（合法通过 + 非法 fail-loud）
+- [x] P0×override 写层拒绝（两层防御第一层）
+- [x] reject-disarming（P0/P1 reject）缺 reason fail-loud
+- [x] `request_change_proposal` 记 `request_cp`，不产 CP-NNN（clean deferral）
+- [x] 纯 deterministic（不调模型），审计 triage 事件
+- [x] status 置 `triaged`（调用 03 helper）
