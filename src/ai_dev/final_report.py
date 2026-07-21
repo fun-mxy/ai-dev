@@ -895,20 +895,31 @@ def _final_report_md(report: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_final_report(repo_root: Path, feature_id: str) -> FinalReportResult:
-    """Generate ``final-report.{json,md}`` for ``feature_id`` (ADR-0003 D5/D6/D7).
+@dataclass(frozen=True)
+class FinalReportCompute:
+    """The pure read+compute half of the final report (no writes).
 
-    A pure projection: reads the coherence ``verdict`` and the feature-run
-    artifacts, writes the two report files, touches no canonical state and
-    appends no audit event. ``verdict == null`` (coherence has not run) fail-loud
-    refuses (§24.2 / D7 supplement c) - the report is downstream of coherence and
-    cannot consume a verdict that does not exist. Re-running over the same
-    artifacts yields byte-identical output (no wall-clock stamp).
+    Extracted so ``--dry-run`` (ticket 04 / ADR-0004) can report the would-be
+    verdict + failure_class without writing ``final-report.{json,md}``. The
+    writer (``generate_final_report``) and the dry-run planner share this one
+    computation so they can never diverge.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
 
+    verdict: str
+    failure_class: str | None
+    report: dict[str, Any]
+
+
+def compute_final_report(feature_root: Path) -> FinalReportCompute:
+    """Run the §23.5 projection read+compute, no writes.
+
+    Reads the coherence verdict + feature-run artifacts, enforces the §24.2
+    preconditions (verdict present and pass/fail, coherence-decision + lane
+    bundles exist), and assembles the full ``final-report.json`` document. Pure
+    of side effects: writes nothing. Re-running over the same artifacts yields a
+    byte-identical document (no wall-clock stamp).
+    """
+    feature_id = feature_root.name
     feature = load_feature_status(feature_root)["feature"]
     verdict = feature.get("verdict")
     if verdict is None:
@@ -966,6 +977,27 @@ def generate_final_report(repo_root: Path, feature_id: str) -> FinalReportResult
         audit_count,
         latest_event_ts,
     )
+    return FinalReportCompute(
+        verdict=verdict, failure_class=failure_class, report=report
+    )
+
+
+def generate_final_report(repo_root: Path, feature_id: str) -> FinalReportResult:
+    """Generate ``final-report.{json,md}`` for ``feature_id`` (ADR-0003 D5/D6/D7).
+
+    A pure projection: reads the coherence ``verdict`` and the feature-run
+    artifacts, writes the two report files, touches no canonical state and
+    appends no audit event. ``verdict == null`` (coherence has not run) fail-loud
+    refuses (§24.2 / D7 supplement c) - the report is downstream of coherence and
+    cannot consume a verdict that does not exist. Re-running over the same
+    artifacts yields byte-identical output (no wall-clock stamp).
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+
+    compute = compute_final_report(feature_root)
+    report = compute.report
 
     report_json_path = feature_root / FINAL_REPORT_JSON
     report_md_path = feature_root / FINAL_REPORT_MD
@@ -974,8 +1006,8 @@ def generate_final_report(repo_root: Path, feature_id: str) -> FinalReportResult
 
     return FinalReportResult(
         feature_id=feature_id,
-        verdict=verdict,
-        failure_class=failure_class,
+        verdict=compute.verdict,
+        failure_class=compute.failure_class,
         report_json_path=report_json_path,
         report_md_path=report_md_path,
     )

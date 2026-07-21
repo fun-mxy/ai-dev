@@ -292,18 +292,31 @@ def _decision_md(decision: Mapping[str, Any]) -> str:
 
 
 
-def evaluate_lane_gate(
-    repo_root: Path,
-    feature_id: str,
-    lane_id: str,
-    *,
-    origin: str | None = None,
-) -> LaneDecisionResult:
-    """Evaluate §18.4 for one lane and write ``lane-decision.{json,md}``.
+@dataclass(frozen=True)
+class LaneGateCompute:
+    """The pure read+compute half of the lane gate (no writes).
 
-    Missing or invalid prerequisite artifacts fail loud (§24.2) before any decision
-    product is written. A normal gate failure (e.g. P1 issue or failed verifier)
-    still writes the decision artifacts and returns a FAIL result.
+    Extracted so ``--dry-run`` (ticket 04 / ADR-0004) can report the would-be
+    decision without writing ``lane-decision.{json,md}``. The writer
+    (``evaluate_lane_gate``) and the dry-run planner share this one computation
+    so they can never diverge.
+    """
+
+    conditions: list[dict[str, Any]]
+    blocking_issues: list[dict[str, Any]]
+    decision: dict[str, Any]
+
+
+def compute_lane_decision(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> LaneGateCompute:
+    """Run the §18.4 precondition + condition compute, no writes.
+
+    Reads the lane's implement-result / verification-report / issue-bundle,
+    enforces the §24.2 structural preconditions, evaluates the five lane-gate
+    conditions, and assembles the decision dict. Pure of side effects: it writes
+    nothing and appends no audit record. Missing/invalid prerequisites raise
+    ``ValueError`` exactly as the writer does.
     """
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
@@ -311,11 +324,6 @@ def evaluate_lane_gate(
     lane_root = lane_dir(repo_root, feature_id, lane_id)
     if not lane_root.is_dir():
         raise ValueError(f"lane {lane_id} not found under feature {feature_id}")
-
-    # v0.4 ticket 02: the gate evaluation's wall-clock duration lands on the
-    # ``lane_gate`` event (``elapsed_ms``). Captured around the deterministic
-    # evaluation so the log answers "how long did the lane gate take".
-    gate_started = utc_now_iso()
 
     implement_result = _require_artifact(lane_root / IMPLEMENT_RESULT_JSON)
     verification_report = _require_artifact(
@@ -351,6 +359,35 @@ def evaluate_lane_gate(
         ),
     ]
     decision = _decision_json(feature_id, lane_id, conditions, blocking_issues)
+    return LaneGateCompute(
+        conditions=conditions, blocking_issues=blocking_issues, decision=decision
+    )
+
+
+def evaluate_lane_gate(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    origin: str | None = None,
+) -> LaneDecisionResult:
+    """Evaluate §18.4 for one lane and write ``lane-decision.{json,md}``.
+
+    Missing or invalid prerequisite artifacts fail loud (§24.2) before any decision
+    product is written. A normal gate failure (e.g. P1 issue or failed verifier)
+    still writes the decision artifacts and returns a FAIL result.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    # v0.4 ticket 02: the gate evaluation's wall-clock duration lands on the
+    # ``lane_gate`` event (``elapsed_ms``). Captured around the deterministic
+    # evaluation so the log answers "how long did the lane gate take".
+    gate_started = utc_now_iso()
+    compute = compute_lane_decision(repo_root, feature_id, lane_id)
+    decision = compute.decision
+    conditions = compute.conditions
+    blocking_issues = compute.blocking_issues
+
+    lane_root = lane_dir(repo_root, feature_id, lane_id)
     decision_json_path = lane_root / LANE_DECISION_JSON
     decision_md_path = lane_root / LANE_DECISION_MD
     write_json(decision_json_path, decision)
