@@ -4,10 +4,10 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `ISSUE-NNN.json` 含 `status` 字段，初值 `raised`
-- [ ] 转移 helper 强制合法转移（非法转移 fail-loud）
-- [ ] 状态机单测覆盖全部合法转移 + 拒绝非法转移
-- [ ] gate（lane-gate）不读 status（读 severity + triage）--回归测试确认
-- [ ] collector 写 raised/reappeared/resolved（02 的 merge 路径调用 helper）
+- [x] `ISSUE-NNN.json` 含 `status` 字段，初值 `raised`
+- [x] 转移 helper 强制合法转移（非法转移 fail-loud）
+- [x] 状态机单测覆盖全部合法转移 + 拒绝非法转移
+- [x] gate（lane-gate）不读 status（读 severity + triage）--回归测试确认
+- [x] collector 写 raised/reappeared/resolved（02 的 merge 路径调用 helper）

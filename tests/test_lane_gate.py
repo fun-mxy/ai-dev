@@ -11,9 +11,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ai_dev.checking_legs import write_review_report, write_spec_gap_report
 from ai_dev.cli import main
 from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, collect_issue_bundle
+from ai_dev.issue_status import ISSUE_STATUSES
 from ai_dev.lane_gate import (
     LANE_DECISION_JSON,
     LANE_DECISION_MD,
@@ -214,6 +217,66 @@ class TestEvaluateLaneGate:
         assert "structurally invalid" in message
         assert "issues" in message
         assert not (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).exists()
+
+
+class TestLaneGateIgnoresIssueStatus:
+    """ADR-0002 D2 regression: the gate reads ``severity`` (+ ``triage`` in
+    ticket 06), never ``status``. ``status`` is collector/driver bookkeeping;
+    flipping it across all four lifecycle values must not move the decision.
+    """
+
+    @staticmethod
+    def _set_first_issue_status(
+        repo_root: Path, feature_id: str, lane_id: str, status: str
+    ) -> None:
+        """Stamp ``status`` onto the bundle's first issue in place."""
+        bundle_path = lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON
+        bundle = json.loads(bundle_path.read_text())
+        bundle["issues"][0]["status"] = status
+        bundle_path.write_text(json.dumps(bundle))
+
+    @pytest.mark.parametrize("status", ISSUE_STATUSES)
+    def test_p2_passes_regardless_of_status(self, repo_root: Path, status: str) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p2",
+                    source="code_review",
+                    severity="P2",
+                    title="Non-blocking nit",
+                )
+            ],
+        )
+        self._set_first_issue_status(repo_root, feature_id, lane_id, status)
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "pass"
+        assert result.blocking_issues == []
+
+    @pytest.mark.parametrize("status", ISSUE_STATUSES)
+    def test_p1_fails_regardless_of_status(self, repo_root: Path, status: str) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p1",
+                    source="code_review",
+                    severity="P1",
+                    title="Blocking issue",
+                )
+            ],
+        )
+        self._set_first_issue_status(repo_root, feature_id, lane_id, status)
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "fail"
+        assert result.failed_conditions == ["review_no_blocking_issues"]
+        # The blocking summary carries severity, not status.
+        assert result.blocking_issues[0]["severity"] == "P1"
+        assert "status" not in result.blocking_issues[0]
 
 
 class TestLaneGateCli:

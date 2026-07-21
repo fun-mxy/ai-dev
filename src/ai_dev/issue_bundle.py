@@ -14,9 +14,18 @@ ADR-0002 D1 makes ``issues/ISSUE-NNN.json`` the single source of truth for
 persisted issue state and the lane ``issue-bundle.json`` a *projection* of it.
 A re-collect therefore MERGES rather than overwrites: report-derived fields
 (§15) are refreshed from the new reviewer/gap report, while persisted state
-that other writers own -- ``triage`` (ADR-0001), ``status`` /
-``triage_history`` / run-tracking (ADR-0002) -- is preserved across the
-re-collect. The bundle never carries state that is not also in ``issues/``.
+that other writers own -- ``triage`` (ADR-0001), ``triage_history`` /
+run-tracking (ADR-0002) -- is preserved across the re-collect. The bundle
+never carries state that is not also in ``issues/``.
+
+ADR-0002 D2/D6 makes this collector the writer of the issue lifecycle
+``status`` (``raised | triaged | resolved | reappeared``): a brand-new
+fingerprint starts ``raised``; a fingerprint present in the prior lane bundle
+but absent from the new report is ``resolved``; a ``request_fix`` issue still
+present after a fix run targeted it is ``reappeared`` (and its triage is
+invalidated). Transitions go through ``ai_dev.issue_status`` so an illegal
+jump fails loud. The lane gate does not read ``status`` (it reads ``severity``
++ ``triage``); ``status`` is collector/driver bookkeeping.
 
 Verifier pass/fail is intentionally outside this bundle; the lane gate consumes
 the verifier report directly.
@@ -37,6 +46,14 @@ from ai_dev.checking_legs import (
     SPEC_GAP_REPORT_JSON,
 )
 from ai_dev.feature_ids import allocate_id
+from ai_dev.issue_status import (
+    STATUS_RAISED,
+    STATUS_REAPPEARED,
+    STATUS_RESOLVED,
+    STATUS_TRIAGED,
+    initial_issue_status,
+    transition_issue_status,
+)
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.paths import feature_dir, lane_dir
 
@@ -45,6 +62,11 @@ ISSUE_BUNDLE_MD = "issue-bundle.md"
 ISSUE_BUNDLE_JSON = "issue-bundle.json"
 
 _COLLECT_EVENT = "collect_issues"
+
+# The disposition that arms the fix loop (ADR-0001 #4). The collector reads it
+# to detect the ``triaged -> reappeared`` trigger; apply_triage (ticket 05)
+# writes it.
+_REQUEST_FIX = "request_fix"
 
 # Fields the reviewer/spec-gap report is authoritative for (the §15 Issue
 # Contract). Everything else on ``issues/ISSUE-NNN.json`` is persisted state
@@ -165,7 +187,110 @@ def _merge_issue(
         if field in report_issue:
             merged[field] = report_issue[field]
     merged["id"] = issue_id
+    # Drive the lifecycle ``status`` through the state machine (ADR-0002 D2) so
+    # the collector-owned transitions (raised / reappeared / resolved) fail loud
+    # on an illegal jump instead of silently corrupting the lifecycle.
+    _apply_lifecycle_status(merged, existing)
     return merged
+
+
+def _triage_action(issue: Mapping[str, Any]) -> str | None:
+    """The issue's current triage disposition (``triage.action``), or ``None``.
+
+    ``None`` covers both "no triage written yet" (ticket 05 not landed) and
+    "triage wiped on reappear" (``triage`` set to null) - both surface as
+    "untriaged" to the gate.
+    """
+    triage = issue.get("triage")
+    if isinstance(triage, Mapping):
+        action = triage.get("action")
+        return action if isinstance(action, str) else None
+    return None
+
+
+def _is_fix_targeted(issue: Mapping[str, Any]) -> bool:
+    """True iff a fix run targeted this issue (``fix_targeted_in_run`` set).
+
+    Written by the fix-run driver (ticket 07); absent until then, so the
+    ``triaged -> reappeared`` trigger never fires before the fix loop exists.
+    """
+    return bool(issue.get("fix_targeted_in_run"))
+
+
+def _recollect_target_status(prior: Mapping[str, Any]) -> str:
+    """The collector's re-collect policy for a fingerprint-matched issue: which
+    lifecycle transition to fire based on the prior ``issues/`` state.
+
+    ADR-0002 D2 (fingerprint still present in the new report):
+
+    * ``raised`` -> ``raised``  (still untriaged; re-reported)
+    * ``triaged`` + ``request_fix`` + fix-targeted -> ``reappeared``  (fix failed)
+    * ``triaged`` (otherwise) -> ``triaged``  (no lifecycle change)
+    * ``reappeared`` -> ``reappeared``  (not re-triaged yet)
+    * ``resolved`` -> ``raised``  (a previously-resolved fingerprint re-reported)
+
+    A prior issue with no ``status`` (written before ticket 03) is treated as
+    ``raised`` so a re-collect migrates it onto the state machine.
+    """
+    prior_status = prior.get("status")
+    if prior_status == STATUS_TRIAGED:
+        if _triage_action(prior) == _REQUEST_FIX and _is_fix_targeted(prior):
+            return STATUS_REAPPEARED
+        return STATUS_TRIAGED
+    if prior_status == STATUS_REAPPEARED:
+        return STATUS_REAPPEARED
+    if prior_status == STATUS_RESOLVED:
+        return STATUS_RAISED
+    # ``raised``, absent, or unknown -> raised.
+    return STATUS_RAISED
+
+
+def _preserve_triage_to_history(issue: dict[str, Any]) -> None:
+    """Move the issue's current ``triage`` into ``triage_history`` and wipe the
+    current ``triage`` to ``None`` (ADR-0002 D2/D6).
+
+    Used by two collector transitions:
+
+    * ``reappeared`` (D2 row "wipe -> None | append old"): the prior
+      ``request_fix`` triage is invalidated so the lane gate sees
+      ``triage is None`` -> FAIL -> the mandatory re-triage step.
+    * ``resolved`` (D6 "its triage is preserved into triage_history"): the
+      issue is no longer re-reported, so its last disposition is preserved into
+      the history log and the active triage cleared. Clearing (rather than
+      keeping) means a later re-raise (``resolved -> raised``) starts cleanly
+      untriaged instead of carrying a stale disposition.
+
+    No-op when no triage is present (e.g. ticket 05 has not written one yet).
+    """
+    triage = issue.get("triage")
+    if triage is None:
+        return
+    history = issue.get("triage_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(triage)
+    issue["triage_history"] = history
+    issue["triage"] = None
+
+
+def _apply_lifecycle_status(
+    merged: dict[str, Any], existing: Mapping[str, Any] | None
+) -> None:
+    """Fire the collector-owned status transition for one merged issue.
+
+    A brand-new fingerprint (``existing is None``) starts at ``raised``. A
+    re-reported fingerprint is driven through ``_recollect_target_status``; the
+    ``reappeared`` target also invalidates the prior triage. The transition is
+    validated by ``transition_issue_status``, so an illegal jump fails loud.
+    """
+    if existing is None:
+        merged["status"] = initial_issue_status()
+        return
+    prior_status = existing.get("status")
+    target = _recollect_target_status(existing)
+    merged["status"] = transition_issue_status(prior_status, target)
+    if target == STATUS_REAPPEARED:
+        _preserve_triage_to_history(merged)
 
 
 def _normalize_issues(
@@ -279,6 +404,57 @@ def _bundle_md(bundle: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _record_resolved_issues(
+    feature_root: Path, lane_root: Path, new_fingerprints: set[str]
+) -> list[str]:
+    """ADR-0002 D6: a fingerprint present in the prior lane bundle but absent
+    from the new report is resolved (not re-reported). Transition those
+    ``issues/ISSUE-NNN.json`` records to ``status: resolved`` and preserve
+    their last disposition into ``triage_history``.
+
+    The diff is scoped to the prior **lane** bundle (not the feature-level
+    ``issues/`` dir, which may carry issues other lanes reported) so a
+    fingerprint absent from one lane's report cannot resolve an issue another
+    lane still reports. Idempotent: an already-``resolved`` record is skipped.
+    Reads the prior bundle before the caller overwrites it with the new one.
+
+    D6 also names a ``resolved_in_run`` run-tracking field; the collector has
+    no run id today (``collect_issue_bundle`` takes none), so that field - like
+    ``first_seen_in_run`` / ``fix_targeted_in_run`` - is written by the
+    run-id-aware driver (ticket 07), not here.
+    """
+    prior_bundle = read_json_object(lane_root / ISSUE_BUNDLE_JSON)
+    if prior_bundle is None:
+        return []
+    raw = prior_bundle.get("issues")
+    if not isinstance(raw, list):
+        return []
+    issue_root = feature_root / ISSUES_DIR
+    resolved_ids: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        if _fingerprint(entry) in new_fingerprints:
+            continue
+        issue_id = entry.get("id")
+        if not isinstance(issue_id, str) or not issue_id:
+            continue
+        path = issue_root / f"{issue_id}.json"
+        issue = read_json_object(path)
+        if issue is None:
+            continue
+        prior_status = issue.get("status")
+        if prior_status == STATUS_RESOLVED:
+            continue
+        issue["status"] = transition_issue_status(prior_status, STATUS_RESOLVED)
+        # D6: the issue's last disposition is preserved into triage_history
+        # (and the active triage cleared) as it leaves the active set.
+        _preserve_triage_to_history(issue)
+        write_json(path, issue)
+        resolved_ids.append(issue_id)
+    return resolved_ids
+
+
 
 def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> IssueBundleResult:
     """Collect reviewer + spec-gap report issues into stable issue artifacts.
@@ -315,6 +491,11 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
         write_json(issue_root / f"{issue_id}.json", issue)
         (issue_root / f"{issue_id}.md").write_text(_issue_md(issue))
 
+    # ADR-0002 D6: diff the prior lane bundle against this report to record
+    # resolutions. Must run before the new bundle overwrites the prior one.
+    new_fingerprints = {_fingerprint(issue) for issue in issues}
+    resolved_ids = _record_resolved_issues(feature_root, lane_root, new_fingerprints)
+
     # The bundle is a projection of ``issues/`` (ADR-0002 D1): it carries the
     # merged issue state just written to ``issues/ISSUE-NNN.json`` - report
     # fields plus any persisted state - so the lane gate sees the same truth.
@@ -333,6 +514,7 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
             "lane": lane_id,
             "issue_count": len(issue_ids),
             "issue_ids": issue_ids,
+            "resolved_issue_ids": resolved_ids,
         },
     )
     return IssueBundleResult(

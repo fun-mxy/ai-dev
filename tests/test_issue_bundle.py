@@ -29,6 +29,12 @@ from ai_dev.issue_bundle import (
     ISSUES_DIR,
     collect_issue_bundle,
 )
+from ai_dev.issue_status import (
+    STATUS_RAISED,
+    STATUS_REAPPEARED,
+    STATUS_RESOLVED,
+    STATUS_TRIAGED,
+)
 from ai_dev.json_artifact import write_json
 from ai_dev.paths import lane_dir
 from ai_dev.validate import ValidationResult
@@ -95,6 +101,29 @@ def _overwrite_review_report(
         metadata=_REVIEW_RUN_METADATA,
         validation=ValidationResult("RUN-002", []),
     )
+
+
+def _stage_triaged_issue(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    action: str,
+    reason: str,
+    **extra: Any,
+) -> Path:
+    """Collect once (-> status=raised), then simulate apply_triage (ticket 05)
+    having written a disposition: set ``status=triaged`` + ``triage`` on the
+    lane's ISSUE-001.json. ``extra`` adds persisted fields later writers own
+    (e.g. ``fix_targeted_in_run`` from ticket 07's driver). Returns the path."""
+    collect_issue_bundle(repo_root, feature_id, lane_id)
+    issue_path = _feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json"
+    issue = json.loads(issue_path.read_text())
+    issue["status"] = STATUS_TRIAGED
+    issue["triage"] = {"action": action, "reason": reason, "by": "human"}
+    issue.update(extra)
+    write_json(issue_path, issue)
+    return issue_path
 
 
 class TestCollectIssueBundle:
@@ -264,10 +293,10 @@ class TestBundleMergeIsProjection:
             (_feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json").read_text()
         )
         assert issue["id"] == "ISSUE-001"
-        # No writer has touched persisted state yet -> the issue carries only
-        # report-derived fields + the stable id.
+        # No writer has touched triage yet -> the issue carries no triage.
         assert "triage" not in issue
-        assert "status" not in issue
+        # Ticket 03: the collector starts every new fingerprint at status=raised.
+        assert issue["status"] == "raised"
 
     def test_re_collect_preserves_persisted_state_and_refreshes_report_fields(
         self, repo_root: Path
@@ -359,6 +388,234 @@ class TestBundleMergeIsProjection:
             "reason": "false positive",
             "by": "human",
         }
+
+
+class TestIssueStatusLifecycle:
+    """ADR-0002 D2/D6: the collector drives the issue ``status`` state machine.
+
+    A brand-new fingerprint starts ``raised``; a fingerprint gone from the new
+    report is ``resolved``; a ``request_fix`` issue still present after a fix
+    run targeted it is ``reappeared`` (and its triage is invalidated). These
+    tests exercise the collector-owned transitions through the public
+    ``collect_issue_bundle`` seam - the helper itself is unit-tested in
+    ``test_issue_status.py``.
+    """
+
+    def _issue_path(self, repo_root: Path, feature_id: str) -> Path:
+        return _feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json"
+
+    def test_new_fingerprint_starts_raised(self, repo_root: Path) -> None:
+        feature_id, _ = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+
+        collect_issue_bundle(repo_root, feature_id, "LANE-001")
+
+        issue = json.loads(self._issue_path(repo_root, feature_id).read_text())
+        assert issue["status"] == STATUS_RAISED
+
+    def test_re_collect_keeps_raised_issue_raised(self, repo_root: Path) -> None:
+        review_issues = [_issue(id="agent-review-1")]
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=review_issues, gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+        # Still untriaged, still reported -> stays raised (idempotent self-loop).
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        issue = json.loads(self._issue_path(repo_root, feature_id).read_text())
+        assert issue["status"] == STATUS_RAISED
+
+    def test_disappeared_fingerprint_is_resolved(self, repo_root: Path) -> None:
+        # D6: a fingerprint in the prior lane bundle but absent from the new
+        # report -> that issues/ record becomes resolved.
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+        assert json.loads(self._issue_path(repo_root, feature_id).read_text())["status"] == (
+            STATUS_RAISED
+        )
+
+        # Re-review drops the issue entirely (reviewer no longer reports it).
+        _overwrite_review_report(repo_root, feature_id, lane_id, review_issues=[])
+        result = collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        assert result.issue_ids == []  # nothing in the new report
+        resolved = json.loads(self._issue_path(repo_root, feature_id).read_text())
+        assert resolved["status"] == STATUS_RESOLVED
+        # The resolved record stays on disk (lifecycle history) even though it
+        # no longer projects into the current lane bundle.
+        bundle = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON).read_text()
+        )
+        assert [i["id"] for i in bundle["issues"]] == []
+
+    def test_resolved_preserves_triage_to_history(self, repo_root: Path) -> None:
+        # D6: when a triaged issue disappears, "its triage is preserved into
+        # triage_history" (and the active triage cleared, so a later re-raise
+        # starts cleanly untriaged).
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        issue_path = _stage_triaged_issue(
+            repo_root,
+            feature_id,
+            lane_id,
+            action="reject",
+            reason="false positive",
+        )
+
+        # Re-review drops the issue -> resolved diff fires.
+        _overwrite_review_report(repo_root, feature_id, lane_id, review_issues=[])
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        resolved = json.loads(issue_path.read_text())
+        assert resolved["status"] == STATUS_RESOLVED
+        assert resolved["triage"] is None
+        assert resolved["triage_history"] == [
+            {"action": "reject", "reason": "false positive", "by": "human"}
+        ]
+
+    def test_resolved_fingerprint_reraises_when_reported_again(
+        self, repo_root: Path
+    ) -> None:
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)  # raised
+        _overwrite_review_report(repo_root, feature_id, lane_id, review_issues=[])
+        collect_issue_bundle(repo_root, feature_id, lane_id)  # -> resolved
+        assert (
+            json.loads(self._issue_path(repo_root, feature_id).read_text())["status"]
+            == STATUS_RESOLVED
+        )
+
+        # The fingerprint comes back in a later report -> re-raise (resolved is
+        # terminal except for this edge). Same fingerprint reuses ISSUE-001.
+        _overwrite_review_report(
+            repo_root, feature_id, lane_id, review_issues=[_issue(id="agent-review-1")]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        issue = json.loads(self._issue_path(repo_root, feature_id).read_text())
+        assert issue["id"] == "ISSUE-001"
+        assert issue["status"] == STATUS_RAISED
+
+    def test_request_fix_reappear_after_fix_run_invalidates_triage(
+        self, repo_root: Path
+    ) -> None:
+        # triaged(request_fix) + fix-targeted + still present -> reappeared, and
+        # the prior triage is wiped to triage_history so the gate sees None.
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        # Simulate apply_triage (ticket 05) + the fix-run driver (ticket 07):
+        # the issue is triaged request_fix and a fix run targeted it.
+        issue_path = _stage_triaged_issue(
+            repo_root,
+            feature_id,
+            lane_id,
+            action="request_fix",
+            reason="Fix before freeze.",
+            fix_targeted_in_run="RUN-009",
+        )
+
+        # Re-collect: same fingerprint still present after the fix run.
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        reappeared = json.loads(issue_path.read_text())
+        assert reappeared["status"] == STATUS_REAPPEARED
+        # Triage invalidated (wipe -> None) so the gate forces a re-triage.
+        assert reappeared["triage"] is None
+        assert reappeared["triage_history"] == [
+            {
+                "action": "request_fix",
+                "reason": "Fix before freeze.",
+                "by": "human",
+            }
+        ]
+        # The bundle projects the reappeared state straight through (SoT).
+        bundle = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON).read_text()
+        )
+        assert bundle["issues"][0]["status"] == STATUS_REAPPEARED
+        assert bundle["issues"][0]["triage"] is None
+
+    def test_non_request_fix_triaged_stays_triaged_when_still_present(
+        self, repo_root: Path
+    ) -> None:
+        # triaged(non-rf) + still present + not fix-targeted -> triaged (no
+        # lifecycle change); triage is preserved, not invalidated.
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        issue_path = _stage_triaged_issue(
+            repo_root,
+            feature_id,
+            lane_id,
+            action="override_issue",
+            reason="Known limitation acceptable for MVP v0.",
+        )
+
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        merged = json.loads(issue_path.read_text())
+        assert merged["status"] == STATUS_TRIAGED
+        assert merged["triage"] == {
+            "action": "override_issue",
+            "reason": "Known limitation acceptable for MVP v0.",
+            "by": "human",
+        }
+
+    def test_request_fix_without_fix_targeting_stays_triaged(
+        self, repo_root: Path
+    ) -> None:
+        # request_fix alone (no fix run yet) does not reappear: the reappear
+        # trigger requires fix_targeted_in_run, so a pre-fix-loop re-collect
+        # leaves the triaged request_fix issue triaged.
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        issue_path = _stage_triaged_issue(
+            repo_root,
+            feature_id,
+            lane_id,
+            action="request_fix",
+            reason="Fix later.",
+        )
+
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        merged = json.loads(issue_path.read_text())
+        assert merged["status"] == STATUS_TRIAGED
+        assert merged["triage"] == {
+            "action": "request_fix",
+            "reason": "Fix later.",
+            "by": "human",
+        }
+
+    def test_reappeared_issue_that_disappears_is_resolved(self, repo_root: Path) -> None:
+        # D6: any fingerprint absent from the new report is resolved, even one
+        # currently reappeared (a second fix worked, or the reviewer stopped
+        # reporting it). The state machine permits reappeared -> resolved.
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=[_issue(id="agent-review-1")], gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)  # raised
+        issue_path = self._issue_path(repo_root, feature_id)
+        issue = json.loads(issue_path.read_text())
+        issue["status"] = STATUS_REAPPEARED
+        issue["triage"] = None
+        issue["triage_history"] = [{"action": "request_fix", "reason": "Fix failed.", "by": "human"}]
+        write_json(issue_path, issue)
+
+        # Re-review drops the issue -> resolved diff fires.
+        _overwrite_review_report(repo_root, feature_id, lane_id, review_issues=[])
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        resolved = json.loads(issue_path.read_text())
+        assert resolved["status"] == STATUS_RESOLVED
 
 
 class TestCollectIssuesCli:
