@@ -124,9 +124,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
@@ -156,6 +157,15 @@ from ai_dev.profiles import (
     load_profile,
     render_profile,
     token_source_var,
+)
+from ai_dev.query import (
+    AuditRecordView,
+    FeatureStatusView,
+    FeatureSummary,
+    LaneDecisionSummary,
+    list_features,
+    read_audit_timeline,
+    show_feature_status,
 )
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
@@ -329,20 +339,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # v0.4 ticket 03: ``--repo-root`` is declared once on this parent parser and
+    # attached to every subparser via ``parents=[...]``. The declaration is
+    # deduplicated (one source of truth) without changing the invocation syntax
+    # — every command still accepts ``<command> ... --repo-root X`` exactly as
+    # before, so existing calls and scripts are unaffected. A second parent
+    # carries the read-only commands' shared ``--json`` flag.
+    repo_root_parent = argparse.ArgumentParser(add_help=False)
+    repo_root_parent.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+    json_parent = argparse.ArgumentParser(add_help=False)
+    json_parent.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the human-readable form "
+        "(read-only commands only; default: human-readable).",
+    )
+
     create = subparsers.add_parser(
         "create-feature-run",
         help="Create a new feature run from an intent string (ticket 01).",
+        parents=[repo_root_parent],
     )
     create.add_argument("intent", help="The original user intent text to record.")
-    create.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root to create .ai-dev/ under (default: current directory).",
-    )
 
     freeze = subparsers.add_parser(
         "freeze",
         help="Freeze a canonical artifact after its human gate passes (§4.2, ticket 04).",
+        parents=[repo_root_parent],
     )
     freeze.add_argument("feature_id", help="The FEATURE-NNN id of the run to update.")
     freeze.add_argument(
@@ -350,26 +377,18 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=FROZEN_ARTIFACTS,
         help="Which frozen artifact to flip (one of the §4.2 four).",
     )
-    freeze.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     show = subparsers.add_parser(
         "show-profile",
         help="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
+        parents=[repo_root_parent],
     )
     show.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
-    show.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/agent-profiles.yml (default: current dir).",
-    )
 
     prepare = subparsers.add_parser(
         "prepare-run",
         help="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
+        parents=[repo_root_parent],
     )
     prepare.add_argument(
         "feature_id", help="The FEATURE-NNN id to prepare the run under."
@@ -395,15 +414,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "Declare every task-specific workspace file so validate-run's boundary "
         "check passes (ticket 05 integration seam).",
     )
-    prepare.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     run = subparsers.add_parser(
         "run-headless",
         help="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
+        parents=[repo_root_parent],
     )
     run.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
     run.add_argument("run_id", help="The RUN-NNN id to invoke.")
@@ -425,29 +440,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="claude --permission-mode (default: bypassPermissions; the wrapper "
         "enforces the file boundary post-hoc, §14.2).",
     )
-    run.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     validate = subparsers.add_parser(
         "validate-run",
         help="Run the §14 deterministic validation (schema + boundary + frozen) "
         "on a captured run (ticket 04).",
+        parents=[repo_root_parent],
     )
     validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
     validate.add_argument("run_id", help="The RUN-NNN id to validate.")
-    validate.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     implement = subparsers.add_parser(
         "implement",
         help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
         "rollup (v0.2 ticket 01, §9.2).",
+        parents=[repo_root_parent],
     )
     implement.add_argument("feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen.")
     implement.add_argument("lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml).")
@@ -469,16 +476,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="claude --permission-mode (default: bypassPermissions; the wrapper "
         "enforces the file boundary post-hoc, §14.2).",
     )
-    implement.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     review = subparsers.add_parser(
         "review",
         help="Run the Code Reviewer leg: build -> run -> validate -> "
         "review-report (v0.2 ticket 02, §9.3).",
+        parents=[repo_root_parent],
     )
     review.add_argument(
         "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
@@ -504,16 +507,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="claude --permission-mode (default: bypassPermissions; the wrapper "
         "enforces the file boundary post-hoc, §14.2).",
     )
-    review.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     spec_gap = subparsers.add_parser(
         "spec-gap",
         help="Run the Spec Gap Analyst leg: build -> run -> validate -> "
         "spec-gap-report (v0.2 ticket 02, §9.4).",
+        parents=[repo_root_parent],
     )
     spec_gap.add_argument(
         "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
@@ -539,16 +538,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="claude --permission-mode (default: bypassPermissions; the wrapper "
         "enforces the file boundary post-hoc, §14.2).",
     )
-    spec_gap.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     verify = subparsers.add_parser(
         "verify",
         help="Run the shell Verifier leg: execute the lane's declared verify "
         "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
+        parents=[repo_root_parent],
     )
     verify.add_argument(
         "feature_id",
@@ -565,16 +560,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-command timeout in seconds (default: 300; a hung command is "
         "recorded as a verification failure, not raised, §24.1).",
     )
-    verify.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     collect = subparsers.add_parser(
         "collect-issues",
         help="Collect reviewer + spec-gap issues into feature issues and the "
         "lane issue-bundle (v0.2 ticket 04, §15).",
+        parents=[repo_root_parent],
     )
     collect.add_argument(
         "feature_id",
@@ -584,16 +575,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "lane_id",
         help="The LANE-NNN id whose checking reports should be collected.",
     )
-    collect.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     lane_gate = subparsers.add_parser(
         "lane-gate",
         help="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
         "(v0.2 ticket 05).",
+        parents=[repo_root_parent],
     )
     lane_gate.add_argument(
         "feature_id",
@@ -603,48 +590,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "lane_id",
         help="The LANE-NNN id whose gate should be evaluated.",
     )
-    lane_gate.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     coherence_gate = subparsers.add_parser(
         "coherence-gate",
         help="Evaluate the §18.5 feature coherence gate and write the terminal "
         "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
+        parents=[repo_root_parent],
     )
     coherence_gate.add_argument(
         "feature_id",
         help="The FEATURE-NNN id whose lane gate has passed and is ready for "
         "the final coherence verdict.",
     )
-    coherence_gate.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     final_report = subparsers.add_parser(
         "final-report",
         help="Generate final-report.{json,md} from the coherence verdict "
         "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
+        parents=[repo_root_parent],
     )
     final_report.add_argument(
         "feature_id",
         help="The FEATURE-NNN id whose coherence verdict should be projected "
         "into the final report.",
     )
-    final_report.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     triage = subparsers.add_parser(
         "triage",
         help="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
         "ticket 05). Deterministic - no model.",
+        parents=[repo_root_parent],
     )
     triage.add_argument(
         "feature_id",
@@ -674,16 +649,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="human",
         help="Who applied the triage (default: human; models may only propose).",
     )
-    triage.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
-    )
 
     fix_run = subparsers.add_parser(
         "fix-run",
         help="Run one bounded fix-loop bookend for active request_fix issues "
         "(ADR-0002, v0.3 ticket 07).",
+        parents=[repo_root_parent],
     )
     fix_run.add_argument(
         "feature_id",
@@ -715,10 +686,38 @@ def _build_parser() -> argparse.ArgumentParser:
         default=300,
         help="Per-command verifier timeout in seconds (default: 300).",
     )
-    fix_run.add_argument(
-        "--repo-root",
-        default=".",
-        help="Repository root holding .ai-dev/ (default: current directory).",
+
+    # v0.4 ticket 03: the three read-only observability commands (§26.5 CLI UX).
+    # They carry the shared ``--json`` flag (human-readable by default, JSON
+    # opt-in) on top of the shared ``--repo-root`` parent. They are deliberately
+    # absent from ``_DRY_RUN_COMMANDS`` below — a dry-run flag on a command with
+    # no side effects is noise.
+    subparsers.add_parser(
+        "list-features",
+        help="List every FEATURE-NNN with its derived status + current gate "
+        "(v0.4 ticket 03). Read-only.",
+        parents=[repo_root_parent, json_parent],
+    )
+
+    show_status = subparsers.add_parser(
+        "show-status",
+        help="Show a feature's gate/verdict/derived status + each lane's "
+        "lane-decision (v0.4 ticket 03). Read-only.",
+        parents=[repo_root_parent, json_parent],
+    )
+    show_status.add_argument(
+        "feature_id", help="The FEATURE-NNN id to inspect."
+    )
+
+    log_cmd = subparsers.add_parser(
+        "log",
+        help="Pretty-print a feature's audit timeline (v0.4 ticket 03). "
+        "Read-only; renders audit.log.json (consumes ticket 02's "
+        "origin/elapsed_ms).",
+        parents=[repo_root_parent, json_parent],
+    )
+    log_cmd.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
     )
 
     # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
@@ -1300,6 +1299,138 @@ def _run_triage(
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v0.4 ticket 03: read-only observability commands (§26.5 CLI UX).
+# ---------------------------------------------------------------------------
+
+
+def _print_json(payload: Any) -> None:
+    """Print ``payload`` as indented JSON to stdout (the ``--json`` form)."""
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _render_list_features(rows: Sequence[FeatureSummary]) -> None:
+    """Human-readable form of ``list-features`` (one line per feature)."""
+    if not rows:
+        print("(no features yet)")
+        return
+    for row in rows:
+        verdict = row.verdict if row.verdict is not None else "-"
+        print(
+            f"{row.feature_id}\tstatus={row.status}\t"
+            f"gate={row.current_gate}\tverdict={verdict}"
+        )
+
+
+def _run_list_features(repo_root: Path, as_json: bool) -> int:
+    """``ai-dev list-features`` — list every feature + derived status + gate.
+
+    Read-only: it reads each feature's ``feature-status.yml`` and prints one row
+    per ``FEATURE-NNN`` (human-readable by default, JSON with ``--json``). Empty
+    is a valid observable state, so it exits ``0`` even with zero features. A
+    corrupt feature-status file propagates as a clean ``error:`` + exit ``1``
+    (§24.2 fail loud) rather than silently dropping the broken feature.
+    """
+    try:
+        rows = list_features(repo_root)
+    except ValueError as exc:
+        _render_error(exc)
+        return 1
+    if as_json:
+        _print_json([row.to_dict() for row in rows])
+    else:
+        _render_list_features(rows)
+    return 0
+
+
+def _render_show_status(view: FeatureStatusView) -> None:
+    """Human-readable form of ``show-status``."""
+    verdict = view.verdict if view.verdict is not None else "(none)"
+    print(f"{view.feature_id}")
+    print(f"  status: {view.status}")
+    print(f"  current_gate: {view.current_gate}")
+    print(f"  verdict: {verdict}")
+    print("  lanes:")
+    if not view.lanes:
+        print("    (no lanes)")
+        return
+    for lane in view.lanes:
+        if lane.decision is None:
+            print(f"    {lane.lane_id}: (no lane-decision yet)")
+            continue
+        detail = ""
+        if lane.failed_conditions:
+            detail = f" failed=[{','.join(lane.failed_conditions)}]"
+        blockers = (
+            f" blockers={lane.blocking_issue_count}"
+            if lane.blocking_issue_count
+            else ""
+        )
+        print(f"    {lane.lane_id}: decision={lane.decision}{detail}{blockers}")
+
+
+def _run_show_status(repo_root: Path, feature_id: str, as_json: bool) -> int:
+    """``ai-dev show-status <FEATURE>`` — gate/verdict/status + per-lane decisions.
+
+    Read-only. Exits ``0`` on a readable feature, ``1`` with a clean ``error:``
+    when the feature does not exist (§24.2 fail loud).
+    """
+    try:
+        view = show_feature_status(repo_root, feature_id)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    if as_json:
+        _print_json(view.to_dict())
+    else:
+        _render_show_status(view)
+    return 0
+
+
+def _render_log(records: Sequence[AuditRecordView]) -> None:
+    """Human-readable chronological audit timeline (from ``audit.log.json``).
+
+    One block per event: ``<timestamp> · <event> · origin=<origin>`` followed by
+    the payload pairs. ``origin`` / ``elapsed_ms`` (ticket 02) are surfaced
+    inline so the timeline answers "which driver ran this" and "how long did it
+    take" without re-reading the raw log.
+    """
+    if not records:
+        print("(no audit events)")
+        return
+    for record in records:
+        header = f"{record.timestamp} · {record.event}"
+        if record.origin is not None:
+            header += f" · origin={record.origin}"
+        print(header)
+        for key, value in record.payload.items():
+            display = value if isinstance(value, str) else json.dumps(
+                value, ensure_ascii=False
+            )
+            print(f"  - {key}: {display}")
+        print()
+
+
+def _run_log(repo_root: Path, feature_id: str, as_json: bool) -> int:
+    """``ai-dev log <FEATURE>`` — pretty-print the audit timeline.
+
+    Read-only. Renders ``audit.log.json`` (the machine product — never
+    ``audit.log.md``), consuming ticket 02's ``origin`` / ``elapsed_ms``. Exits
+    ``0`` on a readable feature, ``1`` with a clean ``error:`` when the feature
+    does not exist or its audit log is missing/corrupt (§24.2 fail loud).
+    """
+    try:
+        records = read_audit_timeline(repo_root, feature_id)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    if as_json:
+        _print_json([record.to_dict() for record in records])
+    else:
+        _render_log(records)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code.
 
@@ -1345,6 +1476,15 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "show-profile":
         return _run_show_profile(Path(args.repo_root), args.name)
+
+    if args.command == "list-features":
+        return _run_list_features(Path(args.repo_root), args.json)
+
+    if args.command == "show-status":
+        return _run_show_status(Path(args.repo_root), args.feature_id, args.json)
+
+    if args.command == "log":
+        return _run_log(Path(args.repo_root), args.feature_id, args.json)
 
     if args.command == "prepare-run":
         return _run_prepare_run(

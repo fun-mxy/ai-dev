@@ -4,13 +4,13 @@
 
 **Blocked by:** 02 — `log` 依赖 02 写入的 `origin`/`elapsed_ms`
 
-**Status:** pending
+**Status:** done
 
-- [ ] `ai-dev list-features [--repo-root] [--json]`：列 FEATURE-NNN + 派生 status + current_gate
-- [ ] `ai-dev show-status <FEATURE> [--repo-root] [--json]`：current_gate + verdict + feature.status + 各 lane lane-decision
-- [ ] `ai-dev log <FEATURE> [--repo-root] [--json]`：按时间序渲染审计时间线（消费 02 的 `origin`/`elapsed_ms`）
-- [ ] 全局 `--json` flag 接入三条只读命令（默认人读、JSON opt-in）
-- [ ] `--repo-root` 抽到顶层 parser，各子命令 dedup（不破坏现有调用）
-- [ ] 单测：三条命令在 seeded feature run 上输出正确；`--json` 输出可 parse
-- [ ] feature 不存在时 exit 1 + 干净 `error:`（沿用 01 helper）
-- [ ] mypy + 全测试绿
+- [x] `ai-dev list-features [--repo-root] [--json]`：列 FEATURE-NNN + 派生 status + current_gate
+- [x] `ai-dev show-status <FEATURE> [--repo-root] [--json]`：current_gate + verdict + feature.status + 各 lane lane-decision
+- [x] `ai-dev log <FEATURE> [--repo-root] [--json]`：按时间序渲染审计时间线（消费 02 的 `origin`/`elapsed_ms`）
+- [x] 全局 `--json` flag 接入三条只读命令（默认人读、JSON opt-in）
+- [x] `--repo-root` 抽到顶层 parser，各子命令 dedup（不破坏现有调用）
+- [x] 单测：三条命令在 seeded feature run 上输出正确；`--json` 输出可 parse
+- [x] feature 不存在时 exit 1 + 干净 `error:`（沿用 01 helper）
+- [x] mypy + 全测试绿
