@@ -4,10 +4,10 @@
 
 **Blocked by:** 无 - 可立即开始
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `feature-status.yml` 字段 `final_verdict` -> `verdict`（init 值仍 null）
-- [ ] status.py `_initial_feature_status` + 任何读取 `final_verdict` 的代码同步改名
-- [ ] spec §8.3 示例 `final_verdict: null` -> `verdict: null`
-- [ ] 单测更新并通过：init 文档含 `verdict: null`、不含 `final_verdict`
-- [ ] mypy + 测试全绿；仓库内无残留 `final_verdict` 字符串（grep 干净）
+- [x] `feature-status.yml` 字段 `final_verdict` -> `verdict`（init 值仍 null）
+- [x] status.py `_initial_feature_status` + 任何读取 `final_verdict` 的代码同步改名
+- [x] spec §8.3 示例 `final_verdict: null` -> `verdict: null`
+- [x] 单测更新并通过：init 文档含 `verdict: null`、不含 `final_verdict`
+- [x] mypy + 测试全绿；仓库内无残留 `final_verdict` 字符串（grep 干净）
