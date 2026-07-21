@@ -64,7 +64,7 @@ class TestWriteInitialFeatureStatus:
         assert doc["feature"]["id"] == "FEATURE-001"
         assert doc["feature"]["status"] == "planning"
         assert doc["feature"]["current_gate"] == "requirements_gate"
-        assert doc["feature"]["final_verdict"] is None
+        assert doc["feature"]["verdict"] is None
 
     def test_all_four_frozen_flags_false(self, tmp_path: Path) -> None:
         write_initial_feature_status(tmp_path, "FEATURE-001")
@@ -86,6 +86,11 @@ class TestWriteInitialFeatureStatus:
         assert "current_gate: requirements_gate" in text
         # Spot-check one frozen flag renders as a literal false, not "False".
         assert "requirements: false" in text
+        # The coherence-gate verdict field (renamed from final_verdict per
+        # ADR-0003 D4) renders as a literal null at init, and the old name is
+        # gone from the file entirely.
+        assert "verdict: null" in text
+        assert "final_verdict" not in text
 
 
 class TestFreezeArtifact:
@@ -141,7 +146,7 @@ class TestFreezeArtifact:
         assert feature["id"] == "FEATURE-007"
         assert feature["status"] == "planning"
         assert feature["current_gate"] == "requirements_gate"
-        assert feature["final_verdict"] is None
+        assert feature["verdict"] is None
 
     def test_freeze_appends_an_audit_record(self, tmp_path: Path) -> None:
         _seed_feature(tmp_path)

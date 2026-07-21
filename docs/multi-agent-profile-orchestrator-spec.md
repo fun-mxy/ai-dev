@@ -517,7 +517,7 @@ feature:
     tasks: false
     lane_graph: false
   current_gate: requirements_gate
-  final_verdict: null
+  verdict: null
 ```
 
 ---

@@ -87,7 +87,7 @@ def _initial_feature_status(feature_id: str) -> dict[str, Any]:
             "status": "planning",
             "frozen_artifacts": {name: False for name in FROZEN_ARTIFACTS},
             "current_gate": _INITIAL_GATE,
-            "final_verdict": None,
+            "verdict": None,
         }
     }
 
