@@ -36,7 +36,7 @@ import json
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ai_dev.checking_legs import (
     ISSUES_OUTPUT_SCHEMA,
@@ -45,6 +45,7 @@ from ai_dev.checking_legs import (
     _require_frozen,
     _reviewer_task_text,
     _spec_gap_task_text,
+    ImplementRunFacts,
     read_implement_run_facts,
 )
 from ai_dev.coherence_gate import COHERENCE_DECISION_JSON, compute_coherence
@@ -358,7 +359,7 @@ def _plan_checking(
     profile: AgentProfile,
     *,
     role: str,
-    task_fn: Any,
+    task_fn: Callable[[Path, ImplementRunFacts], str],
     command: str,
     label: str,
     max_turns: int,
@@ -370,7 +371,13 @@ def _plan_checking(
         raise ValueError(f"feature run {feature_id} not found under {repo_root}")
     _require_frozen(feature_root)
     facts = read_implement_run_facts(repo_root, feature_id, lane_id)
-    task_text = task_fn(facts)
+    # ``task_fn`` takes ``(feature_root, facts)`` so the spec-gap task gets the
+    # root it reads the frozen spec artifacts from; the reviewer task ignores
+    # the root (it builds from the implement-run facts alone), so plan_review
+    # adapts via a thunk. (Previously this called ``task_fn(facts)`` with one
+    # arg, which crashed every spec-gap dry-run: _spec_gap_task_text needs the
+    # root too.)
+    task_text = task_fn(feature_root, facts)
     _require_token_source(profile)
 
     temp_root, input_dir = _render_temp_package(
@@ -421,7 +428,7 @@ def plan_review(
         lane_id,
         profile,
         role=_REVIEWER_ROLE,
-        task_fn=_reviewer_task_text,
+        task_fn=lambda _feature_root, facts: _reviewer_task_text(facts),
         command="review",
         label="REVIEW",
         max_turns=max_turns,

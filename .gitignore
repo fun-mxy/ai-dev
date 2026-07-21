@@ -15,6 +15,12 @@ __pycache__/
 *.py[cod]
 src/*.egg-info/
 
+# Test coverage artifacts (pytest-cov). The baseline NUMBER is recorded in
+# README; the data/HTML reports are regenerated locally and not committed.
+.coverage
+htmlcov/
+.pytest_cache/
+
 # macOS
 .DS_Store
 

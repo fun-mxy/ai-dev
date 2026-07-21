@@ -21,6 +21,7 @@ dev = [
     "pytest>=7.0",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [project.scripts]
@@ -34,7 +35,11 @@ where = ["src"]
 # src layout: let tests import the package without an editable install.
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "-ra"
+# Coverage is on by default (`uv run pytest` prints it). Branch coverage is
+# tracked but there is NO `--cov-fail-under` gate — the number is a soft target
+# (see README), not a build-breaking threshold. Drop to HTML with:
+#   uv run pytest --cov-report=html
+addopts = "-ra --cov=ai_dev --cov-branch --cov-report=term-missing"
 
 [tool.mypy]
 packages = ["ai_dev"]

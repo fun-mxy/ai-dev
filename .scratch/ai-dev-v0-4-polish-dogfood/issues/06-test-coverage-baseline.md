@@ -4,12 +4,30 @@
 
 **Blocked by:** 01, 02, 03, 04 — baseline 须反映新代码，故靠后
 
-**Status:** pending
+**Status:** done
 
-- [ ] `uv add --group dev pytest-cov`；pyproject 配 `--cov=ai_dev` + 分支覆盖；更新 `uv.lock`
-- [ ] `uv run pytest` 出覆盖率报告（terminal + 可选 HTML）
-- [ ] README 写 committed baseline 数字（v0.4 status 段）
-- [ ] 补 01-04 surfaced 缺口测试（dry-run 路径、新 error 分支、只读命令、新审计字段）
-- [ ] 无 hard gate（确认 pyproject/CI 无 fail-on-coverage 阈值）
-- [ ] 文档软目标（README 一行）
-- [ ] mypy + 全测试绿；覆盖率数字 honest
+- [x] `uv add --group dev pytest-cov`；pyproject 配 `--cov=ai_dev` + 分支覆盖；更新 `uv.lock`
+- [x] `uv run pytest` 出覆盖率报告（terminal + 可选 HTML）
+- [x] README 写 committed baseline 数字（v0.4 status 段）
+- [x] 补 01-04 surfaced 缺口测试（dry-run 路径、新 error 分支、只读命令、新审计字段）
+- [x] 无 hard gate（确认 pyproject/CI 无 fail-on-coverage 阈值）
+- [x] 文档软目标（README 一行）
+- [x] mypy + 全测试绿；覆盖率数字 honest
+
+Delivered baseline: **91%** (683 tests, line + branch). `pytest-cov` wired into the dev group;
+`pyproject.toml`'s `[tool.pytest.ini_options]` adds `--cov=ai_dev --cov-branch --cov-report=term-missing`
+by default (opt into HTML with `--cov-report=html`). No `--cov-fail-under` anywhere — coverage is a
+soft target documented in README, not a build gate.
+
+Gap tests filled (real seams, not gauge-padding):
+- **dry-run (ticket 04):** the review + spec-gap checking-leg happy path through `_plan_checking`
+  (previously untested) — which surfaced and fixed a real bug: `plan_spec_gap` called
+  `_spec_gap_task_text(facts)` but that builder takes `(feature_root, facts)`, so every spec-gap
+  dry-run crashed. Also added the disarming-without-reason + request_fix-budget-exhausted refusal
+  branches, the token-source-not-set precondition, unknown disposition/severity, and parametrized
+  feature-not-found guards across the planners.
+- **error branches (ticket 01):** the shared `except ProfileError` guard in `implement` / `review` /
+  `spec-gap` / `fix-run` (clean `error:` + exit 1 on a missing registry), parametrized across all four.
+- Read-only commands (ticket 03) + audit fields (ticket 02) were already well covered; no padding added.
+
+Verified: `uv run pytest` 683 passed, `uv run mypy src/ai_dev` clean.

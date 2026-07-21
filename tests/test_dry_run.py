@@ -37,6 +37,7 @@ from ai_dev.dry_run import (
     plan_lane_gate,
     plan_review,
     plan_run_headless,
+    plan_spec_gap,
     plan_triage,
     render_plan,
 )
@@ -47,6 +48,7 @@ from ai_dev.profiles import load_profile
 from ai_dev.run_prepare import prepare_run
 from ai_dev.status import freeze_artifact
 
+from test_checking_legs import _stage_implement_run  # noqa: E402
 from test_implement_leg import _feature_root, _seed_frozen_feature  # noqa: E402
 
 
@@ -80,6 +82,14 @@ def _audit_count(feature_root: Path) -> int:
     if not path.is_file():
         return 0
     return len(json.loads(path.read_text()))
+
+
+def _exhaust_fix_loop_budget(feature_root: Path) -> None:
+    """Force ``fix_loop_budget`` to ``used == max`` so the ADR-0002 D5 guard fires."""
+    status_path = feature_root / "status" / "feature-status.yml"
+    doc = yaml.safe_load(status_path.read_text())
+    doc["feature"]["fix_loop_budget"] = {"used": 1, "max": 1}
+    status_path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
 def _run_cli(repo_root: Path, argv: list[str]) -> int:
@@ -178,6 +188,77 @@ class TestAgentDryRun:
 
         with pytest.raises(ValueError, match="implement-result"):
             plan_review(repo_root, feature_id, lane_id, profile)
+
+    def test_checking_leg_plans_without_spawn_or_mint(
+        self,
+        repo_root: Path,
+        write_profiles,
+        clean_token_env,
+        monkeypatch,
+    ) -> None:
+        # review + spec-gap share _plan_checking; stage a real implement run so
+        # the planner reaches the would-be package + invocation (the only happy
+        # path through _plan_checking, previously untested).
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        feature_id, lane_id, impl_run_id = _stage_implement_run(repo_root)
+        feature_root = _feature_root(repo_root, feature_id)
+        profile = load_profile(repo_root, "cc-glm52")
+        before_tree = _inventory(feature_root)
+        before_counters = _counters(feature_root)
+
+        review = plan_review(repo_root, feature_id, lane_id, profile)
+        assert review.command == "review"
+        assert review.details["would_spawn"] is True
+        assert review.details["implement_run_id"] == impl_run_id
+        assert review.details["role"] == "Code Reviewer"
+        assert review.details["invocation"][0] == "claude"
+        # No id minted, no spawn, feature tree untouched.
+        assert review.details["would_mint_ids"] == ["RUN-NNN (next monotonic)"]
+        assert _counters(feature_root) == before_counters
+        assert _inventory(feature_root) == before_tree
+
+        # spec-gap exercises the other role through the same shared planner.
+        spec_gap = plan_spec_gap(repo_root, feature_id, lane_id, profile)
+        assert spec_gap.command == "spec-gap"
+        assert spec_gap.details["role"] == "Spec Gap Analyst"
+        assert spec_gap.details["would_spawn"] is True
+        assert _inventory(feature_root) == before_tree
+
+    def test_token_source_not_set_exits_1(
+        self,
+        repo_root: Path,
+        write_profiles,
+        clean_token_env,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # clean_token_env deletes both token vars -> §24.2 precondition fails at
+        # the planner's _require_token_source guard (not at profile load).
+        write_profiles(repo_root)
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        rc = _run_cli(repo_root, ["implement", feature_id, lane_id, "--dry-run"])
+        assert rc == 1
+        assert "token source not set" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "planner", [plan_implement, plan_review, plan_spec_gap]
+    )
+    def test_agent_planner_missing_feature_raises(
+        self,
+        repo_root: Path,
+        write_profiles,
+        clean_token_env,
+        monkeypatch,
+        planner,
+    ) -> None:
+        # The agent planners share the feature-exists precondition; one
+        # parametrized check pins it for implement + both checking legs.
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        profile = load_profile(repo_root, "cc-glm52")
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            planner(repo_root, "FEATURE-404", "LANE-001", profile)
 
     def test_run_headless_missing_run_exits_1(
         self, repo_root, write_profiles, clean_token_env, monkeypatch, capsys
@@ -338,6 +419,96 @@ class TestTriageDryRun:
         assert rc == 1
         assert "ISSUE-999" in capsys.readouterr().err
 
+    def test_disarming_without_reason_refused_exit_0(self, repo_root: Path) -> None:
+        # override x P1 disarms (would mint a DEC) so a reason is mandatory
+        # (ADR-0001 #6). dry-run reports the refusal in the plan (exit 0) rather
+        # than raising - it is a preview of "this would be refused".
+        from test_triage import _stage_issue
+
+        feature_root, feature_id, issue_id, _ = _stage_issue(repo_root, severity="P1")
+        before = _inventory(feature_root)
+
+        plan = plan_triage(repo_root, feature_id, issue_id, "override", None, "human")
+        assert plan.details["would_be_refused"] is True
+        assert "requires a reason" in plan.details["refusal_reason"]
+        # Nothing written (no DEC, no triage state).
+        assert _inventory(feature_root) == before
+
+    def test_request_fix_budget_exhausted_refused_exit_0(self, repo_root: Path) -> None:
+        # ADR-0002 D5: request_fix is refused once fix_loop_budget is exhausted.
+        # dry-run surfaces this as a would_be_refused plan (exit 0), validating
+        # the disposition without consuming or recording anything.
+        from test_triage import _stage_issue
+
+        feature_root, feature_id, issue_id, _ = _stage_issue(repo_root, severity="P1")
+        _exhaust_fix_loop_budget(feature_root)
+        before = _inventory(feature_root)
+
+        plan = plan_triage(
+            repo_root, feature_id, issue_id, "request_fix", "Try again.", "human"
+        )
+        assert plan.details["would_be_refused"] is True
+        assert "fix_loop_budget" in plan.details["refusal_reason"]
+        assert _inventory(feature_root) == before
+
+    def test_unknown_disposition_raises(self, repo_root: Path) -> None:
+        from test_triage import _stage_issue
+
+        _stage_issue(repo_root, severity="P1")
+        with pytest.raises(ValueError, match="unknown disposition"):
+            plan_triage(
+                repo_root, "FEATURE-001", "ISSUE-001", "nope", None, "human"
+            )
+
+    def test_unknown_issue_severity_raises(self, repo_root: Path) -> None:
+        from ai_dev.feature_run import create_feature_run
+
+        feature_id = create_feature_run(repo_root, "triage severity test")
+        feature_root = _feature_root(repo_root, feature_id)
+        issue_path = feature_root / "issues" / "ISSUE-001.json"
+        issue_path.parent.mkdir(parents=True, exist_ok=True)
+        issue_path.write_text(json.dumps({"id": "ISSUE-001", "severity": "P9"}))
+
+        with pytest.raises(ValueError, match="unknown severity"):
+            plan_triage(
+                repo_root, feature_id, "ISSUE-001", "accept", None, "human"
+            )
+
+
+class TestDryRunPreconditionFeatureNotFound:
+    """Every planner fails loud (§24.2) when its feature does not exist.
+
+    The CLI surfaces the ValueError as a clean ``error:`` + exit 1; the
+    precondition guard is shared across the deterministic + agent planners, so
+    one parametrized check pins the contract for all of them.
+    """
+
+    @pytest.mark.parametrize(
+        ("planner", "extra_args"),
+        [
+            (plan_freeze, ("tasks",)),
+            (plan_coherence_gate, ()),
+            (plan_final_report, ()),
+        ],
+    )
+    def test_deterministic_planner_missing_feature_raises(
+        self, repo_root: Path, planner, extra_args: tuple
+    ) -> None:
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            planner(repo_root, "FEATURE-404", *extra_args)
+
+    def test_triage_missing_feature_raises(self, repo_root: Path) -> None:
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            plan_triage(
+                repo_root, "FEATURE-404", "ISSUE-001", "accept", None, "human"
+            )
+
+    def test_lane_gate_missing_feature_and_lane_raise(
+        self, repo_root: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            plan_lane_gate(repo_root, "FEATURE-404", "LANE-001")
+
 
 class TestGateDryRun:
     """coherence-gate / lane-gate / final-report compute the verdict, write nothing."""
@@ -434,6 +605,38 @@ class TestFixRunDryRun:
         assert plan.details["would_consume_budget"] is False
         assert _inventory(feature_root) == before
         assert _counters(feature_root) == before_counters
+
+    def test_budget_exhausted_exits_1(
+        self,
+        repo_root: Path,
+        write_profiles,
+        clean_token_env,
+        monkeypatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # ADR-0002 D5: once fix_loop_budget is exhausted the driver refuses
+        # before planning anything (a real precondition, not a would_be_refused).
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        feature_id, lane_id = _seed_frozen_feature(repo_root, tasks=["TASK-001"])
+        _exhaust_fix_loop_budget(_feature_root(repo_root, feature_id))
+
+        rc = _run_cli(repo_root, ["fix-run", feature_id, lane_id, "--dry-run"])
+        assert rc == 1
+        assert "fix_loop_budget exhausted" in capsys.readouterr().err
+
+    def test_missing_feature_raises(
+        self,
+        repo_root: Path,
+        write_profiles,
+        clean_token_env,
+        monkeypatch,
+    ) -> None:
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        profile = load_profile(repo_root, "cc-glm52")
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            plan_fix_run(repo_root, "FEATURE-404", "LANE-001", profile)
 
 
 # ---------------------------------------------------------------------------

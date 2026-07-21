@@ -966,5 +966,25 @@ class TestCliErrorMessages:
         assert "export" in err
 
 
+class TestCliAgentCommandsProfileError:
+    """implement / review / spec-gap / fix-run load the profile before any leg
+    runs, so a missing registry surfaces as a clean ``error:`` + exit 1 (ticket
+    01's top-level error rendering) rather than a traceback. The shared
+    ``except ProfileError`` guard in each ``_run_*`` was previously unexercised.
+    """
 
+    @pytest.mark.parametrize("cmd", ["implement", "review", "spec-gap", "fix-run"])
+    def test_missing_profiles_file_exits_nonzero(
+        self, cmd: str, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # No agent-profiles.yml written -> load_profile raises ProfileError,
+        # caught and rendered as one error line. Feature/lane need not exist:
+        # profile load is the first step of each command.
+        code = main([
+            cmd, "FEATURE-001", "LANE-001", "--repo-root", str(repo_root),
+        ])
 
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "agent-profiles.yml" in err

@@ -31,7 +31,19 @@ apply_triage command + DEC promotion, lane-gate blocking formula, bounded fix-ru
 coherence-gate evaluator (terminal verdict), and final-report generator, with PASS + FAIL end-to-end
 evidence on ark (tickets 01-10).
 
-Next: v0.4 — polish and dogfood (§26.5).
+v0.4 — polish and dogfood (§26.5) in progress: actionable error messages + top-level `--debug`
+(ticket 01), audit `elapsed_ms` + `origin` fields (ticket 02), read-only `list-features` /
+`show-status` / `log` + global `--json` (ticket 03), and `--dry-run` mode (ticket 04 / ADR-0004).
+
+## Test coverage
+
+`uv run pytest` reports line + branch coverage of `ai_dev` (via `pytest-cov`, configured in
+`pyproject.toml`). The committed v0.4 baseline is **91%** (683 tests).
+
+Coverage is a **soft target**, not a gate: there is no `--cov-fail-under` threshold, so a missed
+line never breaks the build. The goal is to keep this number honest and trending up — prefer a real
+test at a genuine seam over a synthetic one that only moves the gauge. Regressions that drop
+meaningful coverage should be called out in review, not blocked by CI.
 
 ## Usage
 
