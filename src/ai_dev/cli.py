@@ -95,6 +95,16 @@ v0.3 additions (Human Triage + fix loop, ADR-0001/0002):
   driver marks targeted issues with ``fix_targeted_in_run`` and stops before the
   mandatory human re-triage step.
 
+* ``ai-dev coherence-gate <FEATURE>`` (ticket 08) - the terminal §18.5 gate
+  (ADR-0003 D1/D2/D4). Deterministic - no profile, no token, no model. Checks
+  the three D1 input conditions (status consistency; all P0/P1 resolved or
+  disarmed with the lane gate PASSed; every disarmed blocker has a DEC-NNN
+  file), then atomically writes ``current_gate=feature_coherence_gate`` +
+  ``verdict`` (pass/fail) + derived ``feature.status`` (done/blocked) on
+  ``feature-status.yml`` and a ``coherence-decision.{md,json}`` double product.
+  ``verdict`` is mutable (re-coherence overwrites). Exits ``0`` on pass, ``1``
+  on fail or fail-loud missing/corrupt prerequisites (§24.2).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -107,6 +117,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
+from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
 from ai_dev.feature_run import create_feature_run
 from ai_dev.fix_run import FixRunResult, run_fix_run
 from ai_dev.implement_leg import run_implementer_leg
@@ -422,6 +433,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The LANE-NNN id whose gate should be evaluated.",
     )
     lane_gate.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    coherence_gate = subparsers.add_parser(
+        "coherence-gate",
+        help="Evaluate the §18.5 feature coherence gate and write the terminal "
+        "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
+    )
+    coherence_gate.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane gate has passed and is ready for "
+        "the final coherence verdict.",
+    )
+    coherence_gate.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -867,6 +894,37 @@ def _run_lane_gate(
     return 1
 
 
+def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
+    """Evaluate the deterministic §18.5 coherence gate and print PASS/FAIL.
+
+    Delegates to ``evaluate_coherence_gate`` (lane-decision + issues/ +
+    decisions/ + feature-status -> ``coherence-decision.{md,json}`` + the atomic
+    ``current_gate=feature_coherence_gate`` + ``verdict`` + derived
+    ``feature.status`` write) and returns the process-level contract: ``0`` for
+    PASS, ``1`` for FAIL or fail-loud missing/corrupt prerequisites (§24.2). A
+    FAIL still writes the verdict (status=blocked); a fail-loud precondition
+    writes nothing.
+    """
+    try:
+        result: CoherenceResult = evaluate_coherence_gate(repo_root, feature_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.passed:
+        print(
+            f"COHERENCE-GATE PASS - feature={result.feature_id} verdict=pass "
+            f"status=done decision={result.decision_json_path}"
+        )
+        return 0
+    failed = ",".join(result.failed_conditions)
+    print(
+        f"COHERENCE-GATE FAIL - feature={result.feature_id} verdict=fail "
+        f"status=blocked failed_conditions={failed} "
+        f"decision={result.decision_json_path}"
+    )
+    return 1
+
+
 def _run_fix_run(
     repo_root: Path,
     feature_id: str,
@@ -1030,6 +1088,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.feature_id,
             args.lane_id,
         )
+
+    if args.command == "coherence-gate":
+        return _run_coherence_gate(Path(args.repo_root), args.feature_id)
 
     if args.command == "fix-run":
         return _run_fix_run(

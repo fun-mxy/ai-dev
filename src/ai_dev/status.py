@@ -25,9 +25,10 @@ v0.3 (ADR-0003) wires the gate state machine into these primitives:
 human-gate freeze (requirements/design/tasks; lane_graph does not advance), and
 ``feature.status`` is a derived projection of ``(current_gate, verdict)``
 recomputed inside every mutation (``derive_feature_status``) - never an
-independent field. The coherence gate's terminal advance
-(``current_gate = feature_coherence_gate`` + ``verdict``) lands in a later
-ticket; this module owns the derivation and the human-gate advance.
+independent field. ``record_coherence_verdict`` is the terminal write: the
+coherence evaluator's sole ``verdict`` writer, advancing
+``current_gate = feature_coherence_gate`` and writing ``verdict`` atomically
+(ADR-0003 D2/D4, ticket 08).
 """
 
 from __future__ import annotations
@@ -75,6 +76,12 @@ _FIX_LOOP_BUDGET_EVENT = "fix_loop_budget"
 _FIX_LOOP_BUDGET_USED = "used"
 _FIX_LOOP_BUDGET_MAX = "max"
 _FIX_LOOP_BUDGET_DEFAULT_MAX = 1
+# ADR-0003 D2/D4 (ticket 08): the coherence evaluator's terminal write advances
+# current_gate to the final gate and writes the mutable coherence verdict in one
+# atomic mutation. The sole writer of feature-status.yml.verdict (D4).
+_COHERENCE_GATE_EVENT = "coherence_gate"
+_FEATURE_COHERENCE_GATE = GATES[-1]
+_COHERENCE_VERDICTS = ("pass", "fail")
 
 
 class FrozenArtifactError(ValueError):
@@ -197,6 +204,34 @@ def _feature_status_path(feature_root: Path) -> Path:
 def _load_feature_status(feature_root: Path) -> dict[str, Any]:
     """Load and parse the feature-status document from the feature run root."""
     return yaml.safe_load(_feature_status_path(feature_root).read_text())
+
+
+def load_feature_status(feature_root: Path) -> dict[str, Any]:
+    """Load and parse the feature-status document (read-side companion to the
+    writers).
+
+    Fails loud (§24.2) if the file is missing or malformed: a real feature run
+    always has a valid ``feature-status.yml`` (``create_feature_run`` writes it,
+    the mutating primitives rewrite it deterministically), so an unreadable or
+    mis-shaped file is genuine corruption the caller must surface. Mirrors
+    ``frozen_artifacts_status``'s defensive read.
+    """
+    path = _feature_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"feature-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"feature-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    if not isinstance(doc, dict) or not isinstance(doc.get("feature"), dict):
+        raise ValueError(
+            f"feature-status.yml at {path} is malformed (no 'feature' mapping, §24.2)"
+        )
+    return doc
 
 
 def frozen_artifacts_status(feature_root: Path) -> Mapping[str, bool]:
@@ -478,6 +513,54 @@ def set_current_gate(
         return [(_ADVANCE_GATE_EVENT, {"current_gate": gate})]
 
     _mutate_feature_status(feature_root, _set_gate, timestamp=timestamp)
+
+
+def record_coherence_verdict(
+    feature_root: Path,
+    verdict: str,
+    *,
+    audit_payload: Mapping[str, Any] | None = None,
+    timestamp: str | None = None,
+) -> None:
+    """Atomically write the coherence gate's terminal state (ADR-0003 D2/D4).
+
+    The coherence evaluator's (ticket 08) sole canonical write, and the **only**
+    writer of ``feature-status.yml.verdict`` (D4). Sets
+    ``current_gate = feature_coherence_gate`` and ``verdict`` (pass/fail) in one
+    mutation, re-derives ``feature.status`` (done/blocked, D3) from the resulting
+    ``(current_gate, verdict)``, and audits a ``coherence_gate`` event. Because
+    both fields move in the same mutation, the ``(fcg, null)`` transient is
+    unreachable on disk by construction (D3 note †) - this primitive cannot
+    produce it, and a non pass/fail ``verdict`` is rejected before any write.
+
+    ``audit_payload`` is the evaluator-supplied condition breakdown
+    (``failed_conditions`` etc.); it is merged into the single ``coherence_gate``
+    audit record alongside the verdict, so the canonical verdict write and its
+    rationale land in one atomic mutation (the audit is appended only after the
+    status dump succeeds - a rejected verdict writes nothing and audits nothing).
+
+    ADR-0003 D4: ``verdict`` is mutable. A re-coherence overwrites a prior
+    verdict (e.g. ``fail`` -> fix -> re-coherence -> ``pass``); this primitive
+    performs no monotonicity check on ``verdict`` (unlike ``current_gate``),
+    mirroring ``lane-decision.json``'s re-evaluable verdict.
+    """
+    if verdict not in _COHERENCE_VERDICTS:
+        raise ValueError(
+            f"coherence verdict must be one of {_COHERENCE_VERDICTS}, got {verdict!r}"
+        )
+
+    def _write_verdict(feature: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        feature["current_gate"] = _FEATURE_COHERENCE_GATE
+        feature["verdict"] = verdict
+        payload: dict[str, Any] = {
+            "current_gate": _FEATURE_COHERENCE_GATE,
+            "verdict": verdict,
+        }
+        if audit_payload:
+            payload.update(audit_payload)
+        return [(_COHERENCE_GATE_EVENT, payload)]
+
+    _mutate_feature_status(feature_root, _write_verdict, timestamp=timestamp)
 
 
 def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:

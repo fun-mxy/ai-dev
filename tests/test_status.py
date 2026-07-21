@@ -32,6 +32,7 @@ from ai_dev.status import (
     FrozenArtifactError,
     derive_feature_status,
     freeze_artifact,
+    record_coherence_verdict,
     set_current_gate,
     write_initial_feature_status,
     write_initial_lane_status,
@@ -581,6 +582,95 @@ class TestSetCurrentGate:
         assert feature["current_gate"] == "feature_coherence_gate"
         assert feature["verdict"] == verdict
         assert feature["status"] == expected_status
+
+
+class TestRecordCoherenceVerdict:
+    """status.record_coherence_verdict - the coherence evaluator's sole
+    canonical write (ADR-0003 D2/D4, ticket 08).
+
+    Atomically sets ``current_gate = feature_coherence_gate`` and ``verdict``
+    (pass/fail) in one mutation, re-derives ``feature.status`` (done/blocked,
+    D3), and audits a ``coherence_gate`` event. The ``(fcg, null)`` transient is
+    unreachable by construction: this primitive writes both fields together, so
+    it can never be called with a null verdict.
+    """
+
+    def test_pass_verdict_writes_done_status(self, tmp_path: Path) -> None:
+        _seed_feature(tmp_path)
+
+        record_coherence_verdict(tmp_path, "pass", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "feature_coherence_gate"
+        assert feature["verdict"] == "pass"
+        assert feature["status"] == "done"
+
+    def test_fail_verdict_writes_blocked_status(self, tmp_path: Path) -> None:
+        _seed_feature(tmp_path)
+
+        record_coherence_verdict(tmp_path, "fail", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "feature_coherence_gate"
+        assert feature["verdict"] == "fail"
+        assert feature["status"] == "blocked"
+
+    def test_unknown_verdict_rejected(self, tmp_path: Path) -> None:
+        _seed_feature(tmp_path)
+
+        with pytest.raises(ValueError, match="verdict"):
+            record_coherence_verdict(tmp_path, "maybe", timestamp="t")
+
+        # State untouched: nothing written, no audit record.
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "requirements_gate"
+        assert feature["verdict"] is None
+        assert not (tmp_path / AUDIT_LOG_JSON).exists()
+
+    def test_re_coherence_overwrites_prior_verdict(self, tmp_path: Path) -> None:
+        # ADR-0003 D4: verdict is mutable. A re-coherence overwrites a prior
+        # verdict (fail -> pass), mirroring lane-decision.json's verdict.
+        _seed_feature(tmp_path)
+        record_coherence_verdict(tmp_path, "fail", timestamp="t1")
+        assert _feature_doc(tmp_path)["feature"]["status"] == "blocked"
+
+        record_coherence_verdict(tmp_path, "pass", timestamp="t2")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "feature_coherence_gate"
+        assert feature["verdict"] == "pass"
+        assert feature["status"] == "done"
+
+    def test_verdict_write_is_audited(self, tmp_path: Path) -> None:
+        _seed_feature(tmp_path)
+
+        record_coherence_verdict(
+            tmp_path,
+            "fail",
+            audit_payload={"failed_conditions": ["all_p0_p1_handled"]},
+            timestamp="2026-07-21T09:00:00Z",
+        )
+
+        record = _audit_records(tmp_path)[-1]
+        assert record["event"] == "coherence_gate"
+        assert record["timestamp"] == "2026-07-21T09:00:00Z"
+        # The primitive carries the verdict + terminal gate, plus the
+        # evaluator-supplied condition breakdown merged into one record.
+        assert record["payload"]["verdict"] == "fail"
+        assert record["payload"]["current_gate"] == "feature_coherence_gate"
+        assert record["payload"]["failed_conditions"] == ["all_p0_p1_handled"]
+
+    def test_status_always_matches_derivation_after_verdict_write(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        record_coherence_verdict(tmp_path, "fail", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["status"] == derive_feature_status(
+            feature["current_gate"], feature["verdict"]
+        )
 
 
 class TestFeatureStatusIsAlwaysDerived:

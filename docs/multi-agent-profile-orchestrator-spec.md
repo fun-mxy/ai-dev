@@ -1135,11 +1135,10 @@ MVP v0 只有一个 lane，但仍保留 lane gate。
 
 多 lane 时检查整体一致性。
 
-MVP v0 单 lane 下退化为最终复查：
+MVP v0 单 lane 下退化为最终复查（ADR-0003 D1 - coherence 验 inputs，非 report artifact；final report 是 step 21 下游）：
 
 - final status 是否一致；
 - 所有 P0/P1 是否处理；
-- final report 是否完整；
 - decisions 是否记录。
 
 ---
