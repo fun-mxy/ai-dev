@@ -12,11 +12,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from ai_dev.checking_legs import write_review_report, write_spec_gap_report
 from ai_dev.cli import main
 from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, collect_issue_bundle
 from ai_dev.issue_status import ISSUE_STATUSES
+from ai_dev.json_artifact import write_json
 from ai_dev.lane_gate import (
     LANE_DECISION_JSON,
     LANE_DECISION_MD,
@@ -30,8 +32,10 @@ from test_checking_legs import (  # noqa: E402
     _REVIEW_RUN_METADATA,
     _stage_implement_run,
 )
-from test_implement_leg import _feature_root  # noqa: E402
 from test_issue_bundle import _issue  # noqa: E402
+from test_implement_leg import _feature_root  # noqa: E402
+
+_TRIAGE_TS = "2026-07-20T12:30:00Z"
 
 _PASSING_RESULTS = [
     CommandResult(
@@ -92,6 +96,35 @@ def _stage_lane_gate_inputs(
     return feature_id, lane_id
 
 
+def _set_first_bundle_issue_triage(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    triage: dict[str, Any] | None,
+) -> None:
+    """Stamp triage onto the first projected bundle issue and its feature SoT."""
+    bundle_path = lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON
+    bundle = json.loads(bundle_path.read_text())
+    issue_id = bundle["issues"][0]["id"]
+    bundle["issues"][0]["triage"] = triage
+    write_json(bundle_path, bundle)
+
+    issue_path = _feature_root(repo_root, feature_id) / "issues" / f"{issue_id}.json"
+    issue = json.loads(issue_path.read_text())
+    issue["triage"] = triage
+    write_json(issue_path, issue)
+
+
+def _disarming_triage(action: str, *decision_ids: str) -> dict[str, Any]:
+    return {
+        "action": action,
+        "reason": "human triage rationale",
+        "by": "human",
+        "ts": _TRIAGE_TS,
+        "decision_ids": list(decision_ids),
+    }
+
+
 class TestEvaluateLaneGate:
     """Library seam: evaluate §18.4 and write lane-decision artifacts."""
 
@@ -142,7 +175,7 @@ class TestEvaluateLaneGate:
         assert decision["blocking_issue_count"] == 1
         assert decision["blocking_issues"][0]["severity"] == "P0"
         assert decision["conditions"][2]["passed"] is False
-        assert "P0/P1 blocking review issue(s): 1" in decision["conditions"][2]["reason"]
+        assert "P0 is untriaged" in decision["conditions"][2]["reason"]
 
     def test_p1_spec_gap_issue_fails_by_default(self, repo_root: Path) -> None:
         feature_id, lane_id = _stage_lane_gate_inputs(
@@ -166,7 +199,164 @@ class TestEvaluateLaneGate:
         )
         assert decision["blocking_issues"][0]["severity"] == "P1"
         assert decision["conditions"][3]["passed"] is False
-        assert "v0.2 has no triage override" in decision["conditions"][3]["reason"]
+        assert "untriaged" in decision["conditions"][3]["reason"]
+
+    def test_p0_reject_with_decision_disarms_gate(self, repo_root: Path) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p0",
+                    source="code_review",
+                    severity="P0",
+                    title="Rejected false positive",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            _disarming_triage("reject", "DEC-001"),
+        )
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "pass"
+        assert result.blocking_issues == []
+        decision = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).read_text()
+        )
+        assert decision["blocking_issue_count"] == 0
+        assert decision["conditions"][2]["passed"] is True
+
+    def test_p0_reject_without_reason_still_fails_gate(self, repo_root: Path) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p0",
+                    source="code_review",
+                    severity="P0",
+                    title="Decision without rationale",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            {
+                "action": "reject",
+                "reason": "",
+                "by": "human",
+                "ts": _TRIAGE_TS,
+                "decision_ids": ["DEC-001"],
+            },
+        )
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "fail"
+        assert result.failed_conditions == ["review_no_blocking_issues"]
+        assert "missing required triage reason" in result.blocking_issues[0]["blocking_reason"]
+
+    @pytest.mark.parametrize("action", ["override", "reject"])
+    def test_p1_override_or_reject_with_decision_disarms_gate(
+        self, repo_root: Path, action: str
+    ) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            gap_issues=[
+                _issue(
+                    id="agent-gap-p1",
+                    source="spec_gap",
+                    severity="P1",
+                    title="Human-disarmed P1",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            _disarming_triage(action, "DEC-001"),
+        )
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "pass"
+        assert result.blocking_issues == []
+        decision = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).read_text()
+        )
+        assert decision["conditions"][3]["passed"] is True
+
+    def test_p0_override_still_fails_as_second_defense(self, repo_root: Path) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p0",
+                    source="code_review",
+                    severity="P0",
+                    title="Illegal override leaked through",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            _disarming_triage("override", "DEC-001"),
+        )
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "fail"
+        assert result.failed_conditions == ["review_no_blocking_issues"]
+        assert result.blocking_issues[0]["triage_action"] == "override"
+        decision = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).read_text()
+        )
+        assert "P0 override" in decision["conditions"][2]["reason"]
+
+    @pytest.mark.parametrize("action", ["request_fix", "request_change_proposal", "request_cp"])
+    def test_p1_request_fix_or_change_proposal_blocks_gate(
+        self, repo_root: Path, action: str
+    ) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p1",
+                    source="code_review",
+                    severity="P1",
+                    title="Needs follow-up",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            {
+                "action": action,
+                "reason": "needs follow-up",
+                "by": "human",
+                "ts": _TRIAGE_TS,
+            },
+        )
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "fail"
+        assert result.failed_conditions == ["review_no_blocking_issues"]
+        assert result.blocking_issues[0]["resolution_path"] == action
+        decision = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / LANE_DECISION_JSON).read_text()
+        )
+        assert action in decision["conditions"][2]["reason"]
 
     def test_verification_fail_verdict_fails_gate(self, repo_root: Path) -> None:
         feature_id, lane_id = _stage_lane_gate_inputs(
@@ -185,6 +375,18 @@ class TestEvaluateLaneGate:
             "passed": False,
             "reason": "verification verdict is fail (0/1 commands passed)",
         }
+
+    def test_lane_gate_does_not_mutate_current_gate(self, repo_root: Path) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(repo_root)
+        status_path = _feature_root(repo_root, feature_id) / "status" / "feature-status.yml"
+        before = yaml.safe_load(status_path.read_text())
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        after = yaml.safe_load(status_path.read_text())
+        assert result.decision == "pass"
+        assert after["feature"]["current_gate"] == before["feature"]["current_gate"]
+        assert after == before
 
     def test_missing_prerequisite_artifact_fails_loud(self, repo_root: Path) -> None:
         feature_id, lane_id = _stage_lane_gate_inputs(repo_root, collect_issues=False)
@@ -256,7 +458,9 @@ class TestLaneGateIgnoresIssueStatus:
         assert result.blocking_issues == []
 
     @pytest.mark.parametrize("status", ISSUE_STATUSES)
-    def test_p1_fails_regardless_of_status(self, repo_root: Path, status: str) -> None:
+    def test_p1_untriaged_fails_regardless_of_status(
+        self, repo_root: Path, status: str
+    ) -> None:
         feature_id, lane_id = _stage_lane_gate_inputs(
             repo_root,
             review_issues=[
@@ -274,9 +478,38 @@ class TestLaneGateIgnoresIssueStatus:
 
         assert result.decision == "fail"
         assert result.failed_conditions == ["review_no_blocking_issues"]
-        # The blocking summary carries severity, not status.
+        # The blocking summary carries severity and triage, not lifecycle status.
         assert result.blocking_issues[0]["severity"] == "P1"
+        assert result.blocking_issues[0]["triage_action"] is None
         assert "status" not in result.blocking_issues[0]
+
+    @pytest.mark.parametrize("status", ISSUE_STATUSES)
+    def test_p1_triaged_reject_passes_regardless_of_status(
+        self, repo_root: Path, status: str
+    ) -> None:
+        feature_id, lane_id = _stage_lane_gate_inputs(
+            repo_root,
+            review_issues=[
+                _issue(
+                    id="agent-review-p1",
+                    source="code_review",
+                    severity="P1",
+                    title="Disarmed issue",
+                )
+            ],
+        )
+        _set_first_bundle_issue_triage(
+            repo_root,
+            feature_id,
+            lane_id,
+            _disarming_triage("reject", "DEC-001"),
+        )
+        self._set_first_issue_status(repo_root, feature_id, lane_id, status)
+
+        result = evaluate_lane_gate(repo_root, feature_id, lane_id)
+
+        assert result.decision == "pass"
+        assert result.blocking_issues == []
 
 
 class TestLaneGateCli:

@@ -1,10 +1,10 @@
-"""Lane gate evaluator (v0.2 ticket 05, spec §18.4).
+"""Lane gate evaluator (v0.3 triage-aware blocking formula).
 
-This module is the deterministic final gate for a v0.2 lane. It reads only the
+This module is the deterministic final gate for a lane. It reads only the
 existing lane artifacts (implement result, shell verification report, and issue
-bundle), applies the §18.4 conditions plus the §15.2 P0/P1 blocking rule, and
-writes the lane-level ``lane-decision.{json,md}`` double product. No model is
-called here.
+bundle), applies the §18.4 conditions plus the ADR-0001 lane-gate blocking
+formula, and writes the lane-level ``lane-decision.{json,md}`` double product.
+No model is called here.
 """
 
 from __future__ import annotations
@@ -26,6 +26,13 @@ LANE_DECISION_JSON = "lane-decision.json"
 
 _LANE_GATE_EVENT = "lane_gate"
 _BLOCKING_SEVERITIES = {"P0", "P1"}
+_DISARMING_ACTIONS = {
+    ("P0", "reject"),
+    ("P1", "override"),
+    ("P1", "reject"),
+}
+_FOLLOWUP_ACTIONS = {"request_fix", "request_change_proposal", "request_cp"}
+_ILLEGAL_BLOCKING_ACTIONS = {"accept", "defer"}
 
 
 @dataclass(frozen=True)
@@ -86,22 +93,89 @@ def _issue_severity(issue: Mapping[str, Any]) -> str:
     return severity if isinstance(severity, str) else ""
 
 
+def _triage(issue: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    triage = issue.get("triage")
+    return triage if isinstance(triage, Mapping) else None
+
+
+def _triage_action(issue: Mapping[str, Any]) -> str | None:
+    triage = _triage(issue)
+    if triage is None:
+        return None
+    action = triage.get("action")
+    return action if isinstance(action, str) else None
+
+
+def _triage_reason(issue: Mapping[str, Any]) -> str | None:
+    triage = _triage(issue)
+    if triage is None:
+        return None
+    reason = triage.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return reason
+
+
+def _decision_ids(issue: Mapping[str, Any]) -> list[str]:
+    triage = _triage(issue)
+    if triage is None:
+        return []
+    raw = triage.get("decision_ids")
+    if not isinstance(raw, list):
+        return []
+    return [str(decision_id) for decision_id in raw if isinstance(decision_id, str)]
+
+
+def _blocking_reason(issue: Mapping[str, Any]) -> str | None:
+    severity = _issue_severity(issue)
+    if severity not in _BLOCKING_SEVERITIES:
+        return None
+
+    action = _triage_action(issue)
+    if action is None:
+        return f"{severity} is untriaged"
+    if action in _FOLLOWUP_ACTIONS:
+        return f"{severity} triage action {action} is unresolved"
+    if action == "override" and severity == "P0":
+        return "P0 override is not recognized by the lane gate"
+    if action in _ILLEGAL_BLOCKING_ACTIONS:
+        return f"{action} is illegal on {severity} and fails loud at the gate"
+    if (severity, action) in _DISARMING_ACTIONS:
+        if not _triage_reason(issue):
+            return f"{severity} {action} is missing required triage reason"
+        if _decision_ids(issue):
+            return None
+        return f"{severity} {action} is missing required Decision id"
+    return f"{severity} triage action {action} does not disarm the gate"
+
+
 def _blocking_issues(issues: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
     return [
         issue
         for issue in issues
-        if _issue_source(issue) == source and _issue_severity(issue) in _BLOCKING_SEVERITIES
+        if _issue_source(issue) == source and _blocking_reason(issue) is not None
     ]
 
 
 def _summarize_issue(issue: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         "id": issue.get("id"),
         "source": issue.get("source"),
         "severity": issue.get("severity"),
         "title": issue.get("title"),
         "requires_change_proposal": issue.get("requires_change_proposal", False),
+        "triage_action": _triage_action(issue),
     }
+    decision_ids = _decision_ids(issue)
+    if decision_ids:
+        summary["decision_ids"] = decision_ids
+    reason = _blocking_reason(issue)
+    if reason is not None:
+        summary["blocking_reason"] = reason
+    action = _triage_action(issue)
+    if action in _FOLLOWUP_ACTIONS:
+        summary["resolution_path"] = action
+    return summary
 
 
 def _condition(name: str, passed: bool, reason: str) -> dict[str, Any]:
@@ -149,13 +223,15 @@ def _verification_condition(report: Mapping[str, Any]) -> dict[str, Any]:
 
 def _no_blocking_condition(name: str, label: str, blockers: list[dict[str, Any]]) -> dict[str, Any]:
     if not blockers:
-        return _condition(name, True, f"no P0/P1 blocking {label} issues")
-    severities = ", ".join(str(issue.get("severity", "")) for issue in blockers)
+        return _condition(name, True, f"no triage-blocking {label} issues")
+    reasons = "; ".join(
+        f"{issue.get('id', '<unknown>')}: {_blocking_reason(issue)}"
+        for issue in blockers
+    )
     return _condition(
         name,
         False,
-        f"P0/P1 blocking {label} issue(s): {len(blockers)} "
-        f"({severities}); v0.2 has no triage override",
+        f"triage-blocking {label} issue(s): {len(blockers)}; {reasons}",
     )
 
 
