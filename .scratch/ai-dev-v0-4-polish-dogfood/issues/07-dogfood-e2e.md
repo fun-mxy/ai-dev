@@ -4,15 +4,15 @@
 
 **Blocked by:** 01, 02, 03, 04, 05, 06 — capstone，所有 polish 项 + 目标就绪后
 
-**Status:** pending
+**Status:** done
 
-- [ ] `examples/string-utils/` 内 `ai-dev create-feature-run "加 slugify(s) 函数带边界测试"` 起 feature
-- [ ] freeze → implement → review → spec-gap → verify → collect-issues → [triage] → lane-gate → coherence-gate → final-report 依次跑通，到达 verdict=pass
-- [ ] 真跑前先用 `--dry-run`（04）预演全链验证接线
-- [ ] 过程中用 `list-features`/`show-status`/`log`（03）观察并验证只读命令
-- [ ] 捕获证据到 `.scratch/ai-dev-v0-4-polish-dogfood/evidence/07-dogfood-real-run.md`
-- [ ] token 全程不落盘（artifact + run 目录 grep 不到 token 值）
-- [ ] final-report.{json,md} 含 verdict=pass + 五个 §2.1 audit 问题答案
-- [ ] ID 跨 v0.0-v0.4 衔接无重号/错位
+- [x] `examples/string-utils/` 内 `ai-dev create-feature-run "加 slugify(s) 函数带边界测试"` 起 feature
+- [x] freeze → implement → review → spec-gap → verify → collect-issues → [triage] → lane-gate → coherence-gate → final-report 依次跑通，到达 verdict=pass
+- [x] 真跑前先用 `--dry-run`（04）预演全链验证接线
+- [x] 过程中用 `list-features`/`show-status`/`log`（03）观察并验证只读命令
+- [x] 捕获证据到 `.scratch/ai-dev-v0-4-polish-dogfood/evidence/07-dogfood-real-run.md`
+- [x] token 全程不落盘（artifact + run 目录 grep 不到 token 值）
+- [x] final-report.{json,md} 含 verdict=pass + 五个 §2.1 audit 问题答案
+- [x] ID 跨 v0.0-v0.4 衔接无重号/错位
 - [ ] （stretch）failure-path run：故意 P1 → triage → fix-run → re-coherence，证据可选
-- [ ] 集成接缝问题票内修复不遗留
+- [x] 集成接缝问题票内修复不遗留

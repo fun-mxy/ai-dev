@@ -483,7 +483,14 @@ def run_headless(
     default to ``utc_now_iso()`` captured around the subprocess; both are
     injectable for deterministic tests.
     """
-    run_root = run_dir(repo_root, feature_id, run_id)
+    # Resolve to absolute up front: ``claude -p`` is spawned with ``cwd`` = this
+    # run dir and re-resolves its ``--settings`` argument relative to that cwd,
+    # so a relative ``repo_root`` (ticket-05's ``cd examples/string-utils`` +
+    # relative ``--repo-root``) makes the lookup fail with "Settings file not
+    # found". Absolute here covers ``cwd`` + ``--settings`` + the prompt's
+    # working-directory string at once; RUN-relative ``changed_files`` are
+    # unaffected (``relpath`` over an absolute base yields the same keys).
+    run_root = run_dir(repo_root, feature_id, run_id).resolve()
     if not run_root.is_dir():
         raise ValueError(
             f"run directory {run_id} not found under feature {feature_id} "
