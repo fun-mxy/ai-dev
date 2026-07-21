@@ -4,11 +4,13 @@
 
 **Blocked by:** 无 — 可立即开始（纯内容，与 01-04 并行）
 
-**Status:** pending
+**Status:** done
 
-- [ ] `examples/string-utils/` 微型 Python 包：一两个模块 + 预置函数（如 `snake_case`）+ pytest 测试
-- [ ] 目标项目可独立 `pytest`/`mypy` 通过（verify leg 命令可跑）
-- [ ] 目标项目最小可运行配置（`pyproject.toml` 或等价），使 `ai-dev` 能在其内 `create-feature-run`
-- [ ] 目标项目 README：说明它是 ai-dev dogfood 靶子、如何起一个 feature run、验证命令是什么
-- [ ] 目标项目的 `.ai-dev/` gitignore（throwaway 运行态）
-- [ ] 手动验证：在 `examples/string-utils/` 内 `ai-dev create-feature-run` + freeze + prepare 可起（不要求真跑 claude，那是 07）
+- [x] `examples/string-utils/` 微型 Python 包：一两个模块 + 预置函数（如 `snake_case`）+ pytest 测试
+- [x] 目标项目可独立 `pytest`/`mypy` 通过（verify leg 命令可跑）
+- [x] 目标项目最小可运行配置（`pyproject.toml` 或等价），使 `ai-dev` 能在其内 `create-feature-run`
+- [x] 目标项目 README：说明它是 ai-dev dogfood 靶子、如何起一个 feature run、验证命令是什么
+- [x] 目标项目的 `.ai-dev/` gitignore（throwaway 运行态）
+- [x] 手动验证：在 `examples/string-utils/` 内 `ai-dev create-feature-run` + freeze + prepare 可起（不要求真跑 claude，那是 07）
+
+Delivered by f08c9ac (merged via 690cf58). Target package present at `examples/string-utils/` with `pyproject.toml`, `README.md`, `string_utils/` module (pre-baked `snake_case`), and `tests/`. The `.ai-dev/` runtime dir is gitignored both at repo root and inside the target. Real dogfood run is deferred to ticket 07.
