@@ -20,3 +20,6 @@ src/*.egg-info/
 # .ai-dev/ is the committed source of truth per spec §4.1 — that rule applies to
 # the project being developed, not to the orchestrator's own repo.)
 .ai-dev/
+
+# llm-api
+/settings-*.json
