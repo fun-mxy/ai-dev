@@ -456,7 +456,13 @@ def _record_resolved_issues(
 
 
 
-def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> IssueBundleResult:
+def collect_issue_bundle(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    origin: str | None = None,
+) -> IssueBundleResult:
     """Collect reviewer + spec-gap report issues into stable issue artifacts.
 
     Reads only ``review/review-report.json`` and
@@ -516,6 +522,7 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
             "issue_ids": issue_ids,
             "resolved_issue_ids": resolved_ids,
         },
+        origin=origin,
     )
     return IssueBundleResult(
         feature_id=feature_id,

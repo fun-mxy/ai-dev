@@ -46,6 +46,7 @@ def append_audit_event(
     payload: Mapping[str, Any],
     *,
     timestamp: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Append one timestamped ``event`` record to the audit log in ``audit_dir``.
 
@@ -53,6 +54,14 @@ def append_audit_event(
     two stay consistent. ``payload`` values may be any JSON-serialisable type —
     strings render bare in the markdown, other types as compact JSON, while the
     JSON product keeps their native type.
+
+    ``origin`` (v0.4 ticket 02) is the canonical driver tag — *which* driver
+    triggered the event (``cli`` / ``implement-leg`` / ``fix-run-driver`` / …),
+    threaded in explicitly by the caller (never inferred). When supplied it
+    lands as a top-level record field (a peer of ``event``/``payload``) in both
+    products; when ``None`` it is omitted so legacy callers and the appender's
+    own mechanics tests are unaffected. Payload is reserved for the event's
+    factual detail — ``elapsed_ms`` lives there, ``origin`` does not.
 
     Append-only is a content invariant: the markdown is byte-appended, and the
     JSON array is only ever lengthened — existing records are read back verbatim
@@ -69,8 +78,13 @@ def append_audit_event(
         "event": event,
         "payload": dict(payload),
     }
+    if origin is not None:
+        record["origin"] = origin
 
-    lines = [f"## {stamp} · {event}", ""]
+    header = f"## {stamp} · {event}"
+    if origin is not None:
+        header += f" · origin={origin}"
+    lines = [header, ""]
     for key, value in payload.items():
         lines.append(f"- {key}: {_render_value(value)}")
     lines.append("")

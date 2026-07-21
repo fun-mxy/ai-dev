@@ -188,6 +188,7 @@ def _audit_refusal(
     refusal_reason: str,
     *,
     timestamp: str,
+    origin: str | None = None,
 ) -> None:
     """Record a ``triage_refused`` audit event for a refused apply attempt.
 
@@ -206,6 +207,7 @@ def _audit_refusal(
             "refusal_reason": refusal_reason,
         },
         timestamp=timestamp,
+        origin=origin,
     )
 
 
@@ -288,6 +290,7 @@ def apply_triage(
     by: str,
     *,
     timestamp: str | None = None,
+    origin: str | None = None,
 ) -> TriageResult:
     """Apply one Human-Triage disposition to ``issue_id`` and return the result.
 
@@ -331,7 +334,7 @@ def apply_triage(
     if not cell.legal:
         _audit_refusal(
             feature_root, feature_id, issue_id, action, severity, by,
-            cell.refusal_reason or "", timestamp=ts,
+            cell.refusal_reason or "", timestamp=ts, origin=origin,
         )
         raise TriageRefusedError(
             f"triage refused for {issue_id}: {cell.refusal_reason}"
@@ -346,7 +349,7 @@ def apply_triage(
         )
         _audit_refusal(
             feature_root, feature_id, issue_id, action, severity, by, msg,
-            timestamp=ts,
+            timestamp=ts, origin=origin,
         )
         raise TriageRefusedError(f"triage refused for {issue_id}: {msg}")
 
@@ -362,7 +365,7 @@ def apply_triage(
         )
         _audit_refusal(
             feature_root, feature_id, issue_id, action, severity, by, msg,
-            timestamp=ts,
+            timestamp=ts, origin=origin,
         )
         raise TriageRefusedError(f"triage refused for {issue_id}: {msg}")
 
@@ -413,6 +416,7 @@ def apply_triage(
             "decision_ids": decision_ids,
         },
         timestamp=ts,
+        origin=origin,
     )
 
     return TriageResult(

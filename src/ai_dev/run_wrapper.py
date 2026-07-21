@@ -47,7 +47,7 @@ from ai_dev.paths import (
     run_dir,
 )
 from ai_dev.profiles import AgentProfile, token_source_var
-from ai_dev.timeutil import utc_now_iso
+from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 
 # §10.3 explicit strip set - the parent Claude-Code identity vars and the
 # model-alias overrides a nested ``claude`` would otherwise inherit. The
@@ -464,6 +464,7 @@ def run_headless(
     claude_path: str | None = None,
     started_at: str | None = None,
     ended_at: str | None = None,
+    origin: str | None = None,
 ) -> RunResult:
     """Run a prepared ``RUN-NNN`` headless against ``profile`` and capture it.
 
@@ -561,7 +562,9 @@ def run_headless(
     )
 
     # §2.1: the run lifecycle flows through the audit log. Carries no token -
-    # only the run id, profile name, exit code and changed files.
+    # only the run id, profile name, exit code, changed files and the wall-clock
+    # duration (v0.4 ticket 02: ``elapsed_ms`` answers "how long did this leg
+    # run" without reading metadata.json).
     feature_root = feature_dir(repo_root, feature_id)
     append_audit_event(
         feature_root,
@@ -572,7 +575,9 @@ def run_headless(
             "profile": profile.name,
             "exit_code": exit_code,
             "changed_files": changed_files,
+            "elapsed_ms": elapsed_ms_between(started, ended),
         },
+        origin=origin,
     )
 
     return RunResult(

@@ -20,6 +20,7 @@ from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.paths import feature_dir, lane_dir
 from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON
+from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 
 LANE_DECISION_MD = "lane-decision.md"
 LANE_DECISION_JSON = "lane-decision.json"
@@ -291,7 +292,13 @@ def _decision_md(decision: Mapping[str, Any]) -> str:
 
 
 
-def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDecisionResult:
+def evaluate_lane_gate(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    origin: str | None = None,
+) -> LaneDecisionResult:
     """Evaluate §18.4 for one lane and write ``lane-decision.{json,md}``.
 
     Missing or invalid prerequisite artifacts fail loud (§24.2) before any decision
@@ -304,6 +311,11 @@ def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDe
     lane_root = lane_dir(repo_root, feature_id, lane_id)
     if not lane_root.is_dir():
         raise ValueError(f"lane {lane_id} not found under feature {feature_id}")
+
+    # v0.4 ticket 02: the gate evaluation's wall-clock duration lands on the
+    # ``lane_gate`` event (``elapsed_ms``). Captured around the deterministic
+    # evaluation so the log answers "how long did the lane gate take".
+    gate_started = utc_now_iso()
 
     implement_result = _require_artifact(lane_root / IMPLEMENT_RESULT_JSON)
     verification_report = _require_artifact(
@@ -362,6 +374,8 @@ def evaluate_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> LaneDe
             "decision": decision["decision"],
             "failed_conditions": result.failed_conditions,
             "blocking_issue_count": len(blocking_issues),
+            "elapsed_ms": elapsed_ms_between(gate_started, utc_now_iso()),
         },
+        origin=origin,
     )
     return result

@@ -4,12 +4,12 @@
 
 **Blocked by:** 无 — 可立即开始（与 01 并行）
 
-**Status:** pending
+**Status:** done
 
-- [ ] `append_audit_event` 支持payload 带 `elapsed_ms`（number，毫秒）；文档说明"仅有时长语义的事件携带"
-- [ ] run / verify / lane_gate / coherence_gate / fix_run 事件写入真实 `elapsed_ms`
-- [ ] 每个事件携带 `origin`（调用方显式传入）；canonical 名 `origin` 写入 `docs/glossary.md`
-- [ ] token 值仍绝不落 payload（grep 确认）
-- [ ] 单测：典型事件含 `elapsed_ms` + `origin`；无时长语义事件不带 `elapsed_ms`
-- [ ] 单测：audit.log.{md,json} 双产物同步含新字段
-- [ ] mypy + 全测试绿
+- [x] `append_audit_event` 支持payload 带 `elapsed_ms`（number，毫秒）；文档说明"仅有时长语义的事件携带"
+- [x] run / verify / lane_gate / coherence_gate / fix_run 事件写入真实 `elapsed_ms`
+- [x] 每个事件携带 `origin`（调用方显式传入）；canonical 名 `origin` 写入 `docs/glossary.md`
+- [x] token 值仍绝不落 payload（grep 确认）
+- [x] 单测：典型事件含 `elapsed_ms` + `origin`；无时长语义事件不带 `elapsed_ms`
+- [x] 单测：audit.log.{md,json} 双产物同步含新字段
+- [x] mypy + 全测试绿
