@@ -19,12 +19,21 @@ Two scopes, by design:
   the **feature-run root**, because they both rewrite ``status/feature-status.yml``
   *and* append to the run-level audit log at the feature root — the same scope
   as the ticket-03 ``allocate_id`` allocator. ``status_dir = feature_root/"status"``.
+
+v0.3 (ADR-0003) wires the gate state machine into these primitives:
+``freeze_artifact`` atomically advances ``current_gate`` to the next stage on a
+human-gate freeze (requirements/design/tasks; lane_graph does not advance), and
+``feature.status`` is a derived projection of ``(current_gate, verdict)``
+recomputed inside every mutation (``derive_feature_status``) - never an
+independent field. The coherence gate's terminal advance
+(``current_gate = feature_coherence_gate`` + ``verdict``) lands in a later
+ticket; this module owns the derivation and the human-gate advance.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -47,6 +56,17 @@ _INITIAL_GATE = GATES[0]
 # Public so the CLI's argparse ``choices`` (and future callers) share one source
 # of truth for the canonical artifact names.
 FROZEN_ARTIFACTS: tuple[str, ...] = ("requirements", "design", "tasks", "lane_graph")
+
+# ADR-0003 D2 - freezing a human-gate artifact advances ``current_gate`` to the
+# stage that follows the frozen artifact's gate. ``lane_graph`` is deliberately
+# absent: it shares the task gate's freeze window (the task gate freezes
+# requirements/design/tasks/**lane-graph**), so its freeze does not separately
+# advance - the advance already happened on ``freeze(tasks)``.
+_FREEZE_ADVANCE_TARGET: Mapping[str, str] = {
+    "requirements": "design_gate",
+    "design": "task_gate",
+    "tasks": "lane_gate",
+}
 
 _FREEZE_EVENT = "freeze"
 _ADVANCE_GATE_EVENT = "advance_gate"
@@ -79,12 +99,69 @@ def _dump_yaml(path: Path, doc: dict[str, Any]) -> None:
         )
 
 
+# ADR-0003 D3 - the three planning gates share the ``planning`` projection.
+_PLANNING_GATES: tuple[str, ...] = ("requirements_gate", "design_gate", "task_gate")
+
+
+def derive_feature_status(current_gate: str, verdict: str | None) -> str:
+    """Project ``feature.status`` from ``(current_gate, verdict)`` (ADR-0003 D3).
+
+    ``feature.status`` is **not an independent field** - it is a derived
+    projection, recomputed atomically whenever ``current_gate`` or ``verdict``
+    is written. This function is the single source of truth for the projection;
+    writers call it rather than setting ``feature.status`` directly, so the
+    field can never drift from the gate state. Derivation map:
+
+    | ``verdict`` | ``current_gate``                       | ``feature.status`` |
+    | ----------- | -------------------------------------- | ------------------ |
+    | ``pass``    | (any)                                  | ``done``           |
+    | ``fail``    | (any)                                  | ``blocked``        |
+    | ``null``    | requirements/design/task gate          | ``planning``       |
+    | ``null``    | ``lane_gate``                          | ``implementing``   |
+    | ``null``    | ``feature_coherence_gate``             | *(unreachable †)*  |
+
+    † ``(verdict=null, current_gate=feature_coherence_gate)`` is a disk-never-
+    exposed transient: the coherence evaluator (ticket 08) writes
+    ``current_gate = feature_coherence_gate`` **and** ``verdict`` in one atomic
+    mutation, so the ``(fcg, null)`` state is never observable. Deriving it is
+    corruption - fail loud (§24.2) rather than inventing a fifth status value
+    (``verifying`` was rejected for this reason, D3 note †). The same fail-loud
+    path catches an unknown ``verdict`` or ``current_gate`` (corruption).
+
+    ``blocked`` is strictly coherence-fail: the lane-gate verdict lives on
+    ``lane-decision.json`` and is never written back to ``feature-status.yml``,
+    so a lane-gate FAIL (``current_gate`` still ``lane_gate``, ``verdict`` still
+    ``null``) projects to ``implementing``, not ``blocked`` (D3 note a).
+    """
+    if verdict == "pass":
+        return "done"
+    if verdict == "fail":
+        return "blocked"
+    if verdict is None:
+        if current_gate in _PLANNING_GATES:
+            return "planning"
+        if current_gate == "lane_gate":
+            return "implementing"
+    # Reaching here means either (feature_coherence_gate, null) - the
+    # unreachable transient - or an unknown verdict/gate from a corrupted file.
+    # Both are corruption the writer must surface (§24.2), never silently
+    # coerced into a status value.
+    raise ValueError(
+        f"unreachable feature.status projection (current_gate={current_gate!r}, "
+        f"verdict={verdict!r}); the coherence evaluator must write "
+        f"current_gate and verdict atomically (ADR-0003 D2/D3 note †)"
+    )
+
+
 def _initial_feature_status(feature_id: str) -> dict[str, Any]:
-    """Build the §8.3 initial feature-status document, in spec field order."""
+    """Build the initial feature-status document, in spec field order."""
     return {
         "feature": {
             "id": feature_id,
-            "status": "planning",
+            # ADR-0003 D3: status is derived, never independently set. The init
+            # value is derive(requirements_gate, null) == "planning" - computed
+            # via the projection so the literal can never drift from the table.
+            "status": derive_feature_status(_INITIAL_GATE, None),
             "frozen_artifacts": {name: False for name in FROZEN_ARTIFACTS},
             "current_gate": _INITIAL_GATE,
             "verdict": None,
@@ -162,26 +239,60 @@ def frozen_artifacts_status(feature_root: Path) -> Mapping[str, bool]:
 
 def _mutate_feature_status(
     feature_root: Path,
-    mutate: Any,
+    mutate: Callable[[dict[str, Any]], list[tuple[str, dict[str, Any]]]],
     *,
-    event: str,
-    payload: Mapping[str, Any],
     timestamp: str | None,
 ) -> None:
-    """Shared load → mutate → dump → audit spine for feature-status edits.
+    """Shared load → mutate → derive → dump → audit spine for feature-status.
 
-    ``mutate`` receives the parsed ``feature`` mapping and applies the edit in
-    place; if it raises, the file is *not* rewritten and no audit record is
-    appended — so a rejected mutation (e.g. re-freezing) leaves state untouched
-    by construction, not just by convention. On a clean mutation the document is
-    flushed and the ``event``/``payload`` audit record appended.
+    ``mutate`` receives the parsed ``feature`` mapping, applies the edit in
+    place, and returns the audit records (``(event, payload)`` pairs) the
+    mutation warrants – a single mutation may emit more than one record (e.g.
+    a gate-advancing freeze emits both a ``freeze`` and an ``advance_gate``
+    record). If ``mutate`` raises, the file is *not* rewritten and no audit
+    record is appended – so a rejected mutation (e.g. re-freezing) leaves
+    state untouched by construction, not just by convention.
+
+    ADR-0003 D3: ``feature.status`` is recomputed from ``(current_gate,
+    verdict)`` after the callback (see ``derive_feature_status``), so no
+    callback ever sets it directly and it can never drift from the gate
+    state. If the resulting state is the unreachable
+    ``(feature_coherence_gate, null)`` transient, the derivation raises and
+    the whole mutation is discarded (no dump, no audit) – the writer cannot
+    produce that state.
     """
     doc = _load_feature_status(feature_root)
-    mutate(doc["feature"])
-    _dump_yaml(_feature_status_path(feature_root), doc)
-    append_audit_event(
-        feature_root, event=event, payload=payload, timestamp=timestamp
+    events = mutate(doc["feature"])
+    # ADR-0003 D3: feature.status is a derived projection of (current_gate,
+    # verdict), recomputed after the callback so every mutation leaves it
+    # consistent with the gate state. If the resulting state is the
+    # unreachable (feature_coherence_gate, null) transient, derive_feature_status
+    # raises and the whole mutation is discarded (no dump, no audit).
+    doc["feature"]["status"] = derive_feature_status(
+        doc["feature"]["current_gate"], doc["feature"]["verdict"]
     )
+    _dump_yaml(_feature_status_path(feature_root), doc)
+    for event, payload in events:
+        append_audit_event(
+            feature_root, event=event, payload=payload, timestamp=timestamp
+        )
+
+
+def _advance_current_gate(feature: dict[str, Any], target: str) -> bool:
+    """Advance ``current_gate`` to ``target`` monotonically (ADR-0003 D2).
+
+    Freeze is the human-gate pass signal; each gate-advancing freeze moves
+    ``current_gate`` to the stage that follows the frozen artifact's gate. The
+    advance is monotonic - ``current_gate`` never regresses - so an out-of-order
+    freeze (e.g. a test freezing ``tasks`` before ``requirements``, or freezing
+    ``requirements`` after ``tasks``) clamps forward to the later gate rather
+    than moving backwards. Returns ``True`` iff ``current_gate`` actually moved
+    (callers audit the advance only when it does).
+    """
+    current = feature["current_gate"]
+    new = GATES[max(GATES.index(current), GATES.index(target))]
+    feature["current_gate"] = new
+    return new != current
 
 
 def freeze_artifact(
@@ -196,27 +307,45 @@ def freeze_artifact(
     is not an idempotent no-op, it is rejected, because the frozen flag must
     never be cleared or re-set by this writer (only a Change Proposal may change
     a frozen artifact). ``ValueError`` is raised for an unknown artifact name.
+
+    ADR-0003 D2: freezing a human-gate artifact (``requirements`` / ``design`` /
+    ``tasks``) atomically advances ``current_gate`` to the next stage in the
+    *same* mutation that flips the flag, and re-derives ``feature.status`` (D3)
+    from the resulting ``(current_gate, verdict)``. The advance is monotonic
+    (``current_gate`` never regresses) and is audited as an ``advance_gate``
+    record appended right after the ``freeze`` record - but only when the gate
+    actually moves (a no-op clamp emits just the ``freeze`` record).
+    ``freeze(lane_graph)`` does **not** advance: lane_graph shares the task
+    gate's freeze window, so the advance already happened on ``freeze(tasks)``.
     """
     if artifact not in FROZEN_ARTIFACTS:
         raise ValueError(
             f"unknown frozen artifact {artifact!r}; expected one of {FROZEN_ARTIFACTS}"
         )
 
-    def _flip(feature: dict[str, Any]) -> None:
+    def _flip(feature: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
         if feature["frozen_artifacts"][artifact]:
             raise FrozenArtifactError(
                 f"artifact {artifact!r} is already frozen; use a Change Proposal "
                 f"to change it (§4.2)"
             )
         feature["frozen_artifacts"][artifact] = True
+        events: list[tuple[str, dict[str, Any]]] = [
+            (_FREEZE_EVENT, {"artifact": artifact, "frozen": True}),
+        ]
+        # ADR-0003 D2 - a human-gate freeze atomically advances current_gate to
+        # the next stage. lane_graph is absent from _FREEZE_ADVANCE_TARGET, so
+        # its freeze advances nothing (the advance happened on freeze(tasks)).
+        target = _FREEZE_ADVANCE_TARGET.get(artifact)
+        if target is not None:
+            advanced = _advance_current_gate(feature, target)
+            if advanced:
+                events.append(
+                    (_ADVANCE_GATE_EVENT, {"current_gate": feature["current_gate"]})
+                )
+        return events
 
-    _mutate_feature_status(
-        feature_root,
-        _flip,
-        event=_FREEZE_EVENT,
-        payload={"artifact": artifact, "frozen": True},
-        timestamp=timestamp,
-    )
+    _mutate_feature_status(feature_root, _flip, timestamp=timestamp)
 
 
 def set_current_gate(
@@ -229,20 +358,23 @@ def set_current_gate(
     record. This is a low-level deterministic primitive: it records *that* the
     gate moved, not *whether* the move is sequenced — gate ordering is the
     orchestrator's concern (later tickets), not the writer's.
+
+    ADR-0003 D3: writing ``current_gate`` re-derives ``feature.status`` from
+    ``(current_gate, verdict)`` in the same mutation. Setting
+    ``feature_coherence_gate`` while ``verdict`` is still ``null`` fail-loud
+    refuses: ``(fcg, null)`` is an unreachable on-disk state (the coherence
+    evaluator writes ``current_gate`` and ``verdict`` atomically, ticket 08), so
+    this primitive cannot produce it - the rejected mutation rewrites nothing
+    and appends no audit record.
     """
     if gate not in GATES:
         raise ValueError(f"unknown gate {gate!r}; expected one of {GATES}")
 
-    def _set_gate(feature: dict[str, Any]) -> None:
+    def _set_gate(feature: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
         feature["current_gate"] = gate
+        return [(_ADVANCE_GATE_EVENT, {"current_gate": gate})]
 
-    _mutate_feature_status(
-        feature_root,
-        _set_gate,
-        event=_ADVANCE_GATE_EVENT,
-        payload={"current_gate": gate},
-        timestamp=timestamp,
-    )
+    _mutate_feature_status(feature_root, _set_gate, timestamp=timestamp)
 
 
 def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:

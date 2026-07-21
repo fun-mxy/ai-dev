@@ -5,6 +5,13 @@ deterministic writer with the freeze operation (§4.2), the ``current_gate``
 advance, and the minimal ``lane-status.yml`` / ``task-status.yml`` seeds. These
 are the only functions that mutate canonical status — models never call them
 (§4.3 cardinal rule); the deterministic CLI / runtime does.
+
+ADR-0003 (v0.3) wires the gate state machine into ticket 04's primitives:
+``freeze_artifact`` atomically advances ``current_gate`` to the next stage on a
+human-gate freeze (requirements/design/tasks), and ``feature.status`` becomes a
+derived projection of ``(current_gate, verdict)`` - never an independent field,
+recomputed inside every mutation. These tests pin both the derivation table
+(ADR-0003 D3) and the freeze-driven advance (ADR-0003 D2).
 """
 
 from __future__ import annotations
@@ -18,10 +25,12 @@ import yaml
 from ai_dev.audit import AUDIT_LOG_JSON, AUDIT_LOG_MD
 from ai_dev.status import (
     FEATURE_STATUS_FILE,
+    FROZEN_ARTIFACTS,
     GATES,
     LANE_STATUS_FILE,
     TASK_STATUS_FILE,
     FrozenArtifactError,
+    derive_feature_status,
     freeze_artifact,
     set_current_gate,
     write_initial_feature_status,
@@ -93,6 +102,62 @@ class TestWriteInitialFeatureStatus:
         assert "final_verdict" not in text
 
 
+class TestDeriveFeatureStatus:
+    """status.derive_feature_status - the ADR-0003 D3 projection table.
+
+    ``feature.status`` is a *derived projection* of ``(current_gate, verdict)``,
+    never an independent field. This pure function pins the four reachable
+    values and fail-loud rejects the unreachable ``(feature_coherence_gate,
+    null)`` cell - the coherence evaluator writes ``current_gate`` and
+    ``verdict`` atomically (ticket 08), so that state is never observable on
+    disk. ``blocked`` is strictly coherence-fail; the lane-gate verdict lives
+    on ``lane-decision.json`` and is never written back here, so a lane-gate
+    FAIL leaves ``feature.status`` at ``implementing`` (note a).
+    """
+
+    @pytest.mark.parametrize(
+        "gate", ["requirements_gate", "design_gate", "task_gate"]
+    )
+    def test_null_verdict_at_planning_gates_projects_planning(
+        self, gate: str
+    ) -> None:
+        assert derive_feature_status(gate, None) == "planning"
+
+    def test_null_verdict_at_lane_gate_projects_implementing(self) -> None:
+        assert derive_feature_status("lane_gate", None) == "implementing"
+
+    @pytest.mark.parametrize("gate", GATES)
+    def test_pass_verdict_projects_done_regardless_of_gate(
+        self, gate: str
+    ) -> None:
+        assert derive_feature_status(gate, "pass") == "done"
+
+    @pytest.mark.parametrize("gate", GATES)
+    def test_fail_verdict_projects_blocked_regardless_of_gate(
+        self, gate: str
+    ) -> None:
+        # blocked is coherence-fail only: it is reached solely via a fail
+        # verdict, regardless of which gate current_gate sits at.
+        assert derive_feature_status(gate, "fail") == "blocked"
+
+    def test_coherence_gate_with_null_verdict_is_unreachable(self) -> None:
+        # (feature_coherence_gate, null) is never observable on disk (D3 note
+        # †): the coherence evaluator writes current_gate and verdict in one
+        # atomic mutation. Deriving this cell is corruption - fail loud rather
+        # than inventing a fifth status value.
+        with pytest.raises(ValueError):
+            derive_feature_status("feature_coherence_gate", None)
+
+    def test_unknown_verdict_fails_loud(self) -> None:
+        # A verdict that is neither pass/fail/null is corruption (§24.2).
+        with pytest.raises(ValueError):
+            derive_feature_status("lane_gate", "maybe")
+
+    def test_unknown_gate_with_null_verdict_fails_loud(self) -> None:
+        with pytest.raises(ValueError):
+            derive_feature_status("bogus_gate", None)
+
+
 class TestFreezeArtifact:
     """status.freeze_artifact — the §4.2 freeze operation (ticket 04).
 
@@ -144,8 +209,11 @@ class TestFreezeArtifact:
 
         feature = _feature_doc(tmp_path)["feature"]
         assert feature["id"] == "FEATURE-007"
+        # freeze(design) atomically advances current_gate to task_gate
+        # (ADR-0003 D2); verdict is still null and task_gate is a planning
+        # gate, so the derived feature.status stays "planning" (ADR-0003 D3).
         assert feature["status"] == "planning"
-        assert feature["current_gate"] == "requirements_gate"
+        assert feature["current_gate"] == "task_gate"
         assert feature["verdict"] is None
 
     def test_freeze_appends_an_audit_record(self, tmp_path: Path) -> None:
@@ -153,10 +221,16 @@ class TestFreezeArtifact:
 
         freeze_artifact(tmp_path, "requirements", timestamp="2026-07-19T10:00:00Z")
 
-        record = _audit_records(tmp_path)[-1]
-        assert record["event"] == "freeze"
-        assert record["timestamp"] == "2026-07-19T10:00:00Z"
-        assert record["payload"] == {"artifact": "requirements", "frozen": True}
+        # freeze(requirements) atomically advances current_gate (ADR-0003 D2),
+        # so the mutation appends a ``freeze`` record followed by an
+        # ``advance_gate`` record - find the freeze record rather than assume it
+        # is last.
+        freeze_records = [
+            r for r in _audit_records(tmp_path) if r["event"] == "freeze"
+        ]
+        assert len(freeze_records) == 1
+        assert freeze_records[0]["timestamp"] == "2026-07-19T10:00:00Z"
+        assert freeze_records[0]["payload"] == {"artifact": "requirements", "frozen": True}
 
     def test_freeze_also_appears_in_audit_markdown(self, tmp_path: Path) -> None:
         _seed_feature(tmp_path)
@@ -207,6 +281,168 @@ class TestFreezeArtifact:
             freeze_artifact(tmp_path, "bogus", timestamp="t")
 
 
+class TestFreezeAdvancesGate:
+    """ADR-0003 D2 - freeze_artifact atomically advances current_gate.
+
+    Freezing a human-gate artifact (requirements/design/tasks) advances
+    ``current_gate`` to the next stage inside the *same* mutation that flips the
+    frozen flag, and re-derives ``feature.status`` (D3) from the resulting
+    ``(current_gate, verdict)``. ``freeze(lane_graph)`` does **not** advance -
+    lane_graph shares the task gate's freeze window (§4.2), so the advance
+    already happened on ``freeze(tasks)``. The advance is monotonic:
+    ``current_gate`` never regresses, so out-of-order freezes clamp forward.
+    """
+
+    @pytest.mark.parametrize(
+        "artifact,expected_gate",
+        [
+            ("requirements", "design_gate"),
+            ("design", "task_gate"),
+            ("tasks", "lane_gate"),
+        ],
+    )
+    def test_freeze_advances_current_gate_to_next_stage(
+        self, tmp_path: Path, artifact: str, expected_gate: str
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, artifact, timestamp="t")
+
+        assert _feature_doc(tmp_path)["feature"]["current_gate"] == expected_gate
+
+    def test_freeze_tasks_derives_implementing_status(self, tmp_path: Path) -> None:
+        # verdict=null + lane_gate -> implementing (D3). The advance and the
+        # status derivation land in the same mutation as the flag flip.
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, "tasks", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "lane_gate"
+        assert feature["status"] == "implementing"
+
+    def test_freeze_requirements_keeps_planning_status(self, tmp_path: Path) -> None:
+        # verdict=null + design_gate -> planning (still in the planning gates).
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, "requirements", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "design_gate"
+        assert feature["status"] == "planning"
+
+    def test_freeze_lane_graph_does_not_advance_current_gate(
+        self, tmp_path: Path
+    ) -> None:
+        # lane_graph never advances current_gate: after freeze(tasks) the gate
+        # is already lane_gate, and freeze(lane_graph) leaves it there.
+        _seed_feature(tmp_path)
+        freeze_artifact(tmp_path, "tasks", timestamp="t1")
+
+        freeze_artifact(tmp_path, "lane_graph", timestamp="t2")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "lane_gate"
+
+    def test_freeze_lane_graph_first_does_not_advance(self, tmp_path: Path) -> None:
+        # Freezing lane_graph with no prior tasks freeze must not advance
+        # current_gate past requirements_gate - lane_graph is a no-advance
+        # artifact by definition.
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, "lane_graph", timestamp="t")
+
+        assert _feature_doc(tmp_path)["feature"]["current_gate"] == "requirements_gate"
+
+    def test_full_freeze_sequence_ends_at_lane_gate_implementing(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        for artifact in ("requirements", "design", "tasks", "lane_graph"):
+            freeze_artifact(tmp_path, artifact, timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "lane_gate"
+        assert feature["status"] == "implementing"
+
+    def test_freeze_never_produces_coherence_gate_state(
+        self, tmp_path: Path
+    ) -> None:
+        # ADR-0003 D3 note b: assert the (feature_coherence_gate, null) cell is
+        # never produced by any writer. freeze is structurally incapable of
+        # reaching fcg - _FREEZE_ADVANCE_TARGET caps at lane_gate - so freezing
+        # every artifact (in any order) leaves current_gate at lane_gate, never
+        # fcg, and feature.status at implementing, never an unreachable value.
+        _seed_feature(tmp_path)
+
+        for artifact in FROZEN_ARTIFACTS:
+            freeze_artifact(tmp_path, artifact, timestamp="t")
+            feature = _feature_doc(tmp_path)["feature"]
+            assert feature["current_gate"] != "feature_coherence_gate"
+            assert feature["status"] in ("planning", "implementing")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "lane_gate"
+        assert feature["status"] == "implementing"
+
+    def test_freeze_advance_is_monotonic_no_regression(self, tmp_path: Path) -> None:
+        # current_gate never regresses: freezing requirements *after* tasks are
+        # already frozen (current_gate already lane_gate) must not move it back
+        # to design_gate.
+        _seed_feature(tmp_path)
+        freeze_artifact(tmp_path, "tasks", timestamp="t1")
+        assert _feature_doc(tmp_path)["feature"]["current_gate"] == "lane_gate"
+
+        freeze_artifact(tmp_path, "requirements", timestamp="t2")
+
+        assert _feature_doc(tmp_path)["feature"]["current_gate"] == "lane_gate"
+
+    def test_freeze_advance_lands_in_same_atomic_mutation_as_flag(
+        self, tmp_path: Path
+    ) -> None:
+        # One read-modify-write produces a freeze record then an advance_gate
+        # record, sharing one timestamp - the flag flip and the gate advance
+        # are atomic, not two separate operations.
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, "requirements", timestamp="2026-07-19T10:00:00Z")
+
+        records = _audit_records(tmp_path)
+        assert [r["event"] for r in records] == ["freeze", "advance_gate"]
+        assert all(r["timestamp"] == "2026-07-19T10:00:00Z" for r in records)
+        assert records[0]["payload"] == {"artifact": "requirements", "frozen": True}
+        assert records[1]["payload"] == {"current_gate": "design_gate"}
+
+    def test_freeze_lane_graph_emits_no_advance_gate_record(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        freeze_artifact(tmp_path, "lane_graph", timestamp="t")
+
+        assert [r["event"] for r in _audit_records(tmp_path)] == ["freeze"]
+
+    def test_no_advance_gate_record_when_gate_does_not_move(
+        self, tmp_path: Path
+    ) -> None:
+        # Monotonic clamp: freeze(requirements) after freeze(tasks) leaves
+        # current_gate at lane_gate (no move), so only a freeze record is
+        # appended - no spurious advance_gate for a non-advancing freeze.
+        _seed_feature(tmp_path)
+        freeze_artifact(tmp_path, "tasks", timestamp="t1")
+
+        freeze_artifact(tmp_path, "requirements", timestamp="t2")
+
+        records = _audit_records(tmp_path)
+        assert [r["event"] for r in records] == [
+            "freeze",
+            "advance_gate",
+            "freeze",
+        ]
+        assert records[-1]["payload"] == {"artifact": "requirements", "frozen": True}
+
+
 class TestSetCurrentGate:
     """status.set_current_gate — advance current_gate to a known §18 gate.
 
@@ -224,15 +460,14 @@ class TestSetCurrentGate:
 
     @pytest.mark.parametrize(
         "gate",
-        [
-            "requirements_gate",
-            "design_gate",
-            "task_gate",
-            "lane_gate",
-            "feature_coherence_gate",
-        ],
+        # Every gate except feature_coherence_gate is reachable with a null
+        # verdict; derive the set from GATES so a new gate can't fall out of
+        # sync here. (fcg, null) is unreachable - see the dedicated test below.
+        [g for g in GATES if g != "feature_coherence_gate"],
     )
-    def test_each_known_gate_is_accepted(self, tmp_path: Path, gate: str) -> None:
+    def test_each_gate_reachable_with_null_verdict_is_accepted(
+        self, tmp_path: Path, gate: str
+    ) -> None:
         _seed_feature(tmp_path)
 
         set_current_gate(tmp_path, gate, timestamp="t")
@@ -275,6 +510,114 @@ class TestSetCurrentGate:
         assert record["event"] == "advance_gate"
         assert record["payload"] == {"current_gate": "design_gate"}
         assert record["timestamp"] == "2026-07-19T11:00:00Z"
+
+    def test_set_lane_gate_derives_implementing_status(self, tmp_path: Path) -> None:
+        # ADR-0003 D3: writing current_gate re-derives feature.status in the
+        # same mutation. null verdict + lane_gate -> implementing.
+        _seed_feature(tmp_path)
+
+        set_current_gate(tmp_path, "lane_gate", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "lane_gate"
+        assert feature["status"] == "implementing"
+
+    def test_set_planning_gate_derives_planning_status(self, tmp_path: Path) -> None:
+        _seed_feature(tmp_path)
+
+        set_current_gate(tmp_path, "task_gate", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "task_gate"
+        assert feature["status"] == "planning"
+
+    def test_set_coherence_gate_with_null_verdict_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        # (feature_coherence_gate, null) is unreachable on disk (ADR-0003 D3
+        # note †): the coherence evaluator must write current_gate and verdict
+        # atomically (ticket 08). set_current_gate is a current_gate-only
+        # writer, so setting fcg while verdict is still null fail-loud refuses
+        # rather than producing the unreachable state.
+        _seed_feature(tmp_path)
+
+        with pytest.raises(ValueError):
+            set_current_gate(tmp_path, "feature_coherence_gate", timestamp="t")
+
+        # State untouched: the rejected mutation rewrote nothing and appended
+        # no audit record - the audit log file was never created.
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "requirements_gate"
+        assert feature["status"] == "planning"
+        assert not (tmp_path / AUDIT_LOG_JSON).exists()
+
+    @pytest.mark.parametrize(
+        "verdict,expected_status", [("pass", "done"), ("fail", "blocked")]
+    )
+    def test_set_coherence_gate_with_non_null_verdict_derives_terminal_status(
+        self, tmp_path: Path, verdict: str, expected_status: str
+    ) -> None:
+        # When a verdict is already on disk (the post-coherence state ticket
+        # 08's writer will produce), set_current_gate(fcg) is reachable: it sets
+        # fcg and derives the terminal status. This pins the path the coherence
+        # evaluator will use - (fcg, null) remains the only rejected case. The
+        # verdict is injected directly because ticket 04 ships no verdict writer.
+        _seed_feature(tmp_path)
+        path = tmp_path / "status" / FEATURE_STATUS_FILE
+        doc = yaml.safe_load(path.read_text())
+        doc["feature"]["verdict"] = verdict
+        path.write_text(
+            yaml.safe_dump(doc, sort_keys=False, default_flow_style=False, allow_unicode=True)
+        )
+
+        set_current_gate(tmp_path, "feature_coherence_gate", timestamp="t")
+
+        feature = _feature_doc(tmp_path)["feature"]
+        assert feature["current_gate"] == "feature_coherence_gate"
+        assert feature["verdict"] == verdict
+        assert feature["status"] == expected_status
+
+
+class TestFeatureStatusIsAlwaysDerived:
+    """ADR-0003 D3 - feature.status is never an independent field.
+
+    Every current_gate/verdict mutation re-derives feature.status atomically,
+    so on disk it always equals ``derive_feature_status(current_gate,
+    verdict)``. This is the single-source-of-truth guarantee: feature.status
+    can never drift from the gate state.
+    """
+
+    def test_init_status_matches_derivation(self, tmp_path: Path) -> None:
+        write_initial_feature_status(tmp_path, "FEATURE-001")
+
+        feature = _load(tmp_path)["feature"]
+        assert feature["status"] == derive_feature_status(
+            feature["current_gate"], feature["verdict"]
+        )
+
+    def test_status_stays_consistent_across_freeze_sequence(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        for artifact in ("requirements", "design", "tasks", "lane_graph"):
+            freeze_artifact(tmp_path, artifact, timestamp="t")
+            feature = _feature_doc(tmp_path)["feature"]
+            assert feature["status"] == derive_feature_status(
+                feature["current_gate"], feature["verdict"]
+            )
+
+    def test_status_stays_consistent_after_set_current_gate(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_feature(tmp_path)
+
+        for gate in ("design_gate", "task_gate", "lane_gate", "task_gate"):
+            set_current_gate(tmp_path, gate, timestamp="t")
+            feature = _feature_doc(tmp_path)["feature"]
+            assert feature["status"] == derive_feature_status(
+                feature["current_gate"], feature["verdict"]
+            )
 
 
 class TestWriteInitialLaneStatus:
