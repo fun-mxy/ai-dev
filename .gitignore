@@ -1,6 +1,9 @@
 # Secrets — never commit local credentials
 .claude/settings.local.json
 
+# Claude Code worktrees — local isolated working copies, not project state
+.claude/worktrees/
+
 # Throwaway adapter prototype (de-risk artifact). Kept on disk as a v0.1
 # reference, NOT project code — see prototype/adapter/run.sh header "Do NOT promote".
 prototype/
