@@ -45,17 +45,36 @@ from ai_dev.checking_legs import (
     SPEC_GAP_REPORT_MD,
 )
 from ai_dev.cli import main
+from ai_dev.coherence_gate import (
+    COHERENCE_DECISION_JSON,
+    COHERENCE_DECISION_MD,
+    evaluate_coherence_gate,
+)
 from ai_dev.feature_run import create_feature_run
+from ai_dev.final_report import (
+    FIVE_QUESTION_KEYS,
+    FINAL_REPORT_JSON,
+    FINAL_REPORT_MD,
+    generate_final_report,
+)
+from ai_dev.fix_run import run_fix_run
 from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON, IMPLEMENT_RESULT_MD, run_implementer_leg
-from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, ISSUE_BUNDLE_MD, collect_issue_bundle
+from ai_dev.issue_bundle import (
+    ISSUE_BUNDLE_JSON,
+    ISSUE_BUNDLE_MD,
+    ISSUES_DIR,
+    collect_issue_bundle,
+)
+from ai_dev.json_artifact import write_json
 from ai_dev.lane_gate import LANE_DECISION_JSON, LANE_DECISION_MD, evaluate_lane_gate
 from ai_dev.paths import lane_dir, run_dir
 from ai_dev.profiles import load_profile
 from ai_dev.run_prepare import ALLOWED_FILES_FILE, prepare_run
-from ai_dev.run_wrapper import run_headless
+from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON, VERIFICATION_REPORT_MD, run_verifier
-from ai_dev.status import freeze_artifact
-from ai_dev.templates import LANE_GRAPH_YML, TASKS_MD
+from ai_dev.status import derive_feature_status, freeze_artifact, load_feature_status
+from ai_dev.templates import DESIGN_JSON, LANE_GRAPH_YML, REQUIREMENTS_JSON, TASKS_MD
+from ai_dev.triage import DECISIONS_DIR, apply_triage
 from ai_dev.validate import validate_run
 
 # A fake ``claude`` binary: ignores argv, writes the §13.1 agent outputs
@@ -712,6 +731,726 @@ class TestV02EndToEndIntegration:
         assert "LANE: 1" in counters
         assert "RUN: 3" in counters
         assert "ISSUE: 1" in counters
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+
+class TestV03EndToEndIntegration:
+    """Ticket 10: v0.3 walking skeleton over one real feature run.
+
+    Strings tickets 01-09 together on one feature run: freeze (advance
+    ``current_gate`` requirements_gate -> design_gate -> task_gate -> lane_gate)
+    -> implement -> review + spec-gap + verify -> collect-issues -> Human
+    Triage (apply_triage) -> [request_fix] fix-run -> re-collect -> lane-gate ->
+    coherence-gate -> final-report. Four scenarios pin the full v0.3 outcome
+    space against the real artifact chain, the current_gate progression, the
+    RUN/LANE/ISSUE/DEC id scoping, and the token-never-persisted invariant.
+
+    The bundle-staleness seam (triage writes ``issues/`` only; the lane gate
+    reads the lane ``issue-bundle.json`` projection) is fixed in-ticket by the
+    re-collect step the spec §19 flow names: after triage (and after fix-run),
+    ``collect-issues`` is re-run so the bundle re-projects the triaged ``issues/``
+    state the lane gate then reads.
+    """
+
+    # The v0.3 task body + the three agent payloads for the green path. The
+    # Implementer payload declares REQ-001/AC-001 so the final-report Q1/Q2/Q3
+    # traceability sections are non-empty (the v0.2 payload is reused for that).
+    # NB: the real Ark run's implementer did NOT declare related_requirements /
+    # related_acceptance_criteria, so its Q2/Q3 were honestly empty even on PASS
+    # (a model choice recorded in evidence/10-e2e-real-run.md "Q2/Q3 traceability
+    # is run-declared"); this CI payload declares them deliberately to exercise
+    # the coverage-assertion code path the real run left unhit.
+    _V03_TASK_BODY = "Create workspace/hello.py defining answer() returning 42."
+
+    _V03_REVIEW_PASS_PAYLOAD: dict[str, Any] = {"issues": []}
+    _V03_GAP_PASS_PAYLOAD: dict[str, Any] = {"issues": []}
+
+    # A P1 code-review blocker (requires_change_proposal=false) drives the
+    # recoverable-FAIL and the fix-loop scenarios; triaged request_fix, it is a
+    # pending fix (recoverable) until a fix run resolves it.
+    _V03_REVIEW_FAIL_P1_PAYLOAD: dict[str, Any] = {
+        "issues": [
+            {
+                "id": "agent-review-p1",
+                "source": "code_review",
+                "severity": "P1",
+                "title": "Injected review blocker for the v0.3 recoverable / fix-loop path",
+                "description": "Deliberate P1 review blocker for the v0.3 evidence paths.",
+                "related_tasks": ["TASK-001"],
+                "related_requirements": ["REQ-001"],
+                "related_acceptance_criteria": ["AC-001"],
+                "evidence": [{"file": "workspace/hello.py", "line": 1}],
+                "recommendation": "Address the injected blocker before passing the lane gate.",
+                "requires_change_proposal": False,
+            }
+        ]
+    }
+
+    # A P0 spec-gap blocker (requires_change_proposal=true) drives the
+    # terminal-FAIL scenario. Mirrors the real Ark run where glm-5.2 catches the
+    # 42-vs-43 requirement mismatch and classifies it P0 (a correctness break);
+    # triaged request_change_proposal, it is the clean deferral that v0.3 has no
+    # CP lifecycle to resolve -> terminal. Severity is immaterial for
+    # request_change_proposal (non-disarming on any blocking severity) - the P0
+    # matches the real ISSUE-001 so this payload pins the same scenario the
+    # evidence records; the ticket prose's "P1 override" was superseded by the
+    # model's P0 (P0 override is forbidden, so only the request_cp deferral
+    # applied). See evidence/10-e2e-real-run.md "Severity is the model's".
+    _V03_GAP_FAIL_REQUEST_CP_PAYLOAD: dict[str, Any] = {
+        "issues": [
+            {
+                "id": "agent-specgap-p0",
+                "source": "spec_gap",
+                "severity": "P0",
+                "title": "Implementation does not satisfy REQ-001/AC-001",
+                "description": "Spec-gap mismatch: the code does not satisfy the frozen requirement.",
+                "related_tasks": ["TASK-001"],
+                "related_requirements": ["REQ-001"],
+                "related_acceptance_criteria": ["AC-001"],
+                "evidence": [{"file": "workspace/hello.py", "line": 2}],
+                "recommendation": "Resolve the requirement mismatch; a change proposal may be needed.",
+                "requires_change_proposal": True,
+            }
+        ]
+    }
+
+    def _v03_implement_payload(self) -> dict[str, Any]:
+        return {
+            "status": "proposed_done",
+            "summary": "Wrote workspace/hello.py for the run.",
+            "tasks": [
+                {
+                    "id": "TASK-001",
+                    "status": "proposed_done",
+                    "evidence": ["workspace/hello.py"],
+                }
+            ],
+            "related_requirements": ["REQ-001"],
+            "related_acceptance_criteria": ["AC-001"],
+            "known_issues": [],
+            "change_proposals": [],
+        }
+
+    def _fill_v03_artifacts(
+        self,
+        repo_root: Path,
+        feature_id: str,
+        lane_id: str,
+        *,
+        verification_command: str,
+    ) -> None:
+        """Fill requirements (REQ-001/AC-001), design (DES-001), tasks + lane-graph.
+
+        Overwrites the empty seeded templates with a runnable v0.3 lane whose
+        implement-result will declare REQ-001/AC-001, so the final-report Q1/Q2/Q3
+        sections carry real traceability rows rather than placeholders.
+        """
+        root = _feature_root(repo_root, feature_id)
+        # 01-requirements: REQ-001 + AC-001 (final-report Q2/Q3 inputs).
+        write_json(
+            root / REQUIREMENTS_JSON,
+            {
+                "feature": feature_id,
+                "frozen": False,
+                "requirements": [
+                    {
+                        "id": "REQ-001",
+                        "statement": "The module shall expose answer() returning 42.",
+                    }
+                ],
+                "acceptance_criteria": [
+                    {
+                        "id": "AC-001",
+                        "requirement": "REQ-001",
+                        "check": "answer() == 42",
+                    }
+                ],
+                "priority": None,
+                "scope": None,
+                "constraints": [],
+                "open_questions": [],
+            },
+        )
+        # 02-design: DES-001 (minimal; the spec-gap leg reads the .md mirror, the
+        # fake claude ignores content, but the JSON is the canonical machine view).
+        write_json(
+            root / DESIGN_JSON,
+            {
+                "feature": feature_id,
+                "frozen": False,
+                "design_elements": [
+                    {"id": "DES-001", "summary": "Single-module prototype in workspace/."}
+                ],
+                "architecture_decision": None,
+                "data_model": None,
+                "api_cli_contract": None,
+                "file_layout": None,
+                "invariants": [],
+                "risks": [],
+                "dependencies": [],
+                "requirement_mapping": [{"design": "DES-001", "requirement": "REQ-001"}],
+            },
+        )
+        # 03-tasks: TASK-001 (the implementer input text).
+        (root / TASKS_MD).write_text(
+            f"# Tasks - {feature_id}\n"
+            f"\n"
+            f"Frozen: false\n"
+            f"\n"
+            f"> Canonical task state lives in `status/task-status.yml`.\n"
+            f"\n"
+            f"## Tasks (TASK-NNN)\n"
+            f"\n"
+            f"{self._V03_TASK_BODY}\n"
+        )
+        # 04-lane-graph: LANE-001 with the verify command + declared workspace file.
+        lane_graph = {
+            "feature": feature_id,
+            "frozen": False,
+            "lanes": [
+                {
+                    "id": lane_id,
+                    "purpose": "End-to-end v0.3 walking skeleton lane",
+                    "tasks": ["TASK-001"],
+                    "depends_on": [],
+                    "expected_files": ["workspace/hello.py"],
+                    "exclusive_files": ["workspace/hello.py"],
+                    "provides": [],
+                    "consumes": [],
+                    "verification_scope": ["workspace/hello.py"],
+                    "verification_commands": [
+                        {"name": "answer-returns-42", "command": verification_command}
+                    ],
+                    "merge_policy": {
+                        "auto_merge": False,
+                        "allowed_mechanical_resolutions": [],
+                        "semantic_conflict_policy": "human_triage",
+                    },
+                }
+            ],
+        }
+        with (root / LANE_GRAPH_YML).open("w") as f:
+            yaml.safe_dump(
+                lane_graph,
+                f,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            )
+
+    def _freeze_v03_all_artifacts(
+        self,
+        repo_root: Path,
+        feature_id: str,
+        lane_id: str,
+        *,
+        verification_command: str,
+    ) -> None:
+        """Fill + freeze all four human-gate artifacts, advancing current_gate.
+
+        Freezing requirements -> design_gate, design -> task_gate, tasks ->
+        lane_gate (lane_graph shares the task-gate window and does not advance).
+        Exercises the full requirements_gate -> design_gate -> task_gate ->
+        lane_gate progression the ticket requires, pinning each intermediate
+        advance (and the lane_graph-does-not-advance invariant from ticket 04)
+        rather than only the final lane_gate state.
+        """
+        self._fill_v03_artifacts(
+            repo_root, feature_id, lane_id, verification_command=verification_command
+        )
+        root = _feature_root(repo_root, feature_id)
+        status = self._feature_status(repo_root, feature_id)
+        assert status["current_gate"] == "requirements_gate"  # create_feature_run seed
+        assert status["status"] == "planning"
+        freeze_artifact(root, "requirements")
+        assert self._feature_status(repo_root, feature_id)["current_gate"] == "design_gate"
+        freeze_artifact(root, "design")
+        assert self._feature_status(repo_root, feature_id)["current_gate"] == "task_gate"
+        freeze_artifact(root, "tasks")
+        status = self._feature_status(repo_root, feature_id)
+        assert status["current_gate"] == "lane_gate"
+        assert status["status"] == "implementing"
+        freeze_artifact(root, "lane_graph")
+        # lane_graph shares the task-gate freeze window: no further advance.
+        assert self._feature_status(repo_root, feature_id)["current_gate"] == "lane_gate"
+
+    def _v03_verify_command(self) -> str:
+        py = sys.executable
+        return (
+            f'{py} -c "import hello; import sys; '
+            f'sys.exit(0 if hello.answer()==42 else 1)"'
+        )
+
+    def _assert_v03_artifact_chain(self, repo_root: Path, feature_id: str, lane_id: str) -> None:
+        """The v0.2 lane chain plus the v0.3 feature-level coherence + final-report."""
+        _assert_v02_artifact_chain(repo_root, feature_id, lane_id)
+        root = _feature_root(repo_root, feature_id)
+        # Coherence decision + final report are feature-level (§18.5 / §23.5).
+        assert (root / COHERENCE_DECISION_JSON).is_file()
+        assert (root / COHERENCE_DECISION_MD).is_file()
+        assert (root / FINAL_REPORT_JSON).is_file()
+        assert (root / FINAL_REPORT_MD).is_file()
+
+    def _feature_status(self, repo_root: Path, feature_id: str) -> dict[str, Any]:
+        return load_feature_status(_feature_root(repo_root, feature_id))["feature"]
+
+    def _dec_dir(self, repo_root: Path, feature_id: str) -> list[str]:
+        root = _feature_root(repo_root, feature_id) / DECISIONS_DIR
+        if not root.is_dir():
+            return []
+        return sorted(p.name for p in root.glob("DEC-*.json"))
+
+    def _assert_id_scoping(
+        self,
+        repo_root: Path,
+        feature_id: str,
+        *,
+        expected_runs: list[str],
+        run_counter: int,
+        issue_counter: int | None = None,
+    ) -> None:
+        """RUN/LANE/ISSUE/DEC id scoping across v0.0-v0.3 (no re-issue/mis-scope).
+
+        No DEC on any v0.3 path: ``request_change_proposal`` and ``request_fix``
+        are non-disarming clean deferrals, and the disarming override path (which
+        alone mints a DEC) is not exercised - the real Ark run triaged the spec
+        gap as P0 -> ``request_change_proposal``, not a P1 override (P0 override
+        is forbidden). ``issue_counter=None`` asserts the green path has no ISSUE
+        counter at all.
+        """
+        root = _feature_root(repo_root, feature_id)
+        assert sorted(p.name for p in (root / "runs").iterdir()) == expected_runs
+        counters = (root / "id-counters.yml").read_text()
+        assert "LANE: 1" in counters
+        assert f"RUN: {run_counter}" in counters
+        if issue_counter is None:
+            assert "ISSUE:" not in counters
+        else:
+            assert f"ISSUE: {issue_counter}" in counters
+        assert "DEC:" not in counters
+        assert self._dec_dir(repo_root, feature_id) == []
+
+    def _run_green_legs(
+        self,
+        repo_root: Path,
+        feature_id: str,
+        lane_id: str,
+        profile: Any,
+        fake: Path,
+    ) -> list[str]:
+        """implement -> review -> spec-gap -> verify -> collect; return RUN ids used."""
+        from ai_dev.checking_legs import run_reviewer_leg, run_spec_gap_leg
+
+        implement = run_implementer_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-21T10:00:00Z",
+            ended_at="2026-07-21T10:00:05Z",
+        )
+        review = run_reviewer_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-21T10:01:00Z",
+            ended_at="2026-07-21T10:01:05Z",
+        )
+        gap = run_spec_gap_leg(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            claude_path=str(fake),
+            started_at="2026-07-21T10:02:00Z",
+            ended_at="2026-07-21T10:02:05Z",
+        )
+        verification = run_verifier(
+            repo_root,
+            feature_id,
+            lane_id,
+            started_at="2026-07-21T10:03:00Z",
+            ended_at="2026-07-21T10:03:01Z",
+        )
+        assert verification.verdict == "pass"
+        return [implement.run_id, review.run_id, gap.run_id]
+
+    # ------------------------------------------------------------------
+    # Scenario 1 - PASS: all-green chain -> coherence pass -> final-report pass.
+    # ------------------------------------------------------------------
+
+    def test_pass_green_chain_coherence_and_final_report(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root)
+        profile = load_profile(repo_root, "cc-glm52")
+        sentinel = "tok-V03-PASS-LEAK-CHECK-6c2a4e"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        fake = _write_fake_claude_sequence(
+            tmp_path / "bin-pass",
+            [
+                self._v03_implement_payload(),
+                self._V03_REVIEW_PASS_PAYLOAD,
+                self._V03_GAP_PASS_PAYLOAD,
+            ],
+        )
+
+        feature_id = create_feature_run(repo_root, "ship the v0.3 green chain")
+        assert feature_id == "FEATURE-001"
+        lane_id = "LANE-001"
+        self._freeze_v03_all_artifacts(
+            repo_root, feature_id, lane_id, verification_command=self._v03_verify_command()
+        )
+        # current_gate advanced through all three planning-gate freezes -> lane_gate.
+        assert self._feature_status(repo_root, feature_id)["current_gate"] == "lane_gate"
+        assert self._feature_status(repo_root, feature_id)["status"] == "implementing"
+
+        run_ids = self._run_green_legs(repo_root, feature_id, lane_id, profile, fake)
+        assert run_ids == ["RUN-001", "RUN-002", "RUN-003"]
+
+        # collect (empty bundle) -> lane-gate PASS -> coherence PASS -> final-report.
+        bundle = collect_issue_bundle(repo_root, feature_id, lane_id)
+        assert bundle.issue_ids == []
+        lane = evaluate_lane_gate(repo_root, feature_id, lane_id)
+        assert lane.decision == "pass"
+        coherence = evaluate_coherence_gate(repo_root, feature_id)
+        assert coherence.verdict == "pass"
+        report = generate_final_report(repo_root, feature_id)
+        assert report.verdict == "pass"
+        assert report.failure_class is None
+
+        # current_gate advanced to the terminal gate; status derived done.
+        status = self._feature_status(repo_root, feature_id)
+        assert status["current_gate"] == "feature_coherence_gate"
+        assert status["verdict"] == "pass"
+        assert status["status"] == "done"
+        assert status["status"] == derive_feature_status(
+            status["current_gate"], status["verdict"]
+        )
+
+        # final-report.json: five audit-question keys present, no failure shape.
+        root = _feature_root(repo_root, feature_id)
+        report_json = json.loads((root / FINAL_REPORT_JSON).read_text())
+        assert list(report_json.keys())[:1] == ["meta"]
+        for key in FIVE_QUESTION_KEYS:
+            assert key in report_json
+        assert report_json["verdict"] == "pass"
+        assert report_json["failure_class"] is None
+        assert report_json["blocking_reasons"] == []
+        # Q2/Q3 carry the REQ-001/AC-001 traceability the implementer declared.
+        assert report_json["requirement_coverage"][0]["requirement"] == "REQ-001"
+        assert report_json["requirement_coverage"][0]["implemented"] is True
+        assert report_json["acceptance_verification"][0]["acceptance_criterion"] == "AC-001"
+
+        self._assert_v03_artifact_chain(repo_root, feature_id, lane_id)
+        # ID scoping: three agent RUNs, the seeded lane, no ISSUE/DEC in the green path.
+        self._assert_id_scoping(
+            repo_root, feature_id,
+            expected_runs=["RUN-001", "RUN-002", "RUN-003"], run_counter=3,
+        )
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+    # ------------------------------------------------------------------
+    # Scenario 2 - FAIL (terminal): spec-gap P0 -> triage request_change_proposal
+    # -> re-collect -> lane-gate FAIL -> coherence FAIL -> final-report terminal.
+    # ------------------------------------------------------------------
+
+    def test_cli_fail_terminal_request_change_proposal(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        write_profiles(repo_root)
+        sentinel = "tok-V03-FAIL-CP-LEAK-CHECK-2d8b1f"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        fake_bin = _write_fake_claude_sequence(
+            tmp_path / "bin-fail-cp",
+            [
+                self._v03_implement_payload(),
+                self._V03_REVIEW_PASS_PAYLOAD,
+                self._V03_GAP_FAIL_REQUEST_CP_PAYLOAD,
+            ],
+        )
+        monkeypatch.setenv("PATH", f"{fake_bin.parent}{os.pathsep}{os.environ['PATH']}")
+
+        assert main(
+            ["create-feature-run", "v0.3 terminal fail evidence", "--repo-root", str(repo_root)]
+        ) == 0
+        feature_id = "FEATURE-001"
+        lane_id = "LANE-001"
+        # Freeze via the library helper (the CLI freeze subcommand is one
+        # artifact at a time; the library helper freezes all four in one call and
+        # is the under-test seam for the current_gate progression).
+        self._freeze_v03_all_artifacts(
+            repo_root, feature_id, lane_id, verification_command=self._v03_verify_command()
+        )
+
+        assert main(["implement", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["review", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["spec-gap", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["verify", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["collect-issues", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+
+        # ISSUE-001 raised (spec-gap P0); Human Triage -> request_change_proposal
+        # (clean deferral, no DEC: v0.3 has no CP lifecycle).
+        assert main(
+            [
+                "triage", feature_id,
+                "--issue", "ISSUE-001",
+                "--disposition", "request_change_proposal",
+                "--reason", "Requirement mismatch needs a Change Proposal (v0.4 lifecycle).",
+                "--repo-root", str(repo_root),
+            ]
+        ) == 0
+        # re-collect refreshes the lane bundle so the lane gate sees the triage
+        # (the bundle-staleness seam: triage writes issues/ only).
+        assert main(["collect-issues", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+
+        # lane-gate FAIL: the spec-gap P0 is a request_change_proposal followup.
+        assert main(["lane-gate", feature_id, lane_id, "--repo-root", str(repo_root)]) == 1
+        out = capsys.readouterr().out
+        assert "LANE-GATE FAIL" in out
+        assert "spec_gap_no_blocking_issues" in out
+
+        # coherence-gate FAIL: the P0 is unhandled (request_cp is not disarming).
+        assert main(["coherence-gate", feature_id, "--repo-root", str(repo_root)]) == 1
+        out = capsys.readouterr().out
+        assert "COHERENCE-GATE FAIL" in out
+
+        # final-report returns 0 for a successful render of EITHER verdict
+        # (the report exists for pass and fail; 1 is only for missing/null).
+        assert main(["final-report", feature_id, "--repo-root", str(repo_root)]) == 0
+        out = capsys.readouterr().out
+        assert "FINAL-REPORT -" in out
+        assert "verdict=fail" in out
+        assert "failure_class=terminal" in out
+
+        # Artifact chain + bundle content. (DEC scoping is asserted by
+        # _assert_id_scoping below: request_cp is a clean deferral -> no DEC.)
+        self._assert_v03_artifact_chain(repo_root, feature_id, lane_id)
+        root = _feature_root(repo_root, feature_id)
+        lane_root = lane_dir(repo_root, feature_id, lane_id)
+        bundle = json.loads((lane_root / ISSUE_BUNDLE_JSON).read_text())
+        assert [issue["id"] for issue in bundle["issues"]] == ["ISSUE-001"]
+        assert bundle["issues"][0]["triage"]["action"] == "request_change_proposal"
+        assert bundle["issues"][0]["triage"].get("decision_ids", []) == []
+
+        status = self._feature_status(repo_root, feature_id)
+        assert status["current_gate"] == "feature_coherence_gate"
+        assert status["verdict"] == "fail"
+        assert status["status"] == "blocked"
+
+        report_json = json.loads((root / FINAL_REPORT_JSON).read_text())
+        assert report_json["verdict"] == "fail"
+        assert report_json["failure_class"] == "terminal"
+        kinds = {r["kind"] for r in report_json["blocking_reasons"]}
+        assert "pending_change_proposal" in kinds
+        # Q4 records the request_change_proposal disposition with no decision.
+        disp = report_json["issue_dispositions"][0]
+        assert disp["issue_id"] == "ISSUE-001"
+        assert disp["disposition"] == "request_change_proposal"
+        assert disp["decision_ids"] == []
+
+        self._assert_id_scoping(
+            repo_root, feature_id,
+            expected_runs=["RUN-001", "RUN-002", "RUN-003"], run_counter=3, issue_counter=1,
+        )
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+    # ------------------------------------------------------------------
+    # Scenario 3 - FAIL (recoverable): review P1 -> triage request_fix (pending,
+    # no fix run) -> re-collect -> lane-gate FAIL -> coherence FAIL ->
+    # final-report recoverable.
+    # ------------------------------------------------------------------
+
+    def test_fail_recoverable_request_fix_pending(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root)
+        profile = load_profile(repo_root, "cc-glm52")
+        sentinel = "tok-V03-FAIL-FIX-LEAK-CHECK-9e1c3a"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        fake = _write_fake_claude_sequence(
+            tmp_path / "bin-fail-fix",
+            [
+                self._v03_implement_payload(),
+                self._V03_REVIEW_FAIL_P1_PAYLOAD,
+                self._V03_GAP_PASS_PAYLOAD,
+            ],
+        )
+
+        feature_id = create_feature_run(repo_root, "v0.3 recoverable fail evidence")
+        assert feature_id == "FEATURE-001"
+        lane_id = "LANE-001"
+        self._freeze_v03_all_artifacts(
+            repo_root, feature_id, lane_id, verification_command=self._v03_verify_command()
+        )
+
+        self._run_green_legs(repo_root, feature_id, lane_id, profile, fake)
+        collect_issue_bundle(repo_root, feature_id, lane_id)  # ISSUE-001 raised (review P1)
+
+        apply_triage(
+            repo_root,
+            feature_id,
+            "ISSUE-001",
+            "request_fix",
+            "Address the injected review blocker in a bounded fix run.",
+            "human",
+        )
+        # re-collect refreshes the bundle so the lane gate sees request_fix.
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        lane = evaluate_lane_gate(repo_root, feature_id, lane_id)
+        assert lane.decision == "fail"
+        assert "review_no_blocking_issues" in lane.failed_conditions
+        # resolution_path=request_fix recorded on the blocking summary.
+        assert any(
+            b.get("resolution_path") == "request_fix" for b in lane.blocking_issues
+        )
+
+        coherence = evaluate_coherence_gate(repo_root, feature_id)
+        assert coherence.verdict == "fail"
+        report = generate_final_report(repo_root, feature_id)
+        assert report.verdict == "fail"
+        assert report.failure_class == "recoverable"
+
+        root = _feature_root(repo_root, feature_id)
+        report_json = json.loads((root / FINAL_REPORT_JSON).read_text())
+        kinds = {r["kind"] for r in report_json["blocking_reasons"]}
+        assert "pending_fix" in kinds
+        # No terminal reason in a recoverable fail.
+        assert all(r["class"] == "recoverable" for r in report_json["blocking_reasons"])
+
+        status = self._feature_status(repo_root, feature_id)
+        assert status["verdict"] == "fail"
+        assert status["status"] == "blocked"
+        # request_fix is non-disarming: no DEC minted.
+        assert self._dec_dir(repo_root, feature_id) == []
+        # fix_loop_budget still has capacity (no fix run consumed it yet).
+        assert status["fix_loop_budget"]["used"] == 0
+        assert status["fix_loop_budget"]["max"] == 1
+        self._assert_v03_artifact_chain(repo_root, feature_id, lane_id)
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+    # ------------------------------------------------------------------
+    # Scenario 4 - fix-loop PASS: review P1 -> triage request_fix -> fix-run
+    # (clean second pass) -> re-collect (resolved) -> lane-gate PASS ->
+    # coherence PASS -> final-report pass.
+    # ------------------------------------------------------------------
+
+    def test_fix_loop_resolves_to_pass(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root)
+        profile = load_profile(repo_root, "cc-glm52")
+        sentinel = "tok-V03-FIXLOOP-LEAK-CHECK-4a7d2c"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        # Six payloads: initial implement/review(fail)/gap, then the fix-run's
+        # implement/review(pass)/gap. run_fix_run does not expose claude_path,
+        # so the fake is resolved via PATH for every leg - the shared queue
+        # hands them out in invocation order.
+        fake_bin = _write_fake_claude_sequence(
+            tmp_path / "bin-fixloop",
+            [
+                self._v03_implement_payload(),
+                self._V03_REVIEW_FAIL_P1_PAYLOAD,
+                self._V03_GAP_PASS_PAYLOAD,
+                self._v03_implement_payload(),
+                self._V03_REVIEW_PASS_PAYLOAD,
+                self._V03_GAP_PASS_PAYLOAD,
+            ],
+        )
+        monkeypatch.setenv("PATH", f"{fake_bin.parent}{os.pathsep}{os.environ['PATH']}")
+
+        feature_id = create_feature_run(repo_root, "ship the v0.3 fix loop")
+        assert feature_id == "FEATURE-001"
+        lane_id = "LANE-001"
+        self._freeze_v03_all_artifacts(
+            repo_root, feature_id, lane_id, verification_command=self._v03_verify_command()
+        )
+
+        # Initial legs via the shared green-legs helper. claude_path resolves the
+        # same fake that is also on PATH for the fix-run legs run_fix_run spawns;
+        # the implementer invocation writes workspace/hello.py (return 42), so the
+        # initial verify passes exactly as in scenario 1.
+        initial_runs = self._run_green_legs(repo_root, feature_id, lane_id, profile, fake_bin)
+        assert initial_runs == ["RUN-001", "RUN-002", "RUN-003"]
+        collect_issue_bundle(repo_root, feature_id, lane_id)  # ISSUE-001 raised
+
+        apply_triage(
+            repo_root, feature_id, "ISSUE-001", "request_fix",
+            "Address the injected review blocker in a bounded fix run.", "human",
+        )
+
+        # fix-run: RUN-004 implement, RUN-005 review(pass), RUN-006 spec-gap(pass),
+        # verify, collect (ISSUE-001 resolved, bundle emptied).
+        fix = run_fix_run(
+            repo_root, feature_id, lane_id, profile,
+            max_turns=DEFAULT_MAX_TURNS,
+            permission_mode=DEFAULT_PERMISSION_MODE,
+            verify_timeout=30.0,
+        )
+        assert fix.implement_run_id == "RUN-004"
+        assert fix.target_issue_ids == ["ISSUE-001"]
+        assert fix.budget_used == 1
+        assert fix.budget_max == 1
+        # The fix run's clean second pass resolved ISSUE-001 (fingerprint absent).
+        assert fix.collection.issue_ids == []
+
+        # re-collect (spec §19: Re-collect after Fix Run) -> bundle stays empty.
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        lane = evaluate_lane_gate(repo_root, feature_id, lane_id)
+        assert lane.decision == "pass"
+        coherence = evaluate_coherence_gate(repo_root, feature_id)
+        assert coherence.verdict == "pass"
+        report = generate_final_report(repo_root, feature_id)
+        assert report.verdict == "pass"
+        assert report.failure_class is None
+
+        # ISSUE-001 is resolved (not reappeared): the clean fix cleared it.
+        issue = json.loads(
+            (_feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json").read_text()
+        )
+        assert issue["status"] == "resolved"
+        assert issue["triage"] is None  # preserved into triage_history on resolve
+        assert issue["triage_history"][-1]["action"] == "request_fix"
+
+        # ID scoping: six agent RUNs (3 initial + 3 fix), ISSUE-001, no DEC.
+        self._assert_id_scoping(
+            repo_root, feature_id,
+            expected_runs=["RUN-001", "RUN-002", "RUN-003", "RUN-004", "RUN-005", "RUN-006"],
+            run_counter=6,
+            issue_counter=1,
+        )
+
+        status = self._feature_status(repo_root, feature_id)
+        assert status["current_gate"] == "feature_coherence_gate"
+        assert status["verdict"] == "pass"
+        assert status["status"] == "done"
+        self._assert_v03_artifact_chain(repo_root, feature_id, lane_id)
         _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
 
 

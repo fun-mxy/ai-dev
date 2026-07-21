@@ -4,13 +4,13 @@
 
 **Blocked by:** 07, 08, 09
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 从一条 intent 起：freeze -> implement -> review/gap/verify -> collect -> triage -> [fix-run] -> re-collect/re-triage -> lane-gate -> coherence-gate -> final-report 依次跑通，无手动干预
-- [ ] 产出完整 v0.3 artifact 链：triage 写入、DEC-NNN（若有）、fix-run（若有）、coherence verdict、final-report.{json,md}
-- [ ] 捕获 PASS 场景（verdict=pass）与 FAIL 场景（P1 override / request_cp -> verdict=fail，failure_class 标注）各一次作证据
-- [ ] current_gate 全程正确推进（requirements->...->feature_coherence_gate），feature.status 派生正确
-- [ ] ISSUE/RUN/LANE/DEC ID 跨 v0.0-v0.3 衔接无重号/错位
-- [ ] token 全程不落盘（artifact 与 run 目录 grep 不到 token 值）
-- [ ] 集成接缝问题票内修复不遗留
-- [ ] evidence/ 目录记录真实 Ark run 证据
+- [x] 从一条 intent 起：freeze -> implement -> review/gap/verify -> collect -> triage -> [fix-run] -> re-collect/re-triage -> lane-gate -> coherence-gate -> final-report 依次跑通，无手动干预
+- [x] 产出完整 v0.3 artifact 链：triage 写入、DEC-NNN（若有）、fix-run（若有）、coherence verdict、final-report.{json,md}
+- [x] 捕获 PASS 场景（verdict=pass）与 FAIL 场景（P1 override / request_cp -> verdict=fail，failure_class 标注）各一次作证据
+- [x] current_gate 全程正确推进（requirements->...->feature_coherence_gate），feature.status 派生正确
+- [x] ISSUE/RUN/LANE/DEC ID 跨 v0.0-v0.3 衔接无重号/错位
+- [x] token 全程不落盘（artifact 与 run 目录 grep 不到 token 值）
+- [x] 集成接缝问题票内修复不遗留
+- [x] evidence/ 目录记录真实 Ark run 证据
