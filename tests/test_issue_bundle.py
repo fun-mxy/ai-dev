@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ai_dev.checking_legs import (
     REVIEW_DIR,
     REVIEW_REPORT_JSON,
@@ -27,6 +29,7 @@ from ai_dev.issue_bundle import (
     ISSUES_DIR,
     collect_issue_bundle,
 )
+from ai_dev.json_artifact import write_json
 from ai_dev.paths import lane_dir
 from ai_dev.validate import ValidationResult
 
@@ -69,6 +72,29 @@ def _write_review_and_gap_reports(
         validation=ValidationResult("RUN-003", []),
     )
     return feature_id, lane_id
+
+
+def _overwrite_review_report(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    review_issues: list[dict[str, Any]],
+) -> None:
+    """Re-write the lane's review-report in place for a re-collect scenario.
+
+    Reuses the same lane the initial ``_write_review_and_gap_reports`` staged so
+    the re-collect sees an updated reviewer report against the same feature/lane
+    (a fresh ``_write_review_and_gap_reports`` would stage a brand-new feature).
+    """
+    feature_root = _feature_root(repo_root, feature_id)
+    write_review_report(
+        feature_root,
+        lane_id,
+        run_id="RUN-002",
+        result={"issues": review_issues},
+        metadata=_REVIEW_RUN_METADATA,
+        validation=ValidationResult("RUN-002", []),
+    )
 
 
 class TestCollectIssueBundle:
@@ -203,6 +229,136 @@ class TestCollectIssueBundle:
         assert [issue["title"] for issue in bundle["issues"]] == ["Review-only issue"]
         assert "Review-only issue" in (lane_root / ISSUE_BUNDLE_MD).read_text()
         assert "Verifier failure" not in (lane_root / ISSUE_BUNDLE_MD).read_text()
+
+    def test_collect_raises_when_prerequisite_reports_missing(
+        self, repo_root: Path
+    ) -> None:
+        # §24.2 fail-loud: a collector with no reviewer/gap reports to read must
+        # not silently yield an empty bundle; it raises before writing anything.
+        feature_id, lane_id, _ = _stage_implement_run(repo_root)
+
+        with pytest.raises(ValueError):
+            collect_issue_bundle(repo_root, feature_id, lane_id)
+
+
+class TestBundleMergeIsProjection:
+    """ADR-0002 D1: ``issues/ISSUE-NNN.json`` is the source of truth and the
+    lane ``issue-bundle.json`` is a projection of it. Re-collect must MERGE -
+    preserving persisted state other writers own (``triage`` / ``status`` /
+    run-tracking) while refreshing report-derived fields - not overwrite.
+
+    These tests do not introduce the ``triage`` / ``status`` fields themselves
+    (those land in tickets 05 / 03); they write arbitrary persisted state onto
+    ``ISSUE-NNN.json`` between collects to prove the merge preserves it.
+    """
+
+    def test_first_collect_has_no_persisted_state(self, repo_root: Path) -> None:
+        review_issues = [_issue(id="agent-review-1")]
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=review_issues, gap_issues=[]
+        )
+
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        issue = json.loads(
+            (_feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json").read_text()
+        )
+        assert issue["id"] == "ISSUE-001"
+        # No writer has touched persisted state yet -> the issue carries only
+        # report-derived fields + the stable id.
+        assert "triage" not in issue
+        assert "status" not in issue
+
+    def test_re_collect_preserves_persisted_state_and_refreshes_report_fields(
+        self, repo_root: Path
+    ) -> None:
+        # Same fingerprint across both reports (source/title/evidence are the
+        # ``_issue`` defaults) so the id is reused and the merge path is exercised.
+        review_v1 = [
+            _issue(
+                id="agent-review-1",
+                description="v1 description",
+                recommendation="v1 recommendation",
+            )
+        ]
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=review_v1, gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        # Simulate the writers that land in later tickets: apply_triage (05)
+        # writes `triage`, the status helper (03) writes `status`, the
+        # collector/fix-run write run-tracking -- all onto the SoT issue file.
+        issue_path = _feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json"
+        issue = json.loads(issue_path.read_text())
+        issue["triage"] = {
+            "action": "override_issue",
+            "reason": "Known limitation acceptable for MVP v0.",
+            "by": "human",
+        }
+        issue["status"] = "triaged"
+        issue["first_seen_in_run"] = "RUN-001"
+        write_json(issue_path, issue)
+
+        # Re-review: same fingerprint, refreshed severity/description/recommendation.
+        review_v2 = [
+            _issue(
+                id="agent-review-1",
+                severity="P1",
+                description="v2 description - sharper",
+                recommendation="v2 recommendation",
+            )
+        ]
+        _overwrite_review_report(repo_root, feature_id, lane_id, review_v2)
+
+        result = collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        merged = json.loads(issue_path.read_text())
+        # Fingerprint match -> id reused, not re-allocated.
+        assert result.issue_ids == ["ISSUE-001"]
+        assert merged["id"] == "ISSUE-001"
+        # Persisted state survives the re-collect (the bridge-bug fix).
+        assert merged["triage"] == {
+            "action": "override_issue",
+            "reason": "Known limitation acceptable for MVP v0.",
+            "by": "human",
+        }
+        assert merged["status"] == "triaged"
+        assert merged["first_seen_in_run"] == "RUN-001"
+        # Report-derived fields are refreshed from the new report.
+        assert merged["severity"] == "P1"
+        assert merged["description"] == "v2 description - sharper"
+        assert merged["recommendation"] == "v2 recommendation"
+        # The id counter did not advance (no new allocation).
+        counters = (_feature_root(repo_root, feature_id) / "id-counters.yml").read_text()
+        assert "ISSUE: 1" in counters
+
+    def test_bundle_is_projection_of_issues_dir(self, repo_root: Path) -> None:
+        review_issues = [_issue(id="agent-review-1", severity="P1")]
+        feature_id, lane_id = _write_review_and_gap_reports(
+            repo_root, review_issues=review_issues, gap_issues=[]
+        )
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        # Persisted state written to the SoT must project into the bundle.
+        issue_path = _feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json"
+        issue = json.loads(issue_path.read_text())
+        issue["triage"] = {"action": "reject", "reason": "false positive", "by": "human"}
+        write_json(issue_path, issue)
+
+        collect_issue_bundle(repo_root, feature_id, lane_id)
+
+        bundle = json.loads(
+            (lane_dir(repo_root, feature_id, lane_id) / ISSUE_BUNDLE_JSON).read_text()
+        )
+        persisted_issue = json.loads(issue_path.read_text())
+        # The bundle entry IS the merged issues/ state - never a divergent copy.
+        assert bundle["issues"][0] == persisted_issue
+        assert bundle["issues"][0]["triage"] == {
+            "action": "reject",
+            "reason": "false positive",
+            "by": "human",
+        }
 
 
 class TestCollectIssuesCli:

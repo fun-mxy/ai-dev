@@ -10,6 +10,14 @@ writes the §4.4 double products:
 * ``issues/ISSUE-NNN.{json,md}`` at feature level;
 * ``lanes/LANE-NNN/issue-bundle.{json,md}`` at lane level.
 
+ADR-0002 D1 makes ``issues/ISSUE-NNN.json`` the single source of truth for
+persisted issue state and the lane ``issue-bundle.json`` a *projection* of it.
+A re-collect therefore MERGES rather than overwrites: report-derived fields
+(§15) are refreshed from the new reviewer/gap report, while persisted state
+that other writers own -- ``triage`` (ADR-0001), ``status`` /
+``triage_history`` / run-tracking (ADR-0002) -- is preserved across the
+re-collect. The bundle never carries state that is not also in ``issues/``.
+
 Verifier pass/fail is intentionally outside this bundle; the lane gate consumes
 the verifier report directly.
 """
@@ -37,6 +45,26 @@ ISSUE_BUNDLE_MD = "issue-bundle.md"
 ISSUE_BUNDLE_JSON = "issue-bundle.json"
 
 _COLLECT_EVENT = "collect_issues"
+
+# Fields the reviewer/spec-gap report is authoritative for (the §15 Issue
+# Contract). Everything else on ``issues/ISSUE-NNN.json`` is persisted state
+# owned by other writers - ``triage`` (ADR-0001), ``status`` / ``triage_history``
+# / run-tracking (ADR-0002) - and must survive a re-collect. Kept as a closed
+# set so the merge stays forward-compatible with persisted fields later tickets
+# add: any field not listed here is treated as persisted state and preserved.
+# ``id`` is handled separately (the collector reasserts the stable ISSUE-NNN).
+REPORT_DERIVED_FIELDS: tuple[str, ...] = (
+    "source",
+    "severity",
+    "title",
+    "description",
+    "evidence",
+    "recommendation",
+    "requires_change_proposal",
+    "related_tasks",
+    "related_requirements",
+    "related_acceptance_criteria",
+)
 
 
 @dataclass(frozen=True)
@@ -82,16 +110,21 @@ def _extract_report_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [dict(issue) for issue in raw if isinstance(issue, dict)]
 
 
-def _existing_issue_ids_by_fingerprint(feature_root: Path, lane_root: Path) -> dict[str, str]:
-    """Map already-normalized issue fingerprints to stable ids.
+def _existing_issues_by_fingerprint(
+    feature_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Map persisted issue fingerprints to their ``issues/ISSUE-NNN.json`` state.
 
-    Re-reading previous feature issue artifacts makes consecutive collector runs
-    restart-safe: a repeated normalized issue reuses its original ``ISSUE-NNN``
-    instead of calling the allocator again. The current lane bundle is also read
-    as a fallback in case the per-issue file has not been created yet but a prior
-    bundle exists.
+    ``issues/`` is the single source of truth for persisted issue state
+    (ADR-0002 D1), so a re-collect reads prior state from there - not from the
+    lane bundle, which is now a *projection* of ``issues/`` and would make
+    fingerprint matching circular. Returns the full issue dict (carrying the
+    stable ``id`` plus any persisted state) so the merge can preserve the
+    latter while refreshing report-derived fields. A re-reported issue with a
+    matching fingerprint reuses its original ``ISSUE-NNN`` instead of calling
+    the allocator again, keeping collection restart-safe.
     """
-    found: dict[str, str] = {}
+    found: dict[str, dict[str, Any]] = {}
     issue_root = feature_root / ISSUES_DIR
     if issue_root.is_dir():
         for path in sorted(issue_root.glob("ISSUE-*.json")):
@@ -100,21 +133,45 @@ def _existing_issue_ids_by_fingerprint(feature_root: Path, lane_root: Path) -> d
                 continue
             issue_id = issue.get("id")
             if isinstance(issue_id, str) and issue_id:
-                found.setdefault(_fingerprint(issue), issue_id)
-
-    bundle = read_json_object(lane_root / ISSUE_BUNDLE_JSON)
-    if bundle is not None:
-        for issue in _extract_report_issues(bundle):
-            issue_id = issue.get("id")
-            if isinstance(issue_id, str) and issue_id:
-                found.setdefault(_fingerprint(issue), issue_id)
+                found.setdefault(_fingerprint(issue), issue)
     return found
 
 
+def _merge_issue(
+    existing: Mapping[str, Any] | None,
+    report_issue: Mapping[str, Any],
+    issue_id: str,
+) -> dict[str, Any]:
+    """Merge a fresh report issue onto persisted issue state (ADR-0002 D1).
+
+    ``issues/ISSUE-NNN.json`` is the source of truth: persisted state that
+    other writers own - ``triage`` (ADR-0001), ``status`` / ``triage_history``
+    / run-tracking (ADR-0002) - survives a re-collect. Only the
+    report-derived fields (§15) are refreshed from the new reviewer/gap report;
+    the stable ``ISSUE-NNN`` id is (re)asserted by the collector. The result is
+    what gets written back to ``issues/`` and projected into the lane bundle,
+    so the bundle never carries state that is not also in ``issues/``.
+    """
+    merged: dict[str, Any] = {}
+    if existing is not None:
+        # Persisted state: every field the report is NOT authoritative for.
+        # ``id`` is skipped here and reasserted below.
+        for key, value in existing.items():
+            if key in REPORT_DERIVED_FIELDS or key == "id":
+                continue
+            merged[key] = value
+    # Report-derived fields are refreshed from the current report every collect.
+    for field in REPORT_DERIVED_FIELDS:
+        if field in report_issue:
+            merged[field] = report_issue[field]
+    merged["id"] = issue_id
+    return merged
+
+
 def _normalize_issues(
-    feature_root: Path, lane_root: Path, raw_issues: list[dict[str, Any]]
+    feature_root: Path, raw_issues: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    existing_ids = _existing_issue_ids_by_fingerprint(feature_root, lane_root)
+    existing = _existing_issues_by_fingerprint(feature_root)
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
 
@@ -123,15 +180,15 @@ def _normalize_issues(
         if key in seen:
             continue
         seen.add(key)
-        issue_id = existing_ids.get(key)
-        if issue_id is None:
+        prior = existing.get(key)
+        if prior is not None:
+            # Fingerprint match -> reuse the stable id (and its persisted state).
+            issue_id = str(prior["id"])
+        else:
             issue_id = allocate_id(feature_root, "ISSUE")
-            existing_ids[key] = issue_id
-        normalized_issue = dict(issue)
-        # Agent-local ids are not stable. The collector is the authoritative place
-        # where §5.2 feature-stable ISSUE ids are assigned.
-        normalized_issue["id"] = issue_id
-        normalized.append(normalized_issue)
+        # The collector is the authoritative place where §5.2 feature-stable
+        # ISSUE ids are assigned; agent-local ids on the report are not stable.
+        normalized.append(_merge_issue(prior, issue, issue_id))
     return normalized
 
 
@@ -181,6 +238,13 @@ def _issue_md(issue: Mapping[str, Any]) -> str:
 
 
 def _bundle_json(feature_id: str, lane_id: str, issues: list[dict[str, Any]]) -> dict[str, Any]:
+    """Project the merged ``issues/`` state into the lane bundle (ADR-0002 D1).
+
+    The bundle is not an independent source of truth: its ``issues`` are the
+    same merged dicts just written to ``issues/ISSUE-NNN.json``, so any
+    persisted state (``triage`` / ``status`` / run-tracking) projects straight
+    through for the lane gate to read.
+    """
     return {
         "feature": feature_id,
         "lane": lane_id,
@@ -243,7 +307,7 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
     review_report = _require_report(review_report_path)
     gap_report = _require_report(gap_report_path)
     raw_issues = _extract_report_issues(review_report) + _extract_report_issues(gap_report)
-    issues = _normalize_issues(feature_root, lane_root, raw_issues)
+    issues = _normalize_issues(feature_root, raw_issues)
 
     issue_root = feature_root / ISSUES_DIR
     for issue in issues:
@@ -251,6 +315,9 @@ def collect_issue_bundle(repo_root: Path, feature_id: str, lane_id: str) -> Issu
         write_json(issue_root / f"{issue_id}.json", issue)
         (issue_root / f"{issue_id}.md").write_text(_issue_md(issue))
 
+    # The bundle is a projection of ``issues/`` (ADR-0002 D1): it carries the
+    # merged issue state just written to ``issues/ISSUE-NNN.json`` - report
+    # fields plus any persisted state - so the lane gate sees the same truth.
     bundle = _bundle_json(feature_id, lane_id, issues)
     bundle_json_path = lane_root / ISSUE_BUNDLE_JSON
     bundle_md_path = lane_root / ISSUE_BUNDLE_MD
