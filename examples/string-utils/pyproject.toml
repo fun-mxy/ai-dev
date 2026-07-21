@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "string-utils"
+version = "0.0.1"
+description = "Tiny string-helpers package — the ai-dev v0.4 dogfood target (ticket 05)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "fun-mxy" }]
+
+# Dev tooling in a PEP 735 dependency group so `uv sync` installs it
+# automatically (no `--extra dev` needed). These are not runtime dependencies;
+# they exist so the verifier's `pytest`/`mypy` commands run standalone against
+# this target with zero extra toolchain wiring (v0.4 §26.5 verify-leg goal).
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["string_utils*"]
+
+[tool.pytest.ini_options]
+# Flat layout: let tests import string_utils without an editable install.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+packages = ["string_utils"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true

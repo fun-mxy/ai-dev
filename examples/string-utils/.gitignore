@@ -1,0 +1,13 @@
+# ai-dev runtime state — throwaway per spec §4.1 (target-project exception).
+# This example target is a dogfood *victim*, not a real product: feature runs
+# created here by local `ai-dev` invocations are demo output, never committed.
+# (Same principle as the orchestrator's own repo .gitignore.)
+.ai-dev/
+
+# Python build / env artefacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
