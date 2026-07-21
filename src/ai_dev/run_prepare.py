@@ -301,6 +301,7 @@ def prepare_run(
     *,
     allowed_files: Sequence[str] = (),
     output_schema: Mapping[str, Any] | None = None,
+    origin: str | None = None,
 ) -> str:
     """Allocate ``RUN-NNN`` and scaffold its directory + input package.
 
@@ -356,7 +357,7 @@ def prepare_run(
     # Mint the run id via the v0.0 allocator (audits allocate_id, persists the
     # RUN counter) before touching the filesystem, so a crash here leaves an
     # allocated-but-empty id rather than a partial directory.
-    run_id = allocate_id(feature_root, "RUN")
+    run_id = allocate_id(feature_root, "RUN", origin=origin)
     run_root = run_dir(repo_root, feature_id, run_id)
 
     for sub in (INPUT_DIR, OUTPUT_DIR, WORKSPACE_DIR):
@@ -371,5 +372,6 @@ def prepare_run(
         feature_root,
         event=_PREPARE_EVENT,
         payload={"run": run_id, "feature": feature_id, "role": role},
+        origin=origin,
     )
     return run_id

@@ -285,6 +285,7 @@ def _mutate_feature_status(
     mutate: Callable[[dict[str, Any]], list[tuple[str, dict[str, Any]]]],
     *,
     timestamp: str | None,
+    origin: str | None = None,
 ) -> None:
     """Shared load → mutate → derive → dump → audit spine for feature-status.
 
@@ -317,7 +318,8 @@ def _mutate_feature_status(
     _dump_yaml(_feature_status_path(feature_root), doc)
     for event, payload in events:
         append_audit_event(
-            feature_root, event=event, payload=payload, timestamp=timestamp
+            feature_root, event=event, payload=payload, timestamp=timestamp,
+            origin=origin,
         )
 
 
@@ -434,7 +436,8 @@ def _advance_current_gate(feature: dict[str, Any], target: str) -> bool:
 
 
 def freeze_artifact(
-    feature_root: Path, artifact: str, *, timestamp: str | None = None
+    feature_root: Path, artifact: str, *, timestamp: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Flip ``artifact``'s frozen flag ``false → true`` and audit it (§4.2).
 
@@ -483,11 +486,12 @@ def freeze_artifact(
                 )
         return events
 
-    _mutate_feature_status(feature_root, _flip, timestamp=timestamp)
+    _mutate_feature_status(feature_root, _flip, timestamp=timestamp, origin=origin)
 
 
 def set_current_gate(
-    feature_root: Path, gate: str, *, timestamp: str | None = None
+    feature_root: Path, gate: str, *, timestamp: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Move ``current_gate`` to a known §18 gate and audit the advance.
 
@@ -512,7 +516,7 @@ def set_current_gate(
         feature["current_gate"] = gate
         return [(_ADVANCE_GATE_EVENT, {"current_gate": gate})]
 
-    _mutate_feature_status(feature_root, _set_gate, timestamp=timestamp)
+    _mutate_feature_status(feature_root, _set_gate, timestamp=timestamp, origin=origin)
 
 
 def record_coherence_verdict(
@@ -521,6 +525,7 @@ def record_coherence_verdict(
     *,
     audit_payload: Mapping[str, Any] | None = None,
     timestamp: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Atomically write the coherence gate's terminal state (ADR-0003 D2/D4).
 
@@ -560,7 +565,9 @@ def record_coherence_verdict(
             payload.update(audit_payload)
         return [(_COHERENCE_GATE_EVENT, payload)]
 
-    _mutate_feature_status(feature_root, _write_verdict, timestamp=timestamp)
+    _mutate_feature_status(
+        feature_root, _write_verdict, timestamp=timestamp, origin=origin
+    )
 
 
 def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:
@@ -653,6 +660,7 @@ def mark_task_proposed_done(
     lane_id: str,
     run_id: str,
     timestamp: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Write ``task_id``'s status back to ``proposed_done`` (§9.2, v0.2 ticket 01).
 
@@ -718,4 +726,5 @@ def mark_task_proposed_done(
             "status": "proposed_done",
         },
         timestamp=timestamp,
+        origin=origin,
     )

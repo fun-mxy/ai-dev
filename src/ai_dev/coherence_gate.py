@@ -47,6 +47,7 @@ from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.lane_gate import LANE_DECISION_JSON
 from ai_dev.paths import feature_dir
 from ai_dev.status import derive_feature_status, load_feature_status, record_coherence_verdict
+from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 from ai_dev.triage import DECISIONS_DIR
 
 COHERENCE_DECISION_JSON = "coherence-decision.json"
@@ -375,7 +376,9 @@ def _coherence_decision_md(decision: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult:
+def evaluate_coherence_gate(
+    repo_root: Path, feature_id: str, *, origin: str | None = None
+) -> CoherenceResult:
     """Evaluate §18.5 for a feature and write the terminal verdict (ADR-0003 D7).
 
     Deterministically checks the three D1 input conditions, writes
@@ -390,6 +393,11 @@ def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
         raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+
+    # v0.4 ticket 02: the coherence evaluation's wall-clock duration lands on
+    # the ``coherence_gate`` event (``elapsed_ms``), captured around the
+    # deterministic condition checks.
+    gate_started = utc_now_iso()
 
     feature = load_feature_status(feature_root)["feature"]
 
@@ -439,7 +447,9 @@ def evaluate_coherence_gate(repo_root: Path, feature_id: str) -> CoherenceResult
             ],
             "condition_count": len(conditions),
             "issue_count": len(issues),
+            "elapsed_ms": elapsed_ms_between(gate_started, utc_now_iso()),
         },
+        origin=origin,
     )
     write_json(decision_json_path, decision)
     decision_md_path.write_text(_coherence_decision_md(decision))

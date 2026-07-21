@@ -66,7 +66,7 @@ from ai_dev.paths import (
 )
 from ai_dev.status import frozen_artifacts_status
 from ai_dev.templates import LANE_GRAPH_YML
-from ai_dev.timeutil import utc_now_iso
+from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 
 # Lane-level §4.4 double-product filenames (public so later tickets / tests
 # reference one source of truth for the on-disk layout, §6
@@ -501,6 +501,7 @@ def run_verifier(
     timeout: float = DEFAULT_TIMEOUT,
     started_at: str | None = None,
     ended_at: str | None = None,
+    origin: str | None = None,
 ) -> VerifierResult:
     """Run the shell Verifier leg end to end (v0.2 ticket 03, §9.5).
 
@@ -564,7 +565,9 @@ def run_verifier(
             "verdict": verdict,
             "command_count": len(results),
             "passed_count": sum(1 for r in results if r.passed),
+            "elapsed_ms": elapsed_ms_between(started, ended),
         },
+        origin=origin,
     )
 
     return VerifierResult(

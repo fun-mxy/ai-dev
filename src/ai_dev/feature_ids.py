@@ -109,6 +109,7 @@ def allocate_id(
     id_type: str,
     *,
     timestamp: str | None = None,
+    origin: str | None = None,
 ) -> str:
     """Allocate, persist, and audit the next stable id of ``id_type``.
 
@@ -138,5 +139,6 @@ def allocate_id(
         event=_ALLOCATE_EVENT,
         payload={"id": allocated, "type": id_type, "seq": seq},
         timestamp=timestamp,
+        origin=origin,
     )
     return allocated

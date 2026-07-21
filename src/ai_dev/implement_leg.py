@@ -255,6 +255,7 @@ def build_implementer_input_package(
     lane_id: str,
     *,
     task_context_append: str | None = None,
+    origin: str | None = None,
 ) -> str:
     """Build the Implementer input package from frozen artifacts (ticket 01).
 
@@ -297,6 +298,7 @@ def build_implementer_input_package(
         _IMPLEMENTER_ROLE,
         task_text,
         allowed_files=lane_allowed_files(lane),
+        origin=origin,
     )
 
 
@@ -517,6 +519,7 @@ def run_implementer_leg(
     started_at: str | None = None,
     ended_at: str | None = None,
     task_context_append: str | None = None,
+    origin: str | None = None,
 ) -> ImplementerLegResult:
     """Run the full Implementer leg: prepare -> run -> validate -> writeback -> rollup.
 
@@ -542,7 +545,8 @@ def run_implementer_leg(
     contract breach, not a captured run failure.
     """
     run_id = build_implementer_input_package(
-        repo_root, feature_id, lane_id, task_context_append=task_context_append
+        repo_root, feature_id, lane_id, task_context_append=task_context_append,
+        origin=origin,
     )
     run_result = run_headless(
         repo_root,
@@ -554,8 +558,9 @@ def run_implementer_leg(
         claude_path=claude_path,
         started_at=started_at,
         ended_at=ended_at,
+        origin=origin,
     )
-    validation = validate_run(repo_root, feature_id, run_id)
+    validation = validate_run(repo_root, feature_id, run_id, origin=origin)
 
     feature_root = feature_dir(repo_root, feature_id)
     run_root = run_dir(repo_root, feature_id, run_id)
@@ -588,7 +593,7 @@ def run_implementer_leg(
                 )
         for task_id in proposed_ids:
             mark_task_proposed_done(
-                feature_root, task_id, lane_id=lane_id, run_id=run_id
+                feature_root, task_id, lane_id=lane_id, run_id=run_id, origin=origin
             )
             task_ids_marked.append(task_id)
 

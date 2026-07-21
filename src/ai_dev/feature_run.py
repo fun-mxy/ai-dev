@@ -76,7 +76,7 @@ def _seed_empty_dirs(feature_root: Path) -> None:
         (feature_root / name).mkdir(parents=True, exist_ok=True)
 
 
-def create_feature_run(repo_root: Path, intent: str) -> str:
+def create_feature_run(repo_root: Path, intent: str, *, origin: str | None = None) -> str:
     """Create a new feature run for ``intent`` and return its ``FEATURE-NNN`` id.
 
     Lays down the §6 directory skeleton, records the intent, writes the initial
@@ -100,11 +100,12 @@ def create_feature_run(repo_root: Path, intent: str) -> str:
         feature_root,
         event="create",
         payload={"feature": feature_id},
+        origin=origin,
     )
     # §5.3 MVP: every feature run owns exactly one lane. Allocate it through
     # ticket 03's allocator so the lane-graph references a real, persisted,
     # audited id rather than a placeholder string (ticket 05).
-    lane_id = allocate_id(feature_root, "LANE")
+    lane_id = allocate_id(feature_root, "LANE", origin=origin)
     seed_artifact_templates(feature_root, feature_id, lane_id)
     # Ticket 04: seed the §8.2 lane-status with that same allocated lane id and
     # the empty §8.1 task-status, completing the §6 ``status/`` set. These are

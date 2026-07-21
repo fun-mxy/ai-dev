@@ -149,6 +149,17 @@ from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
 from ai_dev.triage import DISPOSITIONS, TriageRefusedError, TriageResult, apply_triage
 from ai_dev.validate import ValidationIssue, validate_run
 
+# v0.4 ticket 02: the canonical ``origin`` driver tag stamped on every audit
+# event this CLI emits (threaded explicitly into each leg/driver below). A direct
+# primitive invocation is ``cli``; the agent commands carry their leg identity so
+# the audit log answers "which driver triggered this run" without inference.
+ORIGIN_CLI = "cli"
+ORIGIN_IMPLEMENT_LEG = "implement-leg"
+ORIGIN_REVIEW_LEG = "review-leg"
+ORIGIN_SPEC_GAP_LEG = "spec-gap-leg"
+ORIGIN_VERIFIER = "verifier"
+ORIGIN_FIX_RUN_DRIVER = "fix-run-driver"
+
 
 def _print_validation_issues(issues: Sequence[ValidationIssue]) -> None:
     """Print one readable line per §14 validation issue.
@@ -581,7 +592,7 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
         )
         return 1
     try:
-        freeze_artifact(feature_root, artifact)
+        freeze_artifact(feature_root, artifact, origin=ORIGIN_CLI)
     except FrozenArtifactError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -635,7 +646,8 @@ def _run_prepare_run(
     """
     try:
         run_id = prepare_run(
-            repo_root, feature_id, role, task, allowed_files=allowed_files
+            repo_root, feature_id, role, task, allowed_files=allowed_files,
+            origin=ORIGIN_CLI,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -675,6 +687,7 @@ def _run_run_headless(
             profile,
             max_turns=max_turns,
             permission_mode=permission_mode,
+            origin=ORIGIN_CLI,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -698,7 +711,7 @@ def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
     fixes the exit code at 0=PASS / 1=FAIL).
     """
     try:
-        result = validate_run(repo_root, feature_id, run_id)
+        result = validate_run(repo_root, feature_id, run_id, origin=ORIGIN_CLI)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -746,6 +759,7 @@ def _run_implement(
             profile,
             max_turns=max_turns,
             permission_mode=permission_mode,
+            origin=ORIGIN_IMPLEMENT_LEG,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -773,6 +787,7 @@ def _run_checking(
     *,
     leg: Callable[..., CheckingLegResult],
     label: str,
+    origin: str,
 ) -> int:
     """Run a checking leg (Code Reviewer or Spec Gap Analyst) end to end
     (v0.2 ticket 02, §9.3/§9.4).
@@ -800,6 +815,7 @@ def _run_checking(
             profile,
             max_turns=max_turns,
             permission_mode=permission_mode,
+            origin=origin,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -846,7 +862,7 @@ def _run_verify(
     ``error:`` line rather than a traceback)."""
     try:
         result = run_verifier(
-            repo_root, feature_id, lane_id, timeout=timeout
+            repo_root, feature_id, lane_id, timeout=timeout, origin=ORIGIN_VERIFIER
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -881,7 +897,9 @@ def _run_collect_issues(
     with a clean ``error:`` line (§24.2).
     """
     try:
-        result: IssueBundleResult = collect_issue_bundle(repo_root, feature_id, lane_id)
+        result: IssueBundleResult = collect_issue_bundle(
+            repo_root, feature_id, lane_id, origin=ORIGIN_CLI
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -903,7 +921,9 @@ def _run_lane_gate(
     prerequisite artifacts.
     """
     try:
-        result: LaneDecisionResult = evaluate_lane_gate(repo_root, feature_id, lane_id)
+        result: LaneDecisionResult = evaluate_lane_gate(
+            repo_root, feature_id, lane_id, origin=ORIGIN_CLI
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -934,7 +954,9 @@ def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
     writes nothing.
     """
     try:
-        result: CoherenceResult = evaluate_coherence_gate(repo_root, feature_id)
+        result: CoherenceResult = evaluate_coherence_gate(
+            repo_root, feature_id, origin=ORIGIN_CLI
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1000,6 +1022,7 @@ def _run_fix_run(
             max_turns=max_turns,
             permission_mode=permission_mode,
             verify_timeout=verify_timeout,
+            origin=ORIGIN_FIX_RUN_DRIVER,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1033,7 +1056,7 @@ def _run_triage(
     """
     try:
         result: TriageResult = apply_triage(
-            repo_root, feature_id, issue_id, disposition, reason, by
+            repo_root, feature_id, issue_id, disposition, reason, by, origin=ORIGIN_CLI
         )
     except (TriageRefusedError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1052,7 +1075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "create-feature-run":
-        feature_id = create_feature_run(Path(args.repo_root), args.intent)
+        feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
         print(feature_id)
         return 0
 
@@ -1104,6 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.permission_mode,
             leg=run_reviewer_leg,
             label="REVIEW",
+            origin=ORIGIN_REVIEW_LEG,
         )
 
     if args.command == "spec-gap":
@@ -1116,6 +1140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.permission_mode,
             leg=run_spec_gap_leg,
             label="SPEC-GAP",
+            origin=ORIGIN_SPEC_GAP_LEG,
         )
 
     if args.command == "verify":

@@ -584,6 +584,7 @@ def validate_run(
     run_id: str,
     *,
     attempt: int = 1,
+    origin: str | None = None,
 ) -> ValidationResult:
     """Run the §14 three deterministic checks against a captured run.
 
@@ -639,6 +640,7 @@ def validate_run(
             "failed_check": result.failed_check,
             "issue_count": len(result.issues),
         },
+        origin=origin,
     )
     return result
 

@@ -167,3 +167,71 @@ class TestAppendAuditEvent:
         # array document, not newline-delimited JSON.
         loaded = json.loads((tmp_path / AUDIT_LOG_JSON).read_text())
         assert isinstance(loaded, list)
+
+    def test_origin_is_a_top_level_field_in_both_products(self, tmp_path: Path) -> None:
+        # v0.4 ticket 02: ``origin`` (the canonical driver tag) is a top-level
+        # record field — a peer of event/payload, not a payload entry — so it
+        # never collides with or pollutes the event's factual detail.
+        append_audit_event(
+            tmp_path,
+            event="run",
+            payload={"run": "RUN-001", "exit_code": 0},
+            timestamp="2026-07-19T10:00:00Z",
+            origin="implement-leg",
+        )
+
+        record = _json_records(tmp_path)[0]
+        assert record["origin"] == "implement-leg"
+        # origin stays out of the payload bag.
+        assert "origin" not in record["payload"]
+
+        md = _md(tmp_path)
+        assert "origin=implement-leg" in md
+
+    def test_origin_omitted_when_none_keeps_legacy_shape(self, tmp_path: Path) -> None:
+        # A caller that does not pass origin must produce the legacy record
+        # shape (no origin key) so older consumers are unaffected.
+        append_audit_event(
+            tmp_path,
+            event="create",
+            payload={"feature": "FEATURE-001"},
+            timestamp="2026-07-19T10:00:00Z",
+        )
+        assert _json_records(tmp_path)[0] == {
+            "timestamp": "2026-07-19T10:00:00Z",
+            "event": "create",
+            "payload": {"feature": "FEATURE-001"},
+        }
+        assert "origin=" not in _md(tmp_path)
+
+    def test_elapsed_ms_payload_field_appears_in_both_products(self, tmp_path: Path) -> None:
+        # v0.4 ticket 02: a duration event carries ``elapsed_ms`` in its payload
+        # (native int in JSON, rendered in markdown); the two products stay in
+        # sync just like every other payload fact.
+        append_audit_event(
+            tmp_path,
+            event="run",
+            payload={"run": "RUN-001", "exit_code": 0, "elapsed_ms": 42000},
+            timestamp="2026-07-19T10:00:00Z",
+            origin="cli",
+        )
+
+        record = _json_records(tmp_path)[0]
+        assert record["payload"]["elapsed_ms"] == 42000
+        assert record["origin"] == "cli"
+
+        md = _md(tmp_path)
+        assert "elapsed_ms: 42000" in md
+        assert "origin=cli" in md
+
+    def test_non_duration_event_carries_no_elapsed_ms(self, tmp_path: Path) -> None:
+        # ``elapsed_ms`` absence is meaningful (the event has no duration
+        # semantics), so a non-duration event must not carry a placeholder 0.
+        append_audit_event(
+            tmp_path,
+            event="create",
+            payload={"feature": "FEATURE-001"},
+            timestamp="2026-07-19T10:00:00Z",
+            origin="cli",
+        )
+        assert "elapsed_ms" not in _json_records(tmp_path)[0]["payload"]

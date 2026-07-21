@@ -880,6 +880,7 @@ class TestRunHeadless:
         run_headless(
             repo_root, "FEATURE-001", "RUN-001", profile, claude_path=str(fake),
             started_at="2026-07-19T10:00:00Z", ended_at="2026-07-19T10:00:05Z",
+            origin="implement-leg",
         )
 
         records = _audit_records(repo_root, "FEATURE-001")
@@ -889,6 +890,10 @@ class TestRunHeadless:
         assert isinstance(payload, dict)
         assert payload.get("run") == "RUN-001"
         assert payload.get("exit_code") == 0
+        # v0.4 ticket 02: elapsed_ms is the real ended-started delta (5s) and
+        # origin threads through as the top-level driver tag.
+        assert payload.get("elapsed_ms") == 5_000
+        assert run_events[0].get("origin") == "implement-leg"
 
     def test_missing_run_dir_raises(
         self,

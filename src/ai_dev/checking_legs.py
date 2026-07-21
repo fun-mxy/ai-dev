@@ -403,7 +403,7 @@ def _spec_gap_task_text(
 
 
 def build_reviewer_input_package(
-    repo_root: Path, feature_id: str, lane_id: str
+    repo_root: Path, feature_id: str, lane_id: str, *, origin: str | None = None
 ) -> str:
     """Build the Code Reviewer input package from the lane's implement run (§9.3).
 
@@ -426,11 +426,12 @@ def build_reviewer_input_package(
         _REVIEWER_ROLE,
         _reviewer_task_text(facts),
         output_schema=ISSUES_OUTPUT_SCHEMA,
+        origin=origin,
     )
 
 
 def build_spec_gap_input_package(
-    repo_root: Path, feature_id: str, lane_id: str
+    repo_root: Path, feature_id: str, lane_id: str, *, origin: str | None = None
 ) -> str:
     """Build the Spec Gap Analyst input package from the lane's implement run (§9.4).
 
@@ -449,6 +450,7 @@ def build_spec_gap_input_package(
         _SPEC_GAP_ROLE,
         _spec_gap_task_text(feature_root, facts),
         output_schema=ISSUES_OUTPUT_SCHEMA,
+        origin=origin,
     )
 
 
@@ -722,12 +724,13 @@ def _run_checking_leg(
     report_dir_name: str,
     report_md_name: str,
     report_json_name: str,
-    build_input_package: Callable[[Path, str, str], str],
+    build_input_package: Callable[..., str],
     claude_path: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     started_at: str | None = None,
     ended_at: str | None = None,
+    origin: str | None = None,
 ) -> CheckingLegResult:
     """Run a checking leg end to end: build input -> run -> validate -> rollup.
 
@@ -741,7 +744,7 @@ def _run_checking_leg(
     ``run_implementer_leg`` / ``run_headless`` returning verdicts rather than
     raising on a captured run failure).
     """
-    run_id = build_input_package(repo_root, feature_id, lane_id)
+    run_id = build_input_package(repo_root, feature_id, lane_id, origin=origin)
     run_result = run_headless(
         repo_root,
         feature_id,
@@ -752,8 +755,9 @@ def _run_checking_leg(
         claude_path=claude_path,
         started_at=started_at,
         ended_at=ended_at,
+        origin=origin,
     )
-    validation = validate_run(repo_root, feature_id, run_id)
+    validation = validate_run(repo_root, feature_id, run_id, origin=origin)
 
     feature_root = feature_dir(repo_root, feature_id)
     run_root = run_dir(repo_root, feature_id, run_id)
@@ -801,6 +805,7 @@ def run_reviewer_leg(
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     started_at: str | None = None,
     ended_at: str | None = None,
+    origin: str | None = None,
 ) -> CheckingLegResult:
     """Run the Code Reviewer leg (§9.3): build -> run -> validate -> review-report."""
     return _run_checking_leg(
@@ -819,6 +824,7 @@ def run_reviewer_leg(
         permission_mode=permission_mode,
         started_at=started_at,
         ended_at=ended_at,
+        origin=origin,
     )
 
 
@@ -833,6 +839,7 @@ def run_spec_gap_leg(
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     started_at: str | None = None,
     ended_at: str | None = None,
+    origin: str | None = None,
 ) -> CheckingLegResult:
     """Run the Spec Gap Analyst leg (§9.4): build -> run -> validate -> spec-gap-report."""
     return _run_checking_leg(
@@ -851,4 +858,5 @@ def run_spec_gap_leg(
         permission_mode=permission_mode,
         started_at=started_at,
         ended_at=ended_at,
+        origin=origin,
     )

@@ -33,6 +33,7 @@ from ai_dev.paths import feature_dir
 from ai_dev.profiles import AgentProfile
 from ai_dev.shell_verifier import VerifierResult, run_verifier
 from ai_dev.status import fix_loop_budget_exhausted, increment_fix_loop_budget
+from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 from ai_dev.validate import ValidationResult
 
 _REQUEST_FIX = "request_fix"
@@ -132,6 +133,8 @@ def _mark_fix_targets(
     feature_id: str,
     targets: list[_IssueTarget],
     run_id: str,
+    *,
+    origin: str | None = None,
 ) -> None:
     """Stamp targeted issues with the validated implement run id and audit it."""
     for target in targets:
@@ -148,6 +151,7 @@ def _mark_fix_targets(
                 "issue": target.issue_id,
                 "run": run_id,
             },
+            origin=origin,
         )
 
 
@@ -176,6 +180,7 @@ def run_fix_run(
     spec_gap_leg: CheckingLeg = run_spec_gap_leg,
     verifier_leg: VerifierLeg = run_verifier,
     collector_leg: CollectorLeg = collect_issue_bundle,
+    origin: str | None = None,
 ) -> FixRunResult:
     """Run one bounded fix loop and stop before human re-triage.
 
@@ -199,6 +204,11 @@ def run_fix_run(
             "fix-run has nothing to target"
         )
 
+    # v0.4 ticket 02: the whole bounded fix loop is one ``elapsed_ms`` span on
+    # the ``fix_run`` event. The driver is the fix-run-driver, so every event
+    # the sub-legs emit inside it carries that origin too.
+    loop_started = utc_now_iso()
+
     implement = implement_leg(
         repo_root,
         feature_id,
@@ -207,10 +217,11 @@ def run_fix_run(
         max_turns=max_turns,
         permission_mode=permission_mode,
         task_context_append=_fix_task_context(targets),
+        origin=origin,
     )
     _require_validation_passed("implement", implement.run_id, implement.validation)
     budget = increment_fix_loop_budget(feature_root, implement.run_id)
-    _mark_fix_targets(feature_root, feature_id, targets, implement.run_id)
+    _mark_fix_targets(feature_root, feature_id, targets, implement.run_id, origin=origin)
 
     review = reviewer_leg(
         repo_root,
@@ -219,6 +230,7 @@ def run_fix_run(
         profile,
         max_turns=max_turns,
         permission_mode=permission_mode,
+        origin=origin,
     )
     _require_validation_passed("review", review.run_id, review.validation)
 
@@ -229,11 +241,14 @@ def run_fix_run(
         profile,
         max_turns=max_turns,
         permission_mode=permission_mode,
+        origin=origin,
     )
     _require_validation_passed("spec-gap", spec_gap.run_id, spec_gap.validation)
 
-    verification = verifier_leg(repo_root, feature_id, lane_id, timeout=verify_timeout)
-    collection = collector_leg(repo_root, feature_id, lane_id)
+    verification = verifier_leg(
+        repo_root, feature_id, lane_id, timeout=verify_timeout, origin=origin
+    )
+    collection = collector_leg(repo_root, feature_id, lane_id, origin=origin)
 
     target_ids = [target.issue_id for target in targets]
     append_audit_event(
@@ -246,7 +261,9 @@ def run_fix_run(
             "target_issue_ids": target_ids,
             "verification_verdict": verification.verdict,
             "collected_issue_ids": collection.issue_ids,
+            "elapsed_ms": elapsed_ms_between(loop_started, utc_now_iso()),
         },
+        origin=origin,
     )
     return FixRunResult(
         feature_id=feature_id,
