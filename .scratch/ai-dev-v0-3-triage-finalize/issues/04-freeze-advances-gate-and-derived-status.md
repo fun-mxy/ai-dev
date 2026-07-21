@@ -4,11 +4,11 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] freeze(requirements/design/tasks) 原子推进 current_gate 到下一 stage，审计 advance_gate
-- [ ] `feature.status` 按 (current_gate, verdict) 派生表投影，永不独立写
-- [ ] 4 个 status 值（planning/implementing/done/blocked）cell-coverage 断言测试
-- [ ] 显式断言 `(null, feature_coherence_gate)` 不可达格永不被产生
-- [ ] `blocked` 严格指 coherence-fail（本票尚无 verdict writer，blocked 分支在 08 后可测；本票先钉派生函数）
-- [ ] freeze(lane_graph) 不重复推进 current_gate
+- [x] freeze(requirements/design/tasks) 原子推进 current_gate 到下一 stage，审计 advance_gate
+- [x] `feature.status` 按 (current_gate, verdict) 派生表投影，永不独立写
+- [x] 4 个 status 值（planning/implementing/done/blocked）cell-coverage 断言测试
+- [x] 显式断言 `(null, feature_coherence_gate)` 不可达格永不被产生
+- [x] `blocked` 严格指 coherence-fail（本票尚无 verdict writer，blocked 分支在 08 后可测；本票先钉派生函数）
+- [x] freeze(lane_graph) 不重复推进 current_gate
