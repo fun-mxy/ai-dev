@@ -778,4 +778,193 @@ class TestCliValidateRun:
         assert "RUN-999" in err
 
 
+class TestCliErrorMessages:
+    """v0.4 §26.5 - clean, actionable ``error:`` rendering (ticket 01).
+
+    The exit-code contract is unchanged (0=success / 1=everything-else); the
+    investment is in message quality: a top-level catch turns uncaught
+    exceptions into one ``error:`` line (no traceback) unless ``--debug``
+    re-raises, and every command's failure carries an actionable hint
+    ("did you mean", legal values, the env var to export).
+    """
+
+    def test_uncaught_exception_becomes_clean_error_line(
+        self,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # An unexpected (non-ValueError) exception must not dump a traceback -
+        # it renders as a single ``error:`` line and exits 1 (§26.5).
+        def _boom(*args: object, **kwargs: object) -> str:
+            raise RuntimeError("kaboom: internal widget fault")
+
+        monkeypatch.setattr("ai_dev.cli.create_feature_run", _boom)
+
+        code = main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "kaboom: internal widget fault" in err
+        # No Python traceback leaks to the user by default.
+        assert "Traceback" not in err
+
+    def test_debug_reraises_uncaught_exception(
+        self,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``--debug`` opts back into the full traceback for diagnosis.
+        def _boom(*args: object, **kwargs: object) -> str:
+            raise RuntimeError("kaboom: internal widget fault")
+
+        monkeypatch.setattr("ai_dev.cli.create_feature_run", _boom)
+
+        with pytest.raises(RuntimeError, match="kaboom"):
+            main([
+                "--debug", "create-feature-run", INTENT,
+                "--repo-root", str(repo_root),
+            ])
+
+    def test_feature_not_found_hint_lists_candidates(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Two features exist; freezing a third, unknown one surfaces the
+        # existing ids as a "did you mean / existing" hint (§26.5).
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main(["create-feature-run", "second intent", "--repo-root", str(repo_root)])
+        capsys.readouterr()
+
+        code = main([
+            "freeze", "FEATURE-099", "requirements", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "FEATURE-099" in err
+        # Actionable: the operator sees what does exist.
+        assert "existing:" in err
+        assert "FEATURE-001" in err
+        assert "FEATURE-002" in err
+
+    def test_run_not_found_hint_lists_candidates(
+        self,
+        repo_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A feature with one prepared run; validating a missing run surfaces the
+        # existing run id rather than just "not found".
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        main([
+            "prepare-run", "FEATURE-001", "--role", "Implementer",
+            "--task", "x", "--repo-root", str(repo_root),
+        ])
+        capsys.readouterr()
+
+        code = main([
+            "validate-run", "FEATURE-001", "RUN-099", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "existing:" in err
+        assert "RUN-001" in err
+
+    def test_triage_refusal_hint_names_legal_cells(
+        self,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # An illegal disposition x severity cell is refused at the write layer;
+        # the CLI hint names the legal matrix so the operator can re-issue. The
+        # triage library logic is covered by test_triage; here we stub the apply
+        # to isolate the CLI's hint rendering.
+        from ai_dev.triage import TriageRefusedError
+
+        def _refuse(*args: object, **kwargs: object) -> None:
+            raise TriageRefusedError(
+                "triage refused for ISSUE-001: P0 cannot be waived by override"
+            )
+
+        monkeypatch.setattr("ai_dev.cli.apply_triage", _refuse)
+
+        code = main([
+            "triage", "FEATURE-001", "--issue", "ISSUE-001",
+            "--disposition", "override", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "triage refused" in err
+        # Actionable: legal cells + the --reason flag reminder.
+        assert "legal cells" in err
+        assert "--reason" in err
+
+    def test_triage_unknown_issue_hint_lists_candidates(
+        self,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # An unknown ISSUE-NNN (a ValueError, not a refusal) points at the
+        # issue ids that do exist under the feature, so the operator can correct
+        # the reference. ``apply_triage`` is stubbed to isolate CLI rendering.
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        issues_dir = (
+            repo_root / ".ai-dev" / "features" / "FEATURE-001" / "issues"
+        )
+        issues_dir.mkdir(parents=True, exist_ok=True)
+        for iid in ("ISSUE-001", "ISSUE-002"):
+            (issues_dir / f"{iid}.json").write_text('{"id": "%s"}' % iid)
+        capsys.readouterr()
+
+        def _not_found(*args: object, **kwargs: object) -> None:
+            raise ValueError(
+                "issue ISSUE-099 not found under FEATURE-001/issues (§24.2)"
+            )
+
+        monkeypatch.setattr("ai_dev.cli.apply_triage", _not_found)
+
+        code = main([
+            "triage", "FEATURE-001", "--issue", "ISSUE-099",
+            "--disposition", "accept", "--repo-root", str(repo_root),
+        ])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "ISSUE-099" in err
+        # Actionable: existing issue ids are surfaced.
+        assert "existing:" in err
+        assert "ISSUE-001" in err
+        assert "ISSUE-002" in err
+
+    def test_token_unset_hint_names_source_var(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Profile is valid config but its token source is unset; the hint names
+        # the concrete env var to export (not just "not set").
+        write_profiles(repo_root)
+
+        code = main(["show-profile", "cc-glm52", "--repo-root", str(repo_root)])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "CC_GLM52_TOKEN" in err
+        assert "export" in err
+
+
+
 

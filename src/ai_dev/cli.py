@@ -123,6 +123,7 @@ Structured as a subcommand dispatcher so later tickets add commands
 from __future__ import annotations
 
 import argparse
+import difflib
 import sys
 from pathlib import Path
 from typing import Callable, Sequence
@@ -133,9 +134,9 @@ from ai_dev.feature_run import create_feature_run
 from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
 from ai_dev.implement_leg import run_implementer_leg
-from ai_dev.issue_bundle import IssueBundleResult, collect_issue_bundle
+from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
-from ai_dev.paths import feature_dir
+from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
 from ai_dev.profiles import (
     ProfileError,
     load_profile,
@@ -163,10 +164,143 @@ def _print_validation_issues(issues: Sequence[ValidationIssue]) -> None:
         print(line)
 
 
+def _render_error(exc: BaseException, *, hint: str | None = None) -> None:
+    """Render one clean, actionable ``error:`` line to stderr (§26.5).
+
+    Every ``_run_*`` failure surfaces through this helper so the ``error:``
+    prefix, stderr destination, and optional ``hint:`` line stay identical
+    across commands (文案同构). Takes the exception itself (per the ticket's
+    ``_render_error(exc, *, hint=None)`` contract) so callers do not each
+    re-spell ``str(exc)`` and the helper may later derive hints by type. The
+    hint is the "next step" / "did you mean" guidance that turns a bare problem
+    statement into an actionable one; it is omitted when there is nothing useful
+    to add.
+    """
+    message = str(exc) or exc.__class__.__name__
+    print(f"error: {message}", file=sys.stderr)
+    if hint:
+        print(f"  hint: {hint}", file=sys.stderr)
+
+
+def _existing_ids(parent: Path, prefix: str) -> list[str]:
+    """Sorted names of existing ``<prefix>-NNN`` children under ``parent``.
+
+    Matches dirs first (features, runs) and falls back to ``<prefix>*.json``
+    files (issues live as ``ISSUE-NNN.json`` under ``issues/``). Returns ``[]``
+    when the parent does not exist yet (a fresh repo).
+    """
+    if not parent.is_dir():
+        return []
+    names = {
+        p.name
+        for p in parent.iterdir()
+        if (p.is_dir() or p.suffix == ".json") and p.name.startswith(prefix)
+    }
+    return sorted(n.removesuffix(".json") for n in names)
+
+
+def _candidate_hint(requested: str, candidates: list[str]) -> str | None:
+    """A "did you mean ..." hint over candidate ids, or ``None`` when empty.
+
+    A close match (difflib) is named first; the full candidate list always
+    follows so the operator sees what actually exists.
+    """
+    if not candidates:
+        return None
+    matches = difflib.get_close_matches(requested, candidates, n=3, cutoff=0.4)
+    if matches:
+        return f"did you mean {', '.join(matches)}? existing: {', '.join(candidates)}"
+    return f"existing: {', '.join(candidates)}"
+
+
+def _lookup_hint(
+    repo_root: Path, feature_id: str | None, run_id: str | None = None
+) -> str | None:
+    """Actionable not-found hint for a feature/run lookup failure, else ``None``.
+
+    Fires only when the referenced feature (or, given a feature that exists, the
+    referenced run) genuinely does not exist on disk - so an unrelated
+    ``ValueError`` (e.g. "lane not frozen") does not get a misleading candidate
+    list appended.
+    """
+    if feature_id is None:
+        return None
+    if not feature_dir(repo_root, feature_id).is_dir():
+        return _candidate_hint(
+            feature_id, _existing_ids(features_dir(repo_root), "FEATURE-")
+        )
+    if run_id is not None and not run_dir(repo_root, feature_id, run_id).is_dir():
+        return _candidate_hint(
+            run_id, _existing_ids(runs_dir(repo_root, feature_id), "RUN-")
+        )
+    return None
+
+
+def _lookup_hint_from_args(args: argparse.Namespace) -> str | None:
+    """``_lookup_hint`` driven by a parsed CLI namespace (the top-level handler).
+
+    Reads ``feature_id`` / ``run_id`` / ``repo_root`` off the namespace so the
+    top-level ``except`` can attach a not-found hint to any uncaught error
+    without each ``_run_*`` repeating the wiring.
+    """
+    feature_id = getattr(args, "feature_id", None)
+    if feature_id is None:
+        return None
+    run_id = getattr(args, "run_id", None)
+    return _lookup_hint(Path(getattr(args, "repo_root", ".")), feature_id, run_id)
+
+
+# The ADR-0001 #4 disposition x severity legality matrix, in one readable line
+# for triage refusal hints (P0 only reject disarms; P1 override/reject need a
+# reason; P2/P3 accept everything). The single source of truth for which cells
+# are legal lives in ``triage._matrix_cell``; this is the operator-facing gloss.
+_TRIAGE_LEGAL_MATRIX = (
+    "legal cells: P0 -> reject (needs --reason) or request_fix; "
+    "P1 -> override/reject (need --reason), request_fix, defer(n/a); "
+    "P2/P3 -> any disposition"
+)
+
+
+def _triage_hint(
+    exc: BaseException,
+    *,
+    repo_root: Path,
+    feature_id: str,
+    issue_id: str,
+    reason: str | None,
+) -> str | None:
+    """Actionable hint for a triage refusal / bad input (§26.5).
+
+    A ``TriageRefusedError`` names the legal disposition x severity cells and
+    reminds the operator of ``--reason``; a plain ``ValueError`` (unknown issue
+    / unknown feature) points at what does exist - issue ids when the feature
+    is present, feature ids when it is not.
+    """
+    if isinstance(exc, TriageRefusedError):
+        hint = _TRIAGE_LEGAL_MATRIX
+        if reason is None or not reason.strip():
+            hint += "; re-run with --reason \"...\" for a disarming disposition"
+        return hint
+    if feature_dir(repo_root, feature_id).is_dir():
+        # Feature exists -> the bad reference is the issue id.
+        return _candidate_hint(
+            issue_id,
+            _existing_ids(feature_dir(repo_root, feature_id) / ISSUES_DIR, "ISSUE-"),
+        )
+    return _lookup_hint(repo_root, feature_id)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-dev",
         description="Multi-Agent Profile orchestrator (v0 walking skeleton).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print a full traceback on an uncaught error (default: a one-line "
+        "`error:` message). Opt-in diagnostics - scripted consumers get stable, "
+        "clean output by default (§26.5).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -575,15 +709,15 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
     """
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
-        print(
-            f"error: feature run {feature_id} not found under {repo_root}",
-            file=sys.stderr,
+        _render_error(
+            ValueError(f"feature run {feature_id} not found under {repo_root}"),
+            hint=_lookup_hint(repo_root, feature_id),
         )
         return 1
     try:
         freeze_artifact(feature_root, artifact)
     except FrozenArtifactError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
     print(f"{feature_id}: froze {artifact}")
     return 0
@@ -603,18 +737,27 @@ def _run_show_profile(repo_root: Path, name: str) -> int:
     try:
         profile = load_profile(repo_root, name)
     except ProfileError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
 
     source = token_source_var(profile)
     print(render_profile(profile, source))
 
     if source is None:
-        print(
-            f"error: token source not set for profile {name!r} "
-            f"({profile.token_source_description()} is unset); "
-            f"set it before running (§24.2)",
-            file=sys.stderr,
+        # Point at the concrete source variable name so the operator knows which
+        # env var to export (§26.5 actionable message - not just "not set").
+        _render_error(
+            ValueError(
+                f"token source not set for profile {name!r} "
+                f"({profile.token_source_description()} is unset); "
+                f"set it before running (§24.2)"
+            ),
+            hint=f"export {profile.auth_env}=<token>"
+            + (
+                f" (or {profile.auth_env_fallback}=<token>)"
+                if profile.auth_env_fallback
+                else ""
+            ),
         )
         return 1
     return 0
@@ -638,7 +781,7 @@ def _run_prepare_run(
             repo_root, feature_id, role, task, allowed_files=allowed_files
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     print(run_id)
     return 0
@@ -665,7 +808,7 @@ def _run_run_headless(
     try:
         profile = load_profile(repo_root, profile_name)
     except ProfileError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
     try:
         result = run_headless(
@@ -677,7 +820,7 @@ def _run_run_headless(
             permission_mode=permission_mode,
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
         return 1
     print(
         f"{result.run_id}: profile={result.profile} exit_code={result.exit_code} "
@@ -700,7 +843,7 @@ def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
     try:
         result = validate_run(repo_root, feature_id, run_id)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
         return 1
     if result.passed:
         print(
@@ -736,7 +879,7 @@ def _run_implement(
     try:
         profile = load_profile(repo_root, profile_name)
     except ProfileError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
     try:
         result = run_implementer_leg(
@@ -748,7 +891,7 @@ def _run_implement(
             permission_mode=permission_mode,
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     status = (
         f"IMPLEMENT PASS - {result.run_id} lane={result.lane_id} "
@@ -790,7 +933,7 @@ def _run_checking(
     try:
         profile = load_profile(repo_root, profile_name)
     except ProfileError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
     try:
         result = leg(
@@ -802,7 +945,7 @@ def _run_checking(
             permission_mode=permission_mode,
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     status = (
         f"{label} PASS - {result.run_id} lane={result.lane_id} "
@@ -849,7 +992,7 @@ def _run_verify(
             repo_root, feature_id, lane_id, timeout=timeout
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     passed = sum(1 for r in result.command_results if r.passed)
     total = len(result.command_results)
@@ -883,7 +1026,7 @@ def _run_collect_issues(
     try:
         result: IssueBundleResult = collect_issue_bundle(repo_root, feature_id, lane_id)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     print(
         f"COLLECT-ISSUES PASS - lane={result.lane_id} "
@@ -905,7 +1048,7 @@ def _run_lane_gate(
     try:
         result: LaneDecisionResult = evaluate_lane_gate(repo_root, feature_id, lane_id)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     if result.passed:
         print(
@@ -936,7 +1079,7 @@ def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
     try:
         result: CoherenceResult = evaluate_coherence_gate(repo_root, feature_id)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     if result.passed:
         print(
@@ -967,7 +1110,7 @@ def _run_final_report(repo_root: Path, feature_id: str) -> int:
     try:
         result: FinalReportResult = generate_final_report(repo_root, feature_id)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     print(
         f"FINAL-REPORT - feature={result.feature_id} verdict={result.verdict} "
@@ -989,7 +1132,7 @@ def _run_fix_run(
     try:
         profile = load_profile(repo_root, profile_name)
     except ProfileError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc)
         return 1
     try:
         result: FixRunResult = run_fix_run(
@@ -1002,7 +1145,7 @@ def _run_fix_run(
             verify_timeout=verify_timeout,
         )
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     print(
         f"FIX-RUN PASS - lane={result.lane_id} implement_run={result.implement_run_id} "
@@ -1036,7 +1179,16 @@ def _run_triage(
             repo_root, feature_id, issue_id, disposition, reason, by
         )
     except (TriageRefusedError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _render_error(
+            exc,
+            hint=_triage_hint(
+                exc,
+                repo_root=repo_root,
+                feature_id=feature_id,
+                issue_id=issue_id,
+                reason=reason,
+            ),
+        )
         return 1
     decisions = ",".join(result.decision_ids) if result.decision_ids else "-"
     print(
@@ -1047,10 +1199,34 @@ def _run_triage(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Dispatch a CLI invocation. Returns a process exit code."""
+    """Dispatch a CLI invocation. Returns a process exit code.
+
+    Parses args (argparse's own errors - bad flags / missing subcommand - exit
+    ``2`` via ``SystemExit`` before this returns), then runs the subcommand. Any
+    exception the subcommand did not itself catch is rendered here as a single
+    clean ``error:`` line and exit ``1`` (§26.5): a scripted consumer never sees
+    a Python traceback by default. ``--debug`` re-raises the original exception
+    so an operator can read the full stack (exit code stays ``1``-or-crash,
+    never a new band - the 0=success / 1=everything-else contract is unchanged).
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(parser, args)
+    except Exception as exc:
+        if getattr(args, "debug", False):
+            raise
+        _render_error(exc, hint=_lookup_hint_from_args(args))
+        return 1
 
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Run the parsed subcommand and return its exit code (no catch-all here).
+
+    Expected failures (missing feature/run, refused triage, bad input) are
+    surfaced by each ``_run_*`` through ``_render_error`` + ``return 1``; this
+    function lets anything else propagate to ``main``'s top-level handler.
+    """
     if args.command == "create-feature-run":
         feature_id = create_feature_run(Path(args.repo_root), args.intent)
         print(feature_id)

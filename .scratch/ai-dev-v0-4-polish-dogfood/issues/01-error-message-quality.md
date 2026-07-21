@@ -4,13 +4,13 @@
 
 **Blocked by:** 无 — 可立即开始
 
-**Status:** pending
+**Status:** done
 
-- [ ] `cli.main` 加顶层 `except Exception`：渲染干净 `error:` 行（非 traceback），exit 1
-- [ ] 全局 `--debug` flag：设置后未捕获异常照常抛 traceback 供调试
-- [ ] 新增 `_render_error(exc, *, hint=None)` helper，所有 `_run_*` 复用，`error:` 文案同构
-- [ ] 关键命令文案可操作化：feature/run 不存在时提示现有候选；triage 非法 cell / 缺 reason 时点名合法值；profile token 未设时点名 source 变量名
-- [ ] exit code 保持 0/1（grep 确认无新增 return 2/3 等）
-- [ ] 单测：顶层 except 把未知异常转成 `error:` + exit 1；`--debug` 时抛原异常
-- [ ] 单测：可操作 hint 在典型错误路径上出现
-- [ ] mypy + 全测试绿
+- [x] `cli.main` 加顶层 `except Exception`：渲染干净 `error:` 行（非 traceback），exit 1
+- [x] 全局 `--debug` flag：设置后未捕获异常照常抛 traceback 供调试
+- [x] 新增 `_render_error(exc, *, hint=None)` helper，所有 `_run_*` 复用，`error:` 文案同构
+- [x] 关键命令文案可操作化：feature/run 不存在时提示现有候选；triage 非法 cell / 缺 reason 时点名合法值；profile token 未设时点名 source 变量名
+- [x] exit code 保持 0/1（grep 确认无新增 return 2/3 等）
+- [x] 单测：顶层 except 把未知异常转成 `error:` + exit 1；`--debug` 时抛原异常
+- [x] 单测：可操作 hint 在典型错误路径上出现
+- [x] mypy + 全测试绿
