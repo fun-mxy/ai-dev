@@ -4,13 +4,13 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] P0×override 仍 FAIL（gate 层忽略，第二层防御）
-- [ ] P0×reject + 有 DEC -> PASS（合法逃生）
-- [ ] P1×override/reject + 有 DEC -> PASS
-- [ ] P1 未 triaged / request_fix 未解决 -> FAIL
-- [ ] request_cp -> FAIL（recoverable，记录 resolution_path）
-- [ ] lane-gate 不写 current_gate（只 04/08 推进）
-- [ ] 单测：全 PASS、P0×override FAIL、P0×reject PASS、P1×override PASS、P1 未 triage FAIL、request_cp FAIL
-- [ ] 退出码 0=PASS / 1=FAIL；缺前置 artifact fail-loud（§24.2）
+- [x] P0×override 仍 FAIL（gate 层忽略，第二层防御）
+- [x] P0×reject + 有 DEC -> PASS（合法逃生）
+- [x] P1×override/reject + 有 DEC -> PASS
+- [x] P1 未 triaged / request_fix 未解决 -> FAIL
+- [x] request_cp -> FAIL（recoverable，记录 resolution_path）
+- [x] lane-gate 不写 current_gate（只 04/08 推进）
+- [x] 单测：全 PASS、P0×override FAIL、P0×reject PASS、P1×override PASS、P1 未 triage FAIL、request_cp FAIL
+- [x] 退出码 0=PASS / 1=FAIL；缺前置 artifact fail-loud（§24.2）
