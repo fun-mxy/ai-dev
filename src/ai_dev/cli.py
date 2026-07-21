@@ -72,6 +72,21 @@ loop, §26.3):
   pass, ``1`` when any command failed or the leg cannot start (unfrozen, no
   verify commands declared, no implement-result - §24.2 fail loud).
 
+v0.3 additions (Human Triage + fix loop, ADR-0001/0002):
+
+* ``ai-dev triage <FEATURE> --issue ISSUE-NNN --disposition <d> [--reason ...]
+  [--by human]`` (ticket 05) - the deterministic Human-Triage write chokepoint
+  (ADR-0001 #8). Pure - no profile, no token, no model. Writes the disposition
+  as the ``triage`` state object on ``issues/ISSUE-NNN.json`` (not the bundle,
+  not a Decision), enforcing the disposition x severity legality matrix, the
+  reason-presence rule for disarming dispositions, the promotion rule
+  (``override`` x P1 / ``reject`` x {P0, P1} -> ``DEC-NNN``), the P0 ``override``
+  write-layer refusal, and the ``request_change_proposal`` clean deferral. Drives
+  the issue ``status`` to ``triaged`` via the ticket-03 helper. Exits ``0`` on a
+  successful apply, ``1`` when the disposition is refused (illegal cell or
+  missing reason - a clean ``error:`` line, issue stays untriaged) or a
+  precondition is missing (§24.2 fail loud).
+
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
 """
@@ -99,6 +114,7 @@ from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.shell_verifier import CommandResult, run_verifier
 from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
+from ai_dev.triage import DISPOSITIONS, TriageRefusedError, TriageResult, apply_triage
 from ai_dev.validate import ValidationIssue, validate_run
 
 
@@ -397,6 +413,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The LANE-NNN id whose gate should be evaluated.",
     )
     lane_gate.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    triage = subparsers.add_parser(
+        "triage",
+        help="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
+        "ticket 05). Deterministic - no model.",
+    )
+    triage.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose issues/ holds the issue to triage.",
+    )
+    triage.add_argument(
+        "--issue",
+        required=True,
+        metavar="ISSUE-NNN",
+        help="The issue id whose disposition is being written (e.g. ISSUE-001).",
+    )
+    triage.add_argument(
+        "--disposition",
+        required=True,
+        choices=DISPOSITIONS,
+        help="The Human-Triage disposition (§16): accept | reject | defer | "
+        "override | request_fix | request_change_proposal.",
+    )
+    triage.add_argument(
+        "--reason",
+        default=None,
+        help="Recorded rationale. Required for override (P1) and reject on "
+        "P0/P1 (ADR-0001 #6); optional otherwise.",
+    )
+    triage.add_argument(
+        "--by",
+        default="human",
+        help="Who applied the triage (default: human; models may only propose).",
+    )
+    triage.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -762,6 +817,40 @@ def _run_lane_gate(
     return 1
 
 
+def _run_triage(
+    repo_root: Path,
+    feature_id: str,
+    issue_id: str,
+    disposition: str,
+    reason: str | None,
+    by: str,
+) -> int:
+    """Apply one Human-Triage disposition to an issue (v0.3 ticket 05, §16).
+
+    Deterministic - no profile, no token, no model (ADR-0001 #8). Delegates to
+    ``apply_triage`` (writes the ``triage`` state object on
+    ``issues/ISSUE-NNN.json``, enforces the legality matrix + reason + promotion,
+    drives ``status -> triaged``, audits). Returns ``0`` on a successful apply,
+    ``1`` when the disposition is refused at the write layer (illegal cell or a
+    disarming disposition missing its reason - ADR-0001 #7: surfaced as a clean
+    ``error:`` line, not a traceback, and the issue stays untriaged) or when a
+    precondition is missing (unknown issue / disposition, §24.2 fail loud).
+    """
+    try:
+        result: TriageResult = apply_triage(
+            repo_root, feature_id, issue_id, disposition, reason, by
+        )
+    except (TriageRefusedError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    decisions = ",".join(result.decision_ids) if result.decision_ids else "-"
+    print(
+        f"TRIAGE PASS - issue={result.issue_id} disposition={result.action} "
+        f"severity={result.severity} decisions={decisions}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code."""
     parser = _build_parser()
@@ -854,6 +943,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.repo_root),
             args.feature_id,
             args.lane_id,
+        )
+
+    if args.command == "triage":
+        return _run_triage(
+            Path(args.repo_root),
+            args.feature_id,
+            args.issue,
+            args.disposition,
+            args.reason,
+            args.by,
         )
 
     # Unreachable: argparse rejects unknown/missing subcommands before we get

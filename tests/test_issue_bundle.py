@@ -321,7 +321,7 @@ class TestBundleMergeIsProjection:
         issue_path = _feature_root(repo_root, feature_id) / ISSUES_DIR / "ISSUE-001.json"
         issue = json.loads(issue_path.read_text())
         issue["triage"] = {
-            "action": "override_issue",
+            "action": "override",
             "reason": "Known limitation acceptable for MVP v0.",
             "by": "human",
         }
@@ -348,7 +348,7 @@ class TestBundleMergeIsProjection:
         assert merged["id"] == "ISSUE-001"
         # Persisted state survives the re-collect (the bridge-bug fix).
         assert merged["triage"] == {
-            "action": "override_issue",
+            "action": "override",
             "reason": "Known limitation acceptable for MVP v0.",
             "by": "human",
         }
@@ -554,7 +554,7 @@ class TestIssueStatusLifecycle:
             repo_root,
             feature_id,
             lane_id,
-            action="override_issue",
+            action="override",
             reason="Known limitation acceptable for MVP v0.",
         )
 
@@ -563,7 +563,7 @@ class TestIssueStatusLifecycle:
         merged = json.loads(issue_path.read_text())
         assert merged["status"] == STATUS_TRIAGED
         assert merged["triage"] == {
-            "action": "override_issue",
+            "action": "override",
             "reason": "Known limitation acceptable for MVP v0.",
             "by": "human",
         }
