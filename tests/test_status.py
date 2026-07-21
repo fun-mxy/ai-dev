@@ -82,6 +82,11 @@ class TestWriteInitialFeatureStatus:
         assert set(frozen) == {"requirements", "design", "tasks", "lane_graph"}
         assert all(value is False for value in frozen.values())
 
+    def test_initial_fix_loop_budget_starts_unused(self, tmp_path: Path) -> None:
+        write_initial_feature_status(tmp_path, "FEATURE-001")
+
+        assert _load(tmp_path)["feature"]["fix_loop_budget"] == {"used": 0, "max": 1}
+
     def test_id_matches_argument_not_hardcoded(self, tmp_path: Path) -> None:
         write_initial_feature_status(tmp_path, "FEATURE-007")
         assert _load(tmp_path)["feature"]["id"] == "FEATURE-007"

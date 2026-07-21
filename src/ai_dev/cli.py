@@ -81,11 +81,19 @@ v0.3 additions (Human Triage + fix loop, ADR-0001/0002):
   not a Decision), enforcing the disposition x severity legality matrix, the
   reason-presence rule for disarming dispositions, the promotion rule
   (``override`` x P1 / ``reject`` x {P0, P1} -> ``DEC-NNN``), the P0 ``override``
-  write-layer refusal, and the ``request_change_proposal`` clean deferral. Drives
-  the issue ``status`` to ``triaged`` via the ticket-03 helper. Exits ``0`` on a
-  successful apply, ``1`` when the disposition is refused (illegal cell or
-  missing reason - a clean ``error:`` line, issue stays untriaged) or a
+  write-layer refusal, the fix-loop budget guard for ``request_fix``, and the
+  ``request_change_proposal`` clean deferral. Drives the issue ``status`` to
+  ``triaged`` via the ticket-03 helper. Exits ``0`` on a successful apply, ``1``
+  when the disposition is refused (illegal cell, missing reason, or exhausted
+  fix-loop budget - a clean ``error:`` line, issue stays untriaged) or a
   precondition is missing (§24.2 fail loud).
+
+* ``ai-dev fix-run <FEATURE> <LANE> [--profile cc-glm52]`` (ticket 07) - run one
+  bounded fix-loop bookend for all active ``request_fix`` issues: implement[fix]
+  -> review -> spec-gap -> verify -> collect. The feature ``fix_loop_budget`` is
+  consumed only after the implement leg produces a §14-validated result; the
+  driver marks targeted issues with ``fix_targeted_in_run`` and stops before the
+  mandatory human re-triage step.
 
 Structured as a subcommand dispatcher so later tickets add commands
 (``allocate-id``, ``append-audit``, …) without disturbing the existing ones.
@@ -100,6 +108,7 @@ from typing import Callable, Sequence
 
 from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_gap_leg
 from ai_dev.feature_run import create_feature_run
+from ai_dev.fix_run import FixRunResult, run_fix_run
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
@@ -452,6 +461,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Who applied the triage (default: human; models may only propose).",
     )
     triage.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root holding .ai-dev/ (default: current directory).",
+    )
+
+    fix_run = subparsers.add_parser(
+        "fix-run",
+        help="Run one bounded fix-loop bookend for active request_fix issues "
+        "(ADR-0002, v0.3 ticket 07).",
+    )
+    fix_run.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose request_fix issues should be targeted.",
+    )
+    fix_run.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to run through implement/review/spec-gap/verify/collect.",
+    )
+    fix_run.add_argument(
+        "--profile",
+        default="cc-glm52",
+        help="Agent profile to invoke for implement/review/spec-gap (default: cc-glm52).",
+    )
+    fix_run.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for each headless agent call (default: 12).",
+    )
+    fix_run.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode for each headless agent call (default: bypassPermissions).",
+    )
+    fix_run.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=300,
+        help="Per-command verifier timeout in seconds (default: 300).",
+    )
+    fix_run.add_argument(
         "--repo-root",
         default=".",
         help="Repository root holding .ai-dev/ (default: current directory).",
@@ -817,6 +867,42 @@ def _run_lane_gate(
     return 1
 
 
+def _run_fix_run(
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    profile_name: str,
+    max_turns: int,
+    permission_mode: str,
+    verify_timeout: float,
+) -> int:
+    """Run one bounded fix-loop bookend and stop before human re-triage."""
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        result: FixRunResult = run_fix_run(
+            repo_root,
+            feature_id,
+            lane_id,
+            profile,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            verify_timeout=verify_timeout,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"FIX-RUN PASS - lane={result.lane_id} implement_run={result.implement_run_id} "
+        f"targets={result.target_issue_ids} budget={result.budget_used}/{result.budget_max} "
+        f"verification={result.verification.verdict} collected={result.collection.issue_count}"
+    )
+    return 0
+
+
 def _run_triage(
     repo_root: Path,
     feature_id: str,
@@ -943,6 +1029,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.repo_root),
             args.feature_id,
             args.lane_id,
+        )
+
+    if args.command == "fix-run":
+        return _run_fix_run(
+            Path(args.repo_root),
+            args.feature_id,
+            args.lane_id,
+            args.profile,
+            args.max_turns,
+            args.permission_mode,
+            args.verify_timeout,
         )
 
     if args.command == "triage":

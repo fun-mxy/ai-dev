@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from ai_dev.audit import AUDIT_LOG_JSON
 from ai_dev.cli import main
@@ -171,6 +172,52 @@ class TestApplyTriageWritesDisposition:
             apply_triage(
                 repo_root, feature_id, issue_id, "frobnicate", None, "human"
             )
+
+
+class TestRequestFixBudget:
+    """ADR-0002 D5: request_fix is bounded by feature.fix_loop_budget."""
+
+    def test_request_fix_writes_when_budget_has_capacity(self, repo_root: Path) -> None:
+        _, feature_id, issue_id, issue_path = _stage_issue(repo_root, severity="P1")
+
+        apply_triage(
+            repo_root,
+            feature_id,
+            issue_id,
+            REQUEST_FIX,
+            reason="Please fix this once.",
+            by="human",
+            timestamp=_FIXED_TS,
+        )
+
+        issue = json.loads(issue_path.read_text())
+        assert issue["triage"]["action"] == REQUEST_FIX
+
+    def test_request_fix_refused_when_budget_exhausted(self, repo_root: Path) -> None:
+        feature_root, feature_id, issue_id, issue_path = _stage_issue(
+            repo_root, severity="P1"
+        )
+        status_path = feature_root / "status" / "feature-status.yml"
+        doc = yaml.safe_load(status_path.read_text())
+        doc["feature"]["fix_loop_budget"] = {"used": 1, "max": 1}
+        status_path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        before = json.loads(issue_path.read_text())
+
+        with pytest.raises(TriageRefusedError, match="fix_loop_budget"):
+            apply_triage(
+                repo_root,
+                feature_id,
+                issue_id,
+                REQUEST_FIX,
+                reason="Try again.",
+                by="human",
+                timestamp=_FIXED_TS,
+            )
+
+        assert json.loads(issue_path.read_text()) == before
+        refusal = _last_audit("triage_refused", feature_root)
+        assert refusal["payload"]["action"] == REQUEST_FIX
+        assert "fix_loop_budget" in refusal["payload"]["refusal_reason"]
 
 
 class TestLegalityMatrix:

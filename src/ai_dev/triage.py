@@ -40,6 +40,7 @@ from ai_dev.issue_bundle import ISSUES_DIR
 from ai_dev.issue_status import STATUS_TRIAGED, transition_issue_status
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.paths import feature_dir
+from ai_dev.status import fix_loop_budget, fix_loop_budget_exhausted
 from ai_dev.timeutil import utc_now_iso
 
 DECISIONS_DIR = "decisions"
@@ -342,6 +343,22 @@ def apply_triage(
         msg = (
             f"{action} on {severity} requires a reason (ADR-0001 #6); without "
             "one it is a Decision-free escape hatch"
+        )
+        _audit_refusal(
+            feature_root, feature_id, issue_id, action, severity, by, msg,
+            timestamp=ts,
+        )
+        raise TriageRefusedError(f"triage refused for {issue_id}: {msg}")
+
+    # Fix-loop budget (ADR-0002 D5): request_fix is the only disposition that
+    # arms the bounded automatic fix loop. It is legal only while the feature's
+    # one-round budget has capacity; exhaustion is refused before any issue
+    # mutation, and audited like the other write-layer refusals.
+    if action == REQUEST_FIX and fix_loop_budget_exhausted(feature_root):
+        budget = fix_loop_budget(feature_root)
+        msg = (
+            f"request_fix is refused because fix_loop_budget is exhausted "
+            f"(used={budget['used']}, max={budget['max']}; ADR-0002 D5)"
         )
         _audit_refusal(
             feature_root, feature_id, issue_id, action, severity, by, msg,

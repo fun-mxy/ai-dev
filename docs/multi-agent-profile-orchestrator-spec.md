@@ -1157,6 +1157,8 @@ Implement
 → Human Triage
 → Fix Run
 → Re-review / Re-gap / Re-verify
+→ Re-collect
+→ Re-triage
 → Final Gate
 ```
 
@@ -1164,7 +1166,7 @@ Implement
 
 - 不继续无限自动修；
 - 进入人工决策；
-- 可选择 fail、defer、override P1、创建 CP。
+- 可选择 fail、reject、request_change_proposal、override P1（P2/P3 仍可 accept/defer）。
 
 ---
 

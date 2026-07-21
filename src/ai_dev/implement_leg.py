@@ -250,7 +250,11 @@ def lane_allowed_files(lane: LaneEntry) -> list[str]:
 
 
 def build_implementer_input_package(
-    repo_root: Path, feature_id: str, lane_id: str
+    repo_root: Path,
+    feature_id: str,
+    lane_id: str,
+    *,
+    task_context_append: str | None = None,
 ) -> str:
     """Build the Implementer input package from frozen artifacts (ticket 01).
 
@@ -259,6 +263,11 @@ def build_implementer_input_package(
     the task text from ``03-tasks.md`` and the lane's allowed-files from
     ``04-lane-graph.yml``, and delegates to the v0.1 ``prepare_run`` with the
     role pinned to ``Implementer``. Returns the allocated ``RUN-NNN`` id.
+
+    ``task_context_append`` is an orchestration-only extension point for the
+    ADR-0002 fix-run driver: it appends the human-triaged ``request_fix`` issues
+    to the otherwise-frozen task package, without modifying the frozen tasks
+    artifact itself.
 
     Reuses ``prepare_run`` unchanged (no new run mechanism): it allocates the
     run id, scaffolds the §12.2 input package, and appends the ``prepare_run``
@@ -279,6 +288,8 @@ def build_implementer_input_package(
             "freeze them at the task gate first"
         )
     task_text = read_task_text(feature_root)
+    if task_context_append is not None and task_context_append.strip():
+        task_text = f"{task_text}\n\n{task_context_append.strip()}"
     lane = read_lane_entry(feature_root, lane_id)
     return prepare_run(
         repo_root,
@@ -505,6 +516,7 @@ def run_implementer_leg(
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     started_at: str | None = None,
     ended_at: str | None = None,
+    task_context_append: str | None = None,
 ) -> ImplementerLegResult:
     """Run the full Implementer leg: prepare -> run -> validate -> writeback -> rollup.
 
@@ -529,7 +541,9 @@ def run_implementer_leg(
     ``proposed_done`` for a task outside the lane's declared task set - that is a
     contract breach, not a captured run failure.
     """
-    run_id = build_implementer_input_package(repo_root, feature_id, lane_id)
+    run_id = build_implementer_input_package(
+        repo_root, feature_id, lane_id, task_context_append=task_context_append
+    )
     run_result = run_headless(
         repo_root,
         feature_id,

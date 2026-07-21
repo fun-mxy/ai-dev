@@ -234,6 +234,22 @@ class TestBuildImplementerInputPackage:
         ).read_text()
         assert _TASK_BODY in task_pkg
 
+    def test_fix_run_context_appends_to_task_package(self, repo_root: Path) -> None:
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        run_id = build_implementer_input_package(
+            repo_root,
+            feature_id,
+            lane_id,
+            task_context_append="## Fix Run Context\n\nISSUE-001: please repair it.",
+        )
+
+        task_pkg = (
+            run_dir(repo_root, feature_id, run_id) / "input" / TASK_PACKAGE_FILE
+        ).read_text()
+        assert _TASK_BODY in task_pkg
+        assert "ISSUE-001: please repair it." in task_pkg
+
     def test_allowed_files_come_from_lane_expected_and_exclusive(
         self, repo_root: Path
     ) -> None:

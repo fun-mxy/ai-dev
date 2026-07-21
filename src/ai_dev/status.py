@@ -71,6 +71,10 @@ _FREEZE_ADVANCE_TARGET: Mapping[str, str] = {
 _FREEZE_EVENT = "freeze"
 _ADVANCE_GATE_EVENT = "advance_gate"
 _MARK_TASK_PROPOSED_DONE_EVENT = "mark_task_proposed_done"
+_FIX_LOOP_BUDGET_EVENT = "fix_loop_budget"
+_FIX_LOOP_BUDGET_USED = "used"
+_FIX_LOOP_BUDGET_MAX = "max"
+_FIX_LOOP_BUDGET_DEFAULT_MAX = 1
 
 
 class FrozenArtifactError(ValueError):
@@ -163,6 +167,10 @@ def _initial_feature_status(feature_id: str) -> dict[str, Any]:
             # via the projection so the literal can never drift from the table.
             "status": derive_feature_status(_INITIAL_GATE, None),
             "frozen_artifacts": {name: False for name in FROZEN_ARTIFACTS},
+            "fix_loop_budget": {
+                _FIX_LOOP_BUDGET_USED: 0,
+                _FIX_LOOP_BUDGET_MAX: _FIX_LOOP_BUDGET_DEFAULT_MAX,
+            },
             "current_gate": _INITIAL_GATE,
             "verdict": None,
         }
@@ -277,6 +285,101 @@ def _mutate_feature_status(
             feature_root, event=event, payload=payload, timestamp=timestamp
         )
 
+
+def _require_fix_loop_budget(feature_root: Path) -> dict[str, int]:
+    """Return the feature's ``fix_loop_budget`` map, fail-loud on corruption.
+
+    ADR-0002 D5 makes this feature-level counter the sole loop-count enforcer for
+    ``request_fix``. A real v0.3 feature run always carries integer ``used`` and
+    ``max`` fields in ``status/feature-status.yml``; missing or malformed values
+    are status corruption (§24.2), not permission for another fix loop.
+    """
+    path = _feature_status_path(feature_root)
+    doc = _load_feature_status(feature_root)
+    feature = doc.get("feature")
+    if not isinstance(feature, dict):
+        raise ValueError(
+            f"feature-status.yml at {path} has no 'feature' mapping (§24.2)"
+        )
+    budget = feature.get("fix_loop_budget")
+    if not isinstance(budget, dict):
+        raise ValueError(
+            f"feature-status.yml at {path} has no 'fix_loop_budget' mapping (§24.2)"
+        )
+    used = budget.get(_FIX_LOOP_BUDGET_USED)
+    maximum = budget.get(_FIX_LOOP_BUDGET_MAX)
+    if not isinstance(used, int) or isinstance(used, bool):
+        raise ValueError(
+            f"feature-status.yml at {path} fix_loop_budget.used is not an integer (§24.2)"
+        )
+    if not isinstance(maximum, int) or isinstance(maximum, bool):
+        raise ValueError(
+            f"feature-status.yml at {path} fix_loop_budget.max is not an integer (§24.2)"
+        )
+    if used < 0 or maximum < 0:
+        raise ValueError(
+            f"feature-status.yml at {path} fix_loop_budget values must be non-negative (§24.2)"
+        )
+    return {_FIX_LOOP_BUDGET_USED: used, _FIX_LOOP_BUDGET_MAX: maximum}
+
+
+def fix_loop_budget(feature_root: Path) -> Mapping[str, int]:
+    """Read the feature-level ``fix_loop_budget`` (ADR-0002 D5)."""
+    return _require_fix_loop_budget(feature_root)
+
+
+def fix_loop_budget_exhausted(feature_root: Path) -> bool:
+    """True iff ``used >= max`` for the feature's fix-loop budget."""
+    budget = _require_fix_loop_budget(feature_root)
+    return budget[_FIX_LOOP_BUDGET_USED] >= budget[_FIX_LOOP_BUDGET_MAX]
+
+
+def increment_fix_loop_budget(
+    feature_root: Path, run_id: str, *, timestamp: str | None = None
+) -> Mapping[str, int]:
+    """Consume one fix-loop budget slot and audit it (ADR-0002 D9).
+
+    Called by the fix-run driver only after the implement leg produced a §14-
+    validated implement result. Refuses if the budget is already exhausted so a
+    double-consume cannot silently overrun the one-round cap.
+    """
+    if not run_id:
+        raise ValueError("run_id must be a non-empty string")
+    updated: dict[str, int] = {}
+
+    def _increment(feature: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        budget = feature.get("fix_loop_budget")
+        if not isinstance(budget, dict):
+            raise ValueError("feature-status.yml has no 'fix_loop_budget' mapping (§24.2)")
+        used = budget.get(_FIX_LOOP_BUDGET_USED)
+        maximum = budget.get(_FIX_LOOP_BUDGET_MAX)
+        if not isinstance(used, int) or isinstance(used, bool):
+            raise ValueError("fix_loop_budget.used is not an integer (§24.2)")
+        if not isinstance(maximum, int) or isinstance(maximum, bool):
+            raise ValueError("fix_loop_budget.max is not an integer (§24.2)")
+        if used < 0 or maximum < 0:
+            raise ValueError("fix_loop_budget values must be non-negative (§24.2)")
+        if used >= maximum:
+            raise ValueError(
+                f"fix_loop_budget exhausted (used={used}, max={maximum}); "
+                "cannot run another request_fix loop (ADR-0002 D5)"
+            )
+        new_used = used + 1
+        budget[_FIX_LOOP_BUDGET_USED] = new_used
+        updated.update({_FIX_LOOP_BUDGET_USED: new_used, _FIX_LOOP_BUDGET_MAX: maximum})
+        return [
+            (
+                _FIX_LOOP_BUDGET_EVENT,
+                {
+                    "run": run_id,
+                    "used": new_used,
+                    "max": maximum,
+                },
+            )
+        ]
+
+    _mutate_feature_status(feature_root, _increment, timestamp=timestamp)
+    return updated
 
 def _advance_current_gate(feature: dict[str, Any], target: str) -> bool:
     """Advance ``current_gate`` to ``target`` monotonically (ADR-0003 D2).
