@@ -4,13 +4,15 @@
 
 **Blocked by:** 无 — 可立即开始（与 02/03 并行）
 
-**Status:** pending
+**Status:** done
 
-- [ ] `--dry-run` flag 接入副作用命令：agent 命令（run-headless/implement/review/spec-gap/fix-run）+ deterministic 命令（freeze/triage/coherence-gate/final-report/lane-gate）
-- [ ] agent 命令 dry-run：prepare input package 到 **temp dir**（非真实 runs/）、解析 profile、算 exact claude invocation + allowed-files boundary、跑 §24.2 precondition、打印 plan、exit 0、**不 spawn claude**、**不 mint RUN-NNN**、feature 树零改动
-- [ ] deterministic 命令 dry-run：跑全部 legality + precondition check、打印"将写入 X"、exit 0、**不写 canonical state**
-- [ ] **dry-run 不 mint stable id**：dry-run 前后 stable-id 计数器不变（单测断言）；`docs/glossary.md` pin `dry-run`
-- [ ] dry-run 事件审计 `origin=dry-run`（沿用 02）
-- [ ] ADR-0004 落 `docs/adr/0004-dry-run-mode.md`（trade-off + temp-dir 决策 + 跳过点表）
-- [ ] 单测：dry-run 打印 plan、不 spawn、不写状态、计数器不变
-- [ ] mypy + 全测试绿
+- [x] `--dry-run` flag 接入副作用命令：agent 命令（run-headless/implement/review/spec-gap/fix-run）+ deterministic 命令（freeze/triage/coherence-gate/final-report/lane-gate）
+- [x] agent 命令 dry-run：prepare input package 到 **temp dir**（非真实 runs/）、解析 profile、算 exact claude invocation + allowed-files boundary、跑 §24.2 precondition、打印 plan、exit 0、**不 spawn claude**、**不 mint RUN-NNN**、feature 树零改动
+- [x] deterministic 命令 dry-run：跑全部 legality + precondition check、打印"将写入 X"、exit 0、**不写 canonical state**
+- [x] **dry-run 不 mint stable id**：dry-run 前后 stable-id 计数器不变（单测断言）；`docs/glossary.md` pin `dry-run`
+- [x] dry-run 事件审计 `origin=dry-run`（沿用 02）
+- [x] ADR-0004 落 `docs/adr/0004-dry-run-mode.md`（trade-off + temp-dir 决策 + 跳过点表）
+- [x] 单测：dry-run 打印 plan、不 spawn、不写状态、计数器不变
+- [x] mypy + 全测试绿
+
+Delivered by 74b1c9f (merged via 56a5af6). `--dry-run` planner lives at `src/ai_dev/dry_run.py`, wired through `cli.py` onto the side-effect agent + deterministic commands. The would-be input package renders to a temp dir (never `runs/RUN-NNN`), so `RUN`/`DEC` counters and the feature-run tree are untouched — the counter-invariance unit test asserts this. ADR-0004 (`docs/adr/0004-dry-run-mode.md`) records the temp-dir trade-off and the skip-point table; `docs/glossary.md` pins `dry-run`. Per ADR-0004 D4, the `origin=dry-run` audit *emission* remains deferred (dry-run still writes nothing); `origin` itself landed in ticket 02. Verified: `uv run pytest` 648 passed, `uv run mypy src/ai_dev` clean.
