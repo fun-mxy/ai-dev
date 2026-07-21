@@ -4,11 +4,11 @@
 
 **Blocked by:** 无 - 可立即开始
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] re-collect 后，已写在 ISSUE-NNN.json 上的 `triage`/`status` 字段保留不丢（merge 而非覆写）
-- [ ] report 派生字段（severity/title/evidence/location 等）按新 report 更新
-- [ ] `issue-bundle.json` 从 `issues/` 投影生成（投影，非独立 SoT）
-- [ ] 指纹复用：同一 issue 跨 re-collect 保持 ISSUE-NNN id
-- [ ] 单测：首次 collect、re-collect 保留 triage、re-collect 更新 report 字段、指纹复用 id
-- [ ] 缺前置 artifact fail-loud（§24.2）
+- [x] re-collect 后，已写在 ISSUE-NNN.json 上的 `triage`/`status` 字段保留不丢（merge 而非覆写）
+- [x] report 派生字段（severity/title/evidence/location 等）按新 report 更新
+- [x] `issue-bundle.json` 从 `issues/` 投影生成（投影，非独立 SoT）
+- [x] 指纹复用：同一 issue 跨 re-collect 保持 ISSUE-NNN id
+- [x] 单测：首次 collect、re-collect 保留 triage、re-collect 更新 report 字段、指纹复用 id
+- [x] 缺前置 artifact fail-loud（§24.2）
