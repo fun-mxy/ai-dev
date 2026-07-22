@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -23,17 +24,22 @@ import pytest
 from ai_dev.audit import AUDIT_LOG_JSON
 from ai_dev.feature_run import create_feature_run
 from ai_dev.paths import run_dir
-from ai_dev.profiles import load_profile
+from ai_dev.profiles import AgentProfile, load_profile
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import (
+    CODEX_WRAPPER_OWNED_RE,
     STRIP_VARS,
     WRAPPER_OWNED_RE,
+    ClaudeRunner,
+    CodexRunner,
     auto_memory_settings,
     build_child_env,
     build_cli_flags,
     build_prompt,
     compute_changed_files,
+    get_runner,
     inject_profile_env,
+    render_codex_env_snapshot,
     render_env_snapshot,
     run_headless,
     snapshot_tree,
@@ -971,5 +977,616 @@ def _result_metadata(repo_root: Path, feature_id: str, run_id: str) -> str:
     return (
         run_dir(repo_root, feature_id, run_id) / "output" / "metadata.json"
     ).read_text()
+
+
+# ---------------------------------------------------------------------------
+# ADR-0005 (v0.5 ticket 02): multi-CLI dispatch. CodexRunner + registry tests
+# at the run_headless seam - mirror the claude TestRunHeadless shape so the two
+# adapters are exercised symmetrically. The codex argv follows the
+# spike-amended ADR (D3/D4), NOT the original checklist text.
+# ---------------------------------------------------------------------------
+
+# A fake ``codex`` binary: reads the prompt from stdin (``codex exec -``),
+# writes the §13.1 agent outputs into its cwd, and exits 0. Stands in for the
+# real CLI so the codex dispatch is exercised without network or token.
+# ``__PY__`` is replaced with the test interpreter (string replace, not
+# ``.format``, so the JSON braces stay literal) - same trick as _FAKE_CLAUDE.
+_FAKE_CODEX = """\
+#!__PY__
+import json, os, sys
+_prompt = sys.stdin.read()
+os.makedirs("workspace", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+with open("workspace/hello.py", "w") as f:
+    f.write("# codex-written module\\n")
+    f.write("def answer():\\n    return 42\\n")
+with open("output/result.md", "w") as f:
+    f.write("Codex wrote workspace/hello.py for the run.\\n")
+with open("output/result.json", "w") as f:
+    json.dump(
+        {
+            "status": "proposed_done",
+            "summary": "Codex wrote workspace/hello.py for the run.",
+            "tasks": [
+                {"id": "TASK-001", "status": "proposed_done",
+                 "evidence": ["workspace/hello.py"]}
+            ],
+        },
+        f,
+    )
+sys.exit(0)
+"""
+
+# A recording fake ``codex``: writes its argv + the stdin prompt + its cwd to
+# ``output/`` so the dispatch/argv/stdin/cwd contract is assertable. Exits 0
+# without writing the §13 outputs (the recording tests only inspect argv/stdin).
+_FAKE_CODEX_RECORD = """\
+#!__PY__
+import os, sys
+_prompt = sys.stdin.read()
+os.makedirs("output", exist_ok=True)
+with open("output/argv.txt", "w") as f:
+    f.write("\\n".join(sys.argv))
+with open("output/stdin.txt", "w") as f:
+    f.write(_prompt)
+with open("output/cwd.txt", "w") as f:
+    f.write(os.getcwd())
+sys.exit(0)
+"""
+
+
+def _write_fake_codex(tmp_path: Path, body: str) -> Path:
+    """Write a fake ``codex`` script and return its executable path."""
+    script = tmp_path / "fake-codex"
+    script.write_text(body.replace("__PY__", sys.executable))
+    os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+# The canonical codex-default profile shape (spec §10.1): cli: codex,
+# backend: openai, base_url: null, auth_env: OPENAI_API_KEY, model: null,
+# invocation: headless, extra_env: {}. A model-bearing variant exercises -m.
+CODEX_DEFAULT_PROFILE_YAML = """\
+agent_profiles:
+  codex-default:
+    cli: codex
+    backend: openai
+    base_url: null
+    auth_env: "OPENAI_API_KEY"
+    model: null
+    invocation: headless
+    extra_env: {}
+"""
+
+CODEX_MODEL_PROFILE_YAML = """\
+agent_profiles:
+  codex-gpt55:
+    cli: codex
+    backend: openai
+    base_url: null
+    auth_env: "OPENAI_API_KEY"
+    model: "gpt-5.5"
+    invocation: headless
+    extra_env: {}
+"""
+
+
+class TestRunnerRegistry:
+    """ADR-0005 D1/D2: the registry is keyed by ``profile.cli``, not backend."""
+
+    def test_returns_codex_runner_for_codex_cli(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+
+        runner = get_runner(profile)
+
+        assert isinstance(runner, CodexRunner)
+        assert runner.cli == "codex"
+        assert runner.token_required is False
+
+    def test_returns_claude_runner_for_claude_cli(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        write_profiles(repo_root)
+        profile = load_profile(repo_root, "cc-glm52")
+
+        runner = get_runner(profile)
+
+        assert isinstance(runner, ClaudeRunner)
+        assert runner.cli == "claude"
+        assert runner.token_required is True
+
+    def test_dispatch_on_cli_not_backend(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # A ``cli: claude`` profile with a non-glm backend still resolves the
+        # ClaudeRunner - dispatch is on ``cli``, not ``backend`` (D2). This is
+        # the cc-minimaxm3 / cc-deepseekv4pro shape (claude CLI, other backend).
+        write_profiles(
+            repo_root,
+            "agent_profiles:\n"
+            "  cc-minimaxm3:\n"
+            "    cli: claude\n"
+            "    backend: minimax\n"
+            "    auth_env: CC_MINIMAXM3_TOKEN\n"
+            "    model: MiniMax-M3\n",
+        )
+        profile = load_profile(repo_root, "cc-minimaxm3")
+
+        runner = get_runner(profile)
+
+        assert isinstance(runner, ClaudeRunner)
+
+    def test_unknown_cli_raises(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # §24.2 fail loud: an unregistered cli surfaces as a ValueError, not a
+        # silent claude fallback.
+        write_profiles(
+            repo_root,
+            "agent_profiles:\n"
+            "  gemini-cli:\n"
+            "    cli: gemini\n"
+            "    auth_env: GEMINI_TOKEN\n",
+        )
+        profile = load_profile(repo_root, "gemini-cli")
+
+        with pytest.raises(ValueError, match="gemini"):
+            get_runner(profile)
+
+    def test_codex_wrapper_owned_re_excludes_settings_file(self) -> None:
+        # codex writes no .run-settings.json; its subtract set is the claude one
+        # minus the settings file (stdout/stderr/metadata/env-snapshot only).
+        for path in (
+            "output/stdout.log",
+            "output/stderr.log",
+            "output/metadata.json",
+            "output/env-snapshot.txt",
+        ):
+            assert CODEX_WRAPPER_OWNED_RE.search(path), f"{path} should be wrapper-owned"
+        assert not CODEX_WRAPPER_OWNED_RE.search("output/.run-settings.json")
+        assert not CODEX_WRAPPER_OWNED_RE.search("output/result.json")
+        assert not CODEX_WRAPPER_OWNED_RE.search("workspace/hello.py")
+
+
+class TestCodexRunHeadless:
+    """CodexRunner at the run_headless seam - argv, stdin, env, capture (D2-D5).
+
+    The codex argv follows the spike-amended ADR-0005: ``codex exec -`` (prompt
+    on stdin), ``-s workspace-write`` (cwd=run_dir), ``--skip-git-repo-check``,
+    ``--color never``, ``--ephemeral``; NO ``--remote-auth-token-env`` (D3
+    amended - rejected by ``codex exec``). Token via OPENAI_API_KEY env-injection
+    (OpenAI provider) or stored creds (custom provider, no fail-loud).
+    """
+
+    def test_captures_exit_code_and_agent_outputs(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "codex-token-value")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        result = run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        assert result.exit_code == 0
+        assert result.changed_files == [
+            "output/result.json",
+            "output/result.md",
+            "workspace/hello.py",
+        ]
+
+    def test_prompt_passed_on_stdin_not_argv(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # codex exec reads the prompt from stdin (``codex exec -``); the prompt
+        # text must NOT ride in argv (unlike claude's ``-p <prompt>``).
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX_RECORD)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        out = run_dir(repo_root, "FEATURE-001", "RUN-001") / "output"
+        stdin_text = (out / "stdin.txt").read_text()
+        argv_lines = (out / "argv.txt").read_text().split("\n")
+        # The prompt is on stdin...
+        assert "You are executing Agent Run RUN-001" in stdin_text
+        assert "input/task-package.md" in stdin_text
+        # ...and NOT in argv (no ``-p <prompt>``); the ``-`` sentinel is.
+        assert "-p" not in argv_lines
+        assert "You are executing Agent Run" not in "\n".join(argv_lines)
+        assert "-" in argv_lines
+
+    def test_codex_argv_shape(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # ADR-0005 D2/D4 + spike amendments: codex exec - (stdin prompt),
+        # -s workspace-write, --skip-git-repo-check, --color never, --ephemeral.
+        # NO --remote-auth-token-env (D3 amended - rejected by codex exec).
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX_RECORD)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        argv_lines = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "argv.txt"
+        ).read_text().split("\n")
+        assert "exec" in argv_lines
+        assert "-" in argv_lines  # the stdin-prompt sentinel
+        assert "-s" in argv_lines
+        assert "workspace-write" in argv_lines
+        assert "--skip-git-repo-check" in argv_lines
+        assert "--color" in argv_lines
+        assert "never" in argv_lines
+        assert "--ephemeral" in argv_lines
+        # D3 amended: --remote-auth-token-env is NOT in the codex argv.
+        assert "--remote-auth-token-env" not in argv_lines
+
+    def test_model_flag_when_profile_has_model(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root, CODEX_MODEL_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-gpt55")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX_RECORD)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        argv_lines = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "argv.txt"
+        ).read_text().split("\n")
+        assert "-m" in argv_lines
+        assert "gpt-5.5" in argv_lines
+
+    def test_no_model_flag_when_profile_model_null(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # codex-default has model: null -> no -m flag; codex resolves the model
+        # from ~/.codex/config.toml.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX_RECORD)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        argv_lines = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "argv.txt"
+        ).read_text().split("\n")
+        assert "-m" not in argv_lines
+
+    def test_openai_api_key_injected_into_child_env(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # D3 amended (OpenAI-provider path): the token is injected onto
+        # profile.auth_env (OPENAI_API_KEY) - the same env-injection pattern
+        # claude uses for ANTHROPIC_AUTH_TOKEN. The env snapshot proves it.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "codex-openai-token")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        snap = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "env-snapshot.txt"
+        ).read_text()
+        assert "OPENAI_API_KEY=<set>" in snap
+        # codex snapshot header labels the engine and the token source name.
+        assert "codex" in snap
+        assert "token_src=OPENAI_API_KEY" in snap
+
+    def test_no_run_settings_file_for_codex(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # codex has no --settings analogue; --ephemeral (in argv) is the
+        # session-persistence hygiene flag. No .run-settings.json is written.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        settings = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / ".run-settings.json"
+        )
+        assert not settings.exists()
+
+    def test_metadata_records_codex_cli_and_backend(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        md = json.loads(_result_metadata(repo_root, "FEATURE-001", "RUN-001"))
+        assert md["cli"] == "codex"
+        assert md["backend"] == "openai"
+        assert md["profile"] == "codex-default"
+        assert md["model"] is None
+        assert md["exit_code"] == 0
+        assert md["changed_files"] == [
+            "output/result.json",
+            "output/result.md",
+            "workspace/hello.py",
+        ]
+
+    def test_cwd_is_run_dir(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # D4 amended: cwd = run_dir (the RUN-NNN directory), so the §13 outputs
+        # and workspace files land inside the run dir and the workspace-write
+        # sandbox confines writes to it.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX_RECORD)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        cwd_text = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "cwd.txt"
+        ).read_text()
+        assert cwd_text == str(run_dir(repo_root, "FEATURE-001", "RUN-001").resolve())
+
+    def test_token_value_never_lands_on_disk(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # §10.2 / invariant #11: the resolved OPENAI_API_KEY value must not
+        # appear in any file the wrapper writes inside the run directory.
+        sentinel = "tok-CODEX-LEAK-CHECK-7d2a9e"
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", sentinel)
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        run_root = run_dir(repo_root, "FEATURE-001", "RUN-001")
+        for path in run_root.rglob("*"):
+            if path.is_file():
+                assert sentinel not in path.read_text(errors="ignore"), (
+                    f"token leaked into {path}"
+                )
+
+    def test_does_not_fail_loud_on_missing_token(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # D3 amended (custom-provider path): codex may use stored
+        # ~/.codex/auth.json when no env token is set. Unlike claude (which
+        # fails loud), a codex run with OPENAI_API_KEY unset proceeds - the
+        # adapter injects nothing and lets codex resolve auth itself. The env
+        # snapshot honestly records token_src=None.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        result = run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+        )
+
+        assert result.exit_code == 0
+        snap = (
+            run_dir(repo_root, "FEATURE-001", "RUN-001") / "output" / "env-snapshot.txt"
+        ).read_text()
+        assert "token_src=None" in snap
+
+    def test_codex_binary_not_found_raises(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # §24.2 fail loud: codex not on PATH and no override -> ValueError
+        # before any subprocess is spawned. (The dev env has codex installed, so
+        # shutil.which is stubbed to None to exercise the not-found branch
+        # without spawning the real CLI.)
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+        with pytest.raises(ValueError, match="codex"):
+            run_headless(
+                repo_root, "FEATURE-001", "RUN-001", profile,
+                started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+            )
+
+    def test_missing_run_dir_raises(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The run-dir precondition is shared (engine-agnostic): a missing run
+        # dir fails loud regardless of the adapter.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        create_feature_run(repo_root, "intent")
+
+        with pytest.raises(ValueError, match="RUN-999"):
+            run_headless(repo_root, "FEATURE-001", "RUN-999", profile)
+
+    def test_audits_run_event(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # §2.1: a codex run lifecycle event flows through the audit log too -
+        # the audit step is shared, engine-agnostic.
+        write_profiles(repo_root, CODEX_DEFAULT_PROFILE_YAML)
+        profile = load_profile(repo_root, "codex-default")
+        monkeypatch.setenv("OPENAI_API_KEY", "tok")
+        _make_prepared_run(repo_root)
+        fake = _write_fake_codex(tmp_path, _FAKE_CODEX)
+
+        run_headless(
+            repo_root, "FEATURE-001", "RUN-001", profile, cli_path=str(fake),
+            started_at="2026-07-22T10:00:00Z", ended_at="2026-07-22T10:00:05Z",
+            origin="implement-leg",
+        )
+
+        records = _audit_records(repo_root, "FEATURE-001")
+        run_events = [r for r in records if r.get("event") == "run"]
+        assert len(run_events) == 1
+        payload = run_events[0]["payload"]
+        assert isinstance(payload, dict)
+        assert payload.get("run") == "RUN-001"
+        assert payload.get("profile") == "codex-default"
+        assert payload.get("exit_code") == 0
+        assert payload.get("elapsed_ms") == 5_000
+        assert run_events[0].get("origin") == "implement-leg"
+
+
+class TestCodexEnvSnapshot:
+    """The codex env snapshot greps openai/codex/AI_ (not claude/anthropic)."""
+
+    def test_lists_openai_api_key_redacted(self) -> None:
+        # The codex snapshot must surface OPENAI_API_KEY (the var codex reads on
+        # the OpenAI-provider path), redacted - proving the env-injection.
+        child_env = {"OPENAI_API_KEY": "secret-openai", "PATH": "/bin"}
+        profile = AgentProfile(
+            name="codex-default", cli="codex", auth_env="OPENAI_API_KEY",
+            backend="openai", model=None,
+        )
+
+        text = render_codex_env_snapshot(child_env, profile, "OPENAI_API_KEY", "2026-07-22T10:00:00Z")
+
+        assert "OPENAI_API_KEY=<set>" in text
+        assert "secret-openai" not in text
+
+    def test_does_not_list_anthropic_vars(self) -> None:
+        # A claude-orchestrator parent may carry ANTHROPIC_* vars; the codex
+        # snapshot must NOT surface them (codex does not read ANTHROPIC_*).
+        child_env = {
+            "OPENAI_API_KEY": "tok",
+            "ANTHROPIC_AUTH_TOKEN": "claude-tok",
+            "ANTHROPIC_BASE_URL": "https://ark",
+        }
+        profile = AgentProfile(
+            name="codex-default", cli="codex", auth_env="OPENAI_API_KEY",
+            backend="openai", model=None,
+        )
+
+        text = render_codex_env_snapshot(child_env, profile, "OPENAI_API_KEY", "2026-07-22T10:00:00Z")
+
+        assert "OPENAI_API_KEY=<set>" in text
+        assert "ANTHROPIC_AUTH_TOKEN" not in text
+        assert "ANTHROPIC_BASE_URL" not in text
+
+    def test_token_value_never_in_snapshot(self) -> None:
+        # §10.2 / invariant #11: the OPENAI_API_KEY value must not appear.
+        sentinel = "tok-CODEX-SNAP-LEAK-2c4f81"
+        child_env = {"OPENAI_API_KEY": sentinel}
+        profile = AgentProfile(
+            name="codex-default", cli="codex", auth_env="OPENAI_API_KEY",
+            backend="openai", model=None,
+        )
+
+        text = render_codex_env_snapshot(child_env, profile, "OPENAI_API_KEY", "2026-07-22T10:00:00Z")
+
+        assert sentinel not in text
+
 
 
