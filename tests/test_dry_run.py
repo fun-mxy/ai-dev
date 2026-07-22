@@ -600,7 +600,7 @@ class TestFixRunDryRun:
         before_counters = _counters(feature_root)
         profile = load_profile(repo_root, "cc-glm52")
 
-        plan = plan_fix_run(repo_root, feature_id, lane_id, profile)
+        plan = plan_fix_run(repo_root, feature_id, lane_id, profile, profile, profile)
         assert plan.details["target_issue_ids"]
         assert plan.details["would_consume_budget"] is False
         assert _inventory(feature_root) == before
@@ -636,7 +636,7 @@ class TestFixRunDryRun:
         monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
         profile = load_profile(repo_root, "cc-glm52")
         with pytest.raises(ValueError, match="FEATURE-404"):
-            plan_fix_run(repo_root, "FEATURE-404", "LANE-001", profile)
+            plan_fix_run(repo_root, "FEATURE-404", "LANE-001", profile, profile, profile)
 
 
 # ---------------------------------------------------------------------------

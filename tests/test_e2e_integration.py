@@ -1407,7 +1407,7 @@ class TestV03EndToEndIntegration:
         # fix-run: RUN-004 implement, RUN-005 review(pass), RUN-006 spec-gap(pass),
         # verify, collect (ISSUE-001 resolved, bundle emptied).
         fix = run_fix_run(
-            repo_root, feature_id, lane_id, profile,
+            repo_root, feature_id, lane_id, profile, profile, profile,
             max_turns=DEFAULT_MAX_TURNS,
             permission_mode=DEFAULT_PERMISSION_MODE,
             verify_timeout=30.0,

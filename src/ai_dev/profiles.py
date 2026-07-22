@@ -35,8 +35,23 @@ import yaml
 
 from ai_dev.paths import agent_profiles_path
 
-# Top-level registry key in agent-profiles.yml (§10.1).
+# Top-level registry keys in agent-profiles.yml (§10.1).
 PROFILES_KEY = "agent_profiles"
+# v0.5 ticket 03: the role -> profile-name policy table, a sibling of
+# ``agent_profiles:``. Optional (absent => no role defaults; callers must pass
+# ``--profile`` explicitly). See ``load_role_defaults`` / ``resolve_profile_name``.
+ROLE_DEFAULTS_KEY = "role_defaults"
+
+# The canonical ``role_defaults`` keys (ticket 03) - one per agent leg that
+# carries a ``--profile`` default. These are stable role identifiers, distinct
+# from (a) the human-readable role strings the legs pin ("Implementer" /
+# "Code Reviewer" / "Spec Gap Analyst") and (b) the §15 issue ``source`` enum
+# (``code_review`` / ``spec_gap``): a key here names only "which default profile
+# does this leg run", so the three concerns cannot collide. ``fix-run`` resolves
+# all three (one per leg); ``implement`` / ``review`` / ``spec-gap`` resolve one.
+ROLE_IMPLEMENTER = "implementer"
+ROLE_REVIEWER = "reviewer"
+ROLE_SPEC_GAP_ANALYST = "spec_gap_analyst"
 
 
 class ProfileError(ValueError):
@@ -169,6 +184,33 @@ def _parse_env_strip_pattern(
     return pattern
 
 
+def _load_registry_doc(repo_root: Path) -> dict[str, Any]:
+    """Read + parse ``agent-profiles.yml`` into a top-level mapping (§24.2).
+
+    Shared by ``load_profile`` and ``load_role_defaults`` so the two cannot
+    drift on the missing-file / malformed-YAML / non-mapping failure surface: a
+    corrupt registry surfaces once as a ``ProfileError`` (not a raw yaml
+    traceback) regardless of which top-level key the caller then reads.
+    """
+    path = agent_profiles_path(repo_root)
+    if not path.is_file():
+        raise ProfileError(f"agent-profiles.yml not found at {path} (§10.1)")
+    try:
+        doc = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        # §24.2 fail loud: a corrupt registry surfaces as a ProfileError (not a
+        # raw yaml traceback) so the CLI's catch-all maps it to a clean exit.
+        raise ProfileError(
+            f"agent-profiles.yml at {path} is not valid YAML: {exc}"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise ProfileError(
+            f"agent-profiles.yml at {path} must be a mapping with key "
+            f"{PROFILES_KEY!r}"
+        )
+    return doc
+
+
 def load_profile(repo_root: Path, name: str) -> AgentProfile:
     """Load and parse the named profile from ``agent-profiles.yml``.
 
@@ -183,32 +225,16 @@ def load_profile(repo_root: Path, name: str) -> AgentProfile:
     missing/empty, an optional field has the wrong type, or ``env_strip_pattern``
     is not a valid regex (§24.2 fail loud - no silent defaults for misconfig).
     """
-    path = agent_profiles_path(repo_root)
-    if not path.is_file():
-        raise ProfileError(
-            f"agent-profiles.yml not found at {path} (§10.1)"
-        )
-    try:
-        doc = yaml.safe_load(path.read_text()) or {}
-    except yaml.YAMLError as exc:
-        # §24.2 fail loud: a corrupt registry surfaces as a ProfileError (not a
-        # raw yaml traceback) so the CLI's catch-all maps it to a clean exit.
-        raise ProfileError(
-            f"agent-profiles.yml at {path} is not valid YAML: {exc}"
-        ) from exc
-    if not isinstance(doc, dict):
-        raise ProfileError(
-            f"agent-profiles.yml at {path} must be a mapping with key "
-            f"{PROFILES_KEY!r}"
-        )
+    doc = _load_registry_doc(repo_root)
     profiles = doc.get(PROFILES_KEY)
     if not isinstance(profiles, dict) or not profiles:
         raise ProfileError(
-            f"agent-profiles.yml at {path} has no {PROFILES_KEY!r} mapping"
+            f"agent-profiles.yml at {agent_profiles_path(repo_root)} has no "
+            f"{PROFILES_KEY!r} mapping"
         )
     if name not in profiles:
         raise ProfileError(
-            f"profile {name!r} not found in {path}; "
+            f"profile {name!r} not found in {agent_profiles_path(repo_root)}; "
             f"available: {sorted(profiles)}"
         )
     raw = profiles[name]
@@ -230,6 +256,69 @@ def load_profile(repo_root: Path, name: str) -> AgentProfile:
         extra_env=_parse_extra_env(raw, name),
         env_strip_pattern=_parse_env_strip_pattern(raw, name),
     )
+
+
+def load_role_defaults(repo_root: Path) -> dict[str, str]:
+    """Load the ``role_defaults`` role -> profile-name mapping (ticket 03).
+
+    Returns the declared mapping, or ``{}`` when ``role_defaults`` is absent
+    (backward compat with v0.4 registries that predate the field - a caller
+    that passes ``--profile`` explicitly never needs it). Values are profile
+    *names* and are **not** validated against the ``agent_profiles`` registry:
+    ticket 03's "no allowed-set, no enforcement" boundary means a dangling
+    reference is returned as-is and surfaces later as a ``load_profile``
+    ``ProfileError``, not a policy refusal here.
+
+    Raises ``ProfileError`` (§24.2 fail loud) on a present-but-non-mapping
+    ``role_defaults`` or a non-string key/value - a misconfigured policy table
+    is rejected rather than silently coerced.
+    """
+    doc = _load_registry_doc(repo_root)
+    if ROLE_DEFAULTS_KEY not in doc or doc[ROLE_DEFAULTS_KEY] is None:
+        return {}
+    raw = doc[ROLE_DEFAULTS_KEY]
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            f"role_defaults in {agent_profiles_path(repo_root)} must be a "
+            f"mapping of role -> profile-name"
+        )
+    parsed: dict[str, str] = {}
+    for role, profile_name in raw.items():
+        if not isinstance(role, str) or not isinstance(profile_name, str):
+            raise ProfileError(
+                f"role_defaults in {agent_profiles_path(repo_root)} entries "
+                f"must be role-string -> profile-name-string"
+            )
+        parsed[role] = profile_name
+    return parsed
+
+
+def resolve_profile_name(
+    repo_root: Path, role: str, override: str | None = None
+) -> str:
+    """Resolve the profile name for a role (ticket 03 policy).
+
+    ``override`` (the ``--profile`` value) always wins, with **no allowed-set
+    and no refusal**: even an unknown name is returned verbatim, deferring the
+    not-found failure to ``load_profile`` - the "no constraint" boundary a
+    future contributor must not add refusal logic to without a fitness
+    justification. When ``override`` is ``None``, the role's ``role_defaults``
+    entry is the default; a role with no entry and no override fails loud
+    (§24.2) with an actionable message naming both fixes.
+
+    The override path skips ``role_defaults`` entirely, so ``--profile`` is
+    self-sufficient even on a registry without the field.
+    """
+    if override is not None:
+        return override
+    defaults = load_role_defaults(repo_root)
+    if role not in defaults:
+        raise ProfileError(
+            f"no --profile given and role {role!r} has no role_defaults entry "
+            f"in {agent_profiles_path(repo_root)}; either pass --profile <name> "
+            f"or add '{role}: <profile>' under role_defaults (ticket 03)"
+        )
+    return defaults[role]
 
 
 def token_source_var(profile: AgentProfile) -> str | None:

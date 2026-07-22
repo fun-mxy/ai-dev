@@ -464,7 +464,9 @@ def plan_fix_run(
     repo_root: Path,
     feature_id: str,
     lane_id: str,
-    profile: AgentProfile,
+    implement_profile: AgentProfile,
+    reviewer_profile: AgentProfile,
+    spec_gap_profile: AgentProfile,
     *,
     max_turns: int = DEFAULT_MAX_TURNS,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
@@ -477,6 +479,10 @@ def plan_fix_run(
     planned as a temp-dir package (``plan_implement`` shape) and the
     review/spec-gap/verify/collect chain is listed as ``would_run``. No leg
     actually runs, no id is minted, no budget is consumed.
+
+    v0.5 ticket 03: each leg's token source is preflighted (one per role
+    default), and the plan reports all three profile names so the operator can
+    see the per-leg routing before committing to a real run.
     """
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
@@ -492,12 +498,23 @@ def plan_fix_run(
             f"no active request_fix issues found under {feature_id}/{ISSUES_DIR}; "
             "fix-run has nothing to target"
         )
-    _require_token_source(profile)
+    # Each leg's token source must be set - preflight all three role defaults.
+    for leg_label, leg_profile in (
+        ("implement", implement_profile),
+        ("review", reviewer_profile),
+        ("spec-gap", spec_gap_profile),
+    ):
+        _require_token_source(leg_profile)
     budget = fix_loop_budget(feature_root)
 
     details: dict[str, Any] = {
         "lane_id": lane_id,
-        "profile": profile.name,
+        "profile": implement_profile.name,
+        "profiles": {
+            "implementer": implement_profile.name,
+            "reviewer": reviewer_profile.name,
+            "spec_gap_analyst": spec_gap_profile.name,
+        },
         "target_issue_ids": [t.issue_id for t in targets],
         "fix_loop_budget": dict(budget),
         "verify_timeout": verify_timeout,

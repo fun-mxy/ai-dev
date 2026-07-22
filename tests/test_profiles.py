@@ -18,8 +18,13 @@ import pytest
 from ai_dev.profiles import (
     AgentProfile,
     ProfileError,
+    ROLE_IMPLEMENTER,
+    ROLE_REVIEWER,
+    ROLE_SPEC_GAP_ANALYST,
     load_profile,
+    load_role_defaults,
     render_profile,
+    resolve_profile_name,
     token_source_var,
 )
 
@@ -36,6 +41,26 @@ agent_profiles:
     model: null
     invocation: headless
     extra_env: {}
+"""
+
+# A v0.4-era cc-glm52 registry that predates role_defaults (ticket 03). Used to
+# pin backward compat: the field is optional, and a caller passing --profile
+# explicitly never needs it. The shared conftest fixture now ships role_defaults
+# (so CLI tests that omit --profile resolve through it), so this no-role-defaults
+# shape lives here for the loader/resolver backward-compat cases.
+CC_GLM52_NO_ROLE_DEFAULTS_YAML = """\
+agent_profiles:
+  cc-glm52:
+    cli: claude
+    backend: glm
+    base_url: "https://ark.cn-beijing.volces.com/api/coding"
+    auth_env: "CC_GLM52_TOKEN"
+    auth_env_fallback: "ANTHROPIC_AUTH_TOKEN"
+    auth_target: "ANTHROPIC_AUTH_TOKEN"
+    model: "glm-5.2"
+    invocation: headless
+    extra_env:
+      ANTHROPIC_MODEL: "glm-5.2"
 """
 
 
@@ -388,3 +413,168 @@ class TestRenderProfile:
         # explicit, not a silent omission.
         for text in (text_set, text_fallback, text_unset):
             assert "<redacted" in text
+
+
+# A registry carrying the v0.5 role_defaults policy (ticket 03): implementer on
+# codex-default, the two checking roles on cc-glm52. Used by the role-defaults
+# loader + resolver tests below.
+ROLE_DEFAULTS_YAML = """\
+agent_profiles:
+  cc-glm52:
+    cli: claude
+    backend: glm
+    base_url: "https://ark.cn-beijing.volces.com/api/coding"
+    auth_env: "CC_GLM52_TOKEN"
+    auth_env_fallback: "ANTHROPIC_AUTH_TOKEN"
+    auth_target: "ANTHROPIC_AUTH_TOKEN"
+    model: "glm-5.2"
+    invocation: headless
+    extra_env:
+      ANTHROPIC_MODEL: "glm-5.2"
+  codex-default:
+    cli: codex
+    backend: openai
+    base_url: null
+    auth_env: "OPENAI_API_KEY"
+    model: null
+    invocation: headless
+    extra_env: {}
+role_defaults:
+  implementer: codex-default
+  reviewer: cc-glm52
+  spec_gap_analyst: cc-glm52
+"""
+
+
+class TestLoadRoleDefaults:
+    """``load_role_defaults`` - the ticket-03 role -> profile-name policy table.
+
+    A plain top-level ``role_defaults:`` mapping alongside ``agent_profiles:``;
+    values are profile *names* (strings), never validated against the registry
+    (no allowed-set, no enforcement - a dangling reference surfaces later as a
+    ``load_profile`` ProfileError, not a policy refusal).
+    """
+
+    def test_returns_the_role_to_profile_mapping(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+
+        defaults = load_role_defaults(repo_root)
+
+        assert defaults == {
+            "implementer": "codex-default",
+            "reviewer": "cc-glm52",
+            "spec_gap_analyst": "cc-glm52",
+        }
+
+    def test_absent_role_defaults_is_empty_not_error(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # Backward compat: a v0.4 registry predating the field loads as {} so a
+        # caller that passes --profile explicitly still works without the field.
+        write_profiles(repo_root, CC_GLM52_NO_ROLE_DEFAULTS_YAML)
+
+        assert load_role_defaults(repo_root) == {}
+
+    def test_missing_file_fails_loud(self, repo_root: Path) -> None:
+        # §24.2: no registry -> ProfileError (same surface as load_profile).
+        with pytest.raises(ProfileError, match="agent-profiles.yml"):
+            load_role_defaults(repo_root)
+
+    def test_non_mapping_role_defaults_fails_loud(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        write_profiles(
+            repo_root,
+            "agent_profiles:\n  cc-glm52:\n    cli: claude\n    auth_env: T\n"
+            "role_defaults: [not, a, mapping]\n",
+        )
+        with pytest.raises(ProfileError, match="role_defaults"):
+            load_role_defaults(repo_root)
+
+    def test_non_string_value_fails_loud(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # A profile name must be a string; a non-string value is a config error
+        # (§24.2 fail loud), not silently coerced.
+        write_profiles(
+            repo_root,
+            "agent_profiles:\n  cc-glm52:\n    cli: claude\n    auth_env: T\n"
+            "role_defaults:\n  implementer: 42\n",
+        )
+        with pytest.raises(ProfileError, match="role_defaults"):
+            load_role_defaults(repo_root)
+
+
+class TestResolveProfileName:
+    """``resolve_profile_name`` - ticket-03 default-resolution policy.
+
+    ``--profile`` (the override) always wins, with NO allowed-set and NO refusal
+    - even an unknown name is returned as-is, deferring the not-found failure to
+    ``load_profile`` (the "no constraint" boundary). When no override is given,
+    the role's ``role_defaults`` entry is the default; a role with no entry and
+    no override fails loud (§24.2) telling the operator exactly how to fix it.
+    """
+
+    def test_override_wins_even_when_role_default_differs(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # implementer defaults to codex-default, but --profile cc-glm52 overrides.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+
+        assert resolve_profile_name(
+            repo_root, ROLE_IMPLEMENTER, override="cc-glm52"
+        ) == "cc-glm52"
+
+    def test_override_returned_verbatim_no_enforcement(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # "no allowed-set, no refusal": an override that names a profile that does
+        # not exist is returned as-is - resolve does not gate, load_profile does.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+
+        assert resolve_profile_name(
+            repo_root, ROLE_IMPLEMENTER, override="no-such-profile"
+        ) == "no-such-profile"
+
+    def test_role_default_used_when_no_override(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+
+        assert resolve_profile_name(repo_root, ROLE_IMPLEMENTER) == "codex-default"
+        assert resolve_profile_name(repo_root, ROLE_REVIEWER) == "cc-glm52"
+        assert resolve_profile_name(repo_root, ROLE_SPEC_GAP_ANALYST) == "cc-glm52"
+
+    def test_role_default_resolves_to_a_loadable_profile(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # The resolved name must actually load - pins that role_defaults points
+        # at a real registry entry (codex-default's null fields exercise this).
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+
+        name = resolve_profile_name(repo_root, ROLE_IMPLEMENTER)
+
+        assert load_profile(repo_root, name).name == "codex-default"
+
+    def test_no_override_no_role_entry_fails_loud(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # A v0.4 registry (no role_defaults) + no --profile: the operator must be
+        # told to either pass --profile or add the role to role_defaults.
+        write_profiles(repo_root, CC_GLM52_NO_ROLE_DEFAULTS_YAML)
+
+        with pytest.raises(ProfileError, match="implementer"):
+            resolve_profile_name(repo_root, ROLE_IMPLEMENTER)
+
+    def test_override_works_without_role_defaults_field(
+        self, repo_root: Path, write_profiles: Callable[..., Path]
+    ) -> None:
+        # --profile is self-sufficient: it must not require role_defaults to exist
+        # (the override path skips role_defaults entirely).
+        write_profiles(repo_root, CC_GLM52_NO_ROLE_DEFAULTS_YAML)
+
+        assert resolve_profile_name(
+            repo_root, ROLE_IMPLEMENTER, override="cc-glm52"
+        ) == "cc-glm52"

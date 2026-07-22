@@ -154,8 +154,12 @@ from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
 from ai_dev.profiles import (
     ProfileError,
+    ROLE_IMPLEMENTER,
+    ROLE_REVIEWER,
+    ROLE_SPEC_GAP_ANALYST,
     load_profile,
     render_profile,
+    resolve_profile_name,
     token_source_var,
 )
 from ai_dev.query import (
@@ -460,9 +464,10 @@ def _build_parser() -> argparse.ArgumentParser:
     implement.add_argument("lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml).")
     implement.add_argument(
         "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[implementer] in "
+        "agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
     )
     implement.add_argument(
         "--max-turns",
@@ -491,9 +496,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument(
         "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[reviewer] in "
+        "agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
     )
     review.add_argument(
         "--max-turns",
@@ -522,9 +528,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     spec_gap.add_argument(
         "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[spec_gap_analyst] "
+        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
     )
     spec_gap.add_argument(
         "--max-turns",
@@ -666,8 +673,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fix_run.add_argument(
         "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke for implement/review/spec-gap (default: cc-glm52).",
+        default=None,
+        help="Agent profile to invoke for implement/review/spec-gap (default: "
+        "each leg's role_defaults entry, ticket 03; --profile, if given, "
+        "overrides all three legs - no allowed-set, no refusal).",
     )
     fix_run.add_argument(
         "--max-turns",
@@ -1223,14 +1232,24 @@ def _run_fix_run(
     repo_root: Path,
     feature_id: str,
     lane_id: str,
-    profile_name: str,
+    implement_profile_name: str,
+    reviewer_profile_name: str,
+    spec_gap_profile_name: str,
     max_turns: int,
     permission_mode: str,
     verify_timeout: float,
 ) -> int:
-    """Run one bounded fix-loop bookend and stop before human re-triage."""
+    """Run one bounded fix-loop bookend and stop before human re-triage.
+
+    v0.5 ticket 03: loads one profile per leg (per-leg role defaults resolved by
+    the dispatcher); a missing profile surfaces as a clean ``error:`` + exit 1
+    before any leg runs. ``--profile``, when given, was applied to all three
+    names upstream so a single override covers the whole chain.
+    """
     try:
-        profile = load_profile(repo_root, profile_name)
+        implement_profile = load_profile(repo_root, implement_profile_name)
+        reviewer_profile = load_profile(repo_root, reviewer_profile_name)
+        spec_gap_profile = load_profile(repo_root, spec_gap_profile_name)
     except ProfileError as exc:
         _render_error(exc)
         return 1
@@ -1239,7 +1258,9 @@ def _run_fix_run(
             repo_root,
             feature_id,
             lane_id,
-            profile,
+            implement_profile,
+            reviewer_profile,
+            spec_gap_profile,
             max_turns=max_turns,
             permission_mode=permission_mode,
             verify_timeout=verify_timeout,
@@ -1520,43 +1541,59 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
 
     if args.command == "implement":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_IMPLEMENTER, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
         if args.dry_run:
             return _run_dry_plan(
                 lambda: plan_implement(
-                    Path(args.repo_root),
+                    repo_root,
                     args.feature_id,
                     args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
+                    load_profile(repo_root, profile_name),
                     max_turns=args.max_turns,
                     permission_mode=args.permission_mode,
                 )
             )
         return _run_implement(
-            Path(args.repo_root),
+            repo_root,
             args.feature_id,
             args.lane_id,
-            args.profile,
+            profile_name,
             args.max_turns,
             args.permission_mode,
         )
 
     if args.command == "review":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_REVIEWER, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
         if args.dry_run:
             return _run_dry_plan(
                 lambda: plan_review(
-                    Path(args.repo_root),
+                    repo_root,
                     args.feature_id,
                     args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
+                    load_profile(repo_root, profile_name),
                     max_turns=args.max_turns,
                     permission_mode=args.permission_mode,
                 )
             )
         return _run_checking(
-            Path(args.repo_root),
+            repo_root,
             args.feature_id,
             args.lane_id,
-            args.profile,
+            profile_name,
             args.max_turns,
             args.permission_mode,
             leg=run_reviewer_leg,
@@ -1565,22 +1602,30 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         )
 
     if args.command == "spec-gap":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_SPEC_GAP_ANALYST, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
         if args.dry_run:
             return _run_dry_plan(
                 lambda: plan_spec_gap(
-                    Path(args.repo_root),
+                    repo_root,
                     args.feature_id,
                     args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
+                    load_profile(repo_root, profile_name),
                     max_turns=args.max_turns,
                     permission_mode=args.permission_mode,
                 )
             )
         return _run_checking(
-            Path(args.repo_root),
+            repo_root,
             args.feature_id,
             args.lane_id,
-            args.profile,
+            profile_name,
             args.max_turns,
             args.permission_mode,
             leg=run_spec_gap_leg,
@@ -1631,23 +1676,44 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return _run_final_report(Path(args.repo_root), args.feature_id)
 
     if args.command == "fix-run":
+        repo_root = Path(args.repo_root)
+        # --profile (override) applies to all three legs; when absent each leg
+        # resolves its own role default (ticket 03: fix-run uses per-leg role
+        # defaults). No allowed-set, no refusal - a bad name surfaces at load.
+        try:
+            implement_name = resolve_profile_name(
+                repo_root, ROLE_IMPLEMENTER, args.profile
+            )
+            reviewer_name = resolve_profile_name(
+                repo_root, ROLE_REVIEWER, args.profile
+            )
+            spec_gap_name = resolve_profile_name(
+                repo_root, ROLE_SPEC_GAP_ANALYST, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
         if args.dry_run:
             return _run_dry_plan(
                 lambda: plan_fix_run(
-                    Path(args.repo_root),
+                    repo_root,
                     args.feature_id,
                     args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
+                    load_profile(repo_root, implement_name),
+                    load_profile(repo_root, reviewer_name),
+                    load_profile(repo_root, spec_gap_name),
                     max_turns=args.max_turns,
                     permission_mode=args.permission_mode,
                     verify_timeout=args.verify_timeout,
                 )
             )
         return _run_fix_run(
-            Path(args.repo_root),
+            repo_root,
             args.feature_id,
             args.lane_id,
-            args.profile,
+            implement_name,
+            reviewer_name,
+            spec_gap_name,
             args.max_turns,
             args.permission_mode,
             args.verify_timeout,

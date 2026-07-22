@@ -16,6 +16,10 @@ import pytest
 # profiles-module and CLI tests so the two cannot drift apart on what "a valid
 # profile" looks like (a previous split copy had already dropped env_strip_pattern
 # and the ANTHROPIC_BASE_URL extra_env entry).
+#
+# v0.5 ticket 03: carries ``role_defaults`` mapping every role to cc-glm52 so the
+# many CLI/dry-run tests that omit ``--profile`` resolve it through the policy
+# table (the new default path) rather than a hardcoded argparse default.
 CC_GLM52_PROFILE_YAML = """\
 agent_profiles:
   cc-glm52:
@@ -31,6 +35,10 @@ agent_profiles:
       ANTHROPIC_BASE_URL: "https://ark.cn-beijing.volces.com/api/coding"
       ANTHROPIC_MODEL: "glm-5.2"
     env_strip_pattern: "^(CLAUDE_CODE_|CLAUDECODE$|AI_AGENT$|CLAUDE_EFFORT$)"
+role_defaults:
+  implementer: cc-glm52
+  reviewer: cc-glm52
+  spec_gap_analyst: cc-glm52
 """
 
 

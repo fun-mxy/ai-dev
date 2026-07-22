@@ -668,6 +668,15 @@ agent_profiles:
     model: null
     invocation: headless
     extra_env: {}
+
+# role_defaults（v0.5 ticket 03）：role -> profile 名的默认策略表。每个 agent leg
+# 在未传 --profile 时按 role 解析默认 profile；--profile 永远覆盖（无 allowed-set、
+# 无拒绝逻辑——“无约束”边界）。fix-run 三条 leg 各取各的 role 默认。可选字段：缺失
+# 等价于无 role 默认（调用方必须显式传 --profile）。
+role_defaults:
+  implementer: codex-default
+  reviewer: cc-glm52
+  spec_gap_analyst: cc-glm52
 ```
 
 > **认证字段语义**（补充 §10.2 的"只用变量名"规则）：

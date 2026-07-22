@@ -17,6 +17,13 @@ from ai_dev.cli import main
 from ai_dev.profiles import AgentProfile
 from ai_dev.run_wrapper import RunResult
 
+from test_fix_run import _stage_request_fix_issue  # noqa: E402
+from test_implement_leg import _seed_frozen_feature  # noqa: E402
+from test_profiles import (  # noqa: E402
+    CC_GLM52_NO_ROLE_DEFAULTS_YAML,
+    ROLE_DEFAULTS_YAML,
+)
+
 INTENT = "export reports for sharing"
 
 
@@ -162,6 +169,33 @@ class TestCliShowProfile:
         assert code == 0
         out = capsys.readouterr().out
         assert "token_source: ANTHROPIC_AUTH_TOKEN" in out
+        assert "token_set: true" in out
+
+    def test_show_profile_resolves_codex_default(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # v0.5 ticket 03: the second Agent Profile resolves through the same
+        # loader - null base_url/model + empty extra_env render as <none>/<none>,
+        # and OPENAI_API_KEY is its token source (no fallback declared).
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.setenv("OPENAI_API_KEY", "codex-live-token")
+
+        code = main(["show-profile", "codex-default", "--repo-root", str(repo_root)])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "profile: codex-default" in out
+        assert "cli: codex" in out
+        assert "backend: openai" in out
+        assert "base_url: <none>" in out
+        assert "model: <none>" in out
+        assert "auth_env: OPENAI_API_KEY" in out
+        assert "token_source: OPENAI_API_KEY" in out
         assert "token_set: true" in out
 
     def test_token_value_redacted_in_all_output(
@@ -988,3 +1022,135 @@ class TestCliAgentCommandsProfileError:
         err = capsys.readouterr().err
         assert "error:" in err
         assert "agent-profiles.yml" in err
+
+
+class TestCliRoleDefaultsResolution:
+    """ticket 03: ``--profile`` defaults resolve from ``role_defaults`` by role;
+    ``--profile`` always overrides (no allowed-set, no refusal). ``fix-run``
+    resolves per-leg. Exercised via ``--dry-run`` so no subprocess spawns - the
+    plan carries the resolved profile name(s).
+    """
+
+    def test_implement_no_profile_uses_role_default(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # role_defaults[implementer] = codex-default -> the plan runs on codex.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.setenv("OPENAI_API_KEY", "codex-tok")
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        code = main(
+            ["implement", feature_id, lane_id, "--dry-run", "--repo-root", str(repo_root)]
+        )
+
+        assert code == 0
+        assert "profile: codex-default" in capsys.readouterr().out
+
+    def test_implement_profile_overrides_role_default(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # --profile cc-glm52 overrides role_defaults[implementer]=codex-default;
+        # no enforcement, no refusal - the override fully replaces the default.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "glm-tok")
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        code = main(
+            [
+                "implement", feature_id, lane_id, "--dry-run",
+                "--profile", "cc-glm52", "--repo-root", str(repo_root),
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "profile: cc-glm52" in out
+        assert "codex-default" not in out
+
+    def test_no_role_defaults_no_profile_exits_1_with_hint(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A v0.4 registry (no role_defaults) + no --profile: fail loud with an
+        # actionable message naming both the role and role_defaults (§24.2/§26.5).
+        write_profiles(repo_root, CC_GLM52_NO_ROLE_DEFAULTS_YAML)
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        code = main(
+            ["implement", feature_id, lane_id, "--dry-run", "--repo-root", str(repo_root)]
+        )
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "error:" in err
+        assert "role_defaults" in err
+        assert "implementer" in err
+
+    def test_fix_run_dry_run_reports_per_leg_profiles(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # fix-run uses each leg's role default: implementer=codex-default,
+        # reviewer/spec_gap_analyst=cc-glm52. The plan's ``profiles`` block pins
+        # the per-leg routing (ticket 03).
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.setenv("OPENAI_API_KEY", "codex-tok")
+        monkeypatch.setenv("CC_GLM52_TOKEN", "glm-tok")
+        feature_id, lane_id = _seed_frozen_feature(repo_root, tasks=["TASK-001"])
+        _stage_request_fix_issue(repo_root, feature_id)
+
+        code = main(
+            ["fix-run", feature_id, lane_id, "--dry-run", "--repo-root", str(repo_root)]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert '"implementer": "codex-default"' in out
+        assert '"reviewer": "cc-glm52"' in out
+        assert '"spec_gap_analyst": "cc-glm52"' in out
+
+    def test_fix_run_profile_override_applies_to_all_legs(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # --profile (override) covers the whole fix-run chain: all three legs
+        # resolve to the override, ignoring role_defaults.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "glm-tok")
+        feature_id, lane_id = _seed_frozen_feature(repo_root, tasks=["TASK-001"])
+        _stage_request_fix_issue(repo_root, feature_id)
+
+        code = main(
+            [
+                "fix-run", feature_id, lane_id, "--dry-run",
+                "--profile", "cc-glm52", "--repo-root", str(repo_root),
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert '"implementer": "cc-glm52"' in out
+        assert '"reviewer": "cc-glm52"' in out
+        assert '"spec_gap_analyst": "cc-glm52"' in out
+        assert "codex-default" not in out
