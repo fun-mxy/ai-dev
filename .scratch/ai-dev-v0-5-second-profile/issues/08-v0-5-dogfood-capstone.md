@@ -13,12 +13,12 @@ end-to-end. Update `README.md` status with a v0.5 section.
 
 **Blocked by:** 04, 05, 06, 07.
 
-**Status:** pending
+**Status:** done
 
-- [ ] same intent through `cc-glm52` AND `codex-default` -> two feature-runs, both verdict'd
-- [ ] `compare-profiles` across the two (requirement-coverage quality axis populated)
-- [ ] `project-github` to a real GH issue + PR comment (`--pr` to a human-created PR)
-- [ ] `evidence/08-capstone-real-run.md`: both verdicts, comparison artifact, GH mapping + URLs, token grep
-- [ ] real backend (codex/OpenAI) + real GitHub push - not just fake-claude / mocked-`gh` tests
-- [ ] `README.md` v0.5 status section added
-- [ ] milestone tickets 01-07 all done
+- [x] same intent through `cc-glm52` AND `codex-default` -> two feature-runs, both verdict'd
+- [x] `compare-profiles` across the two (requirement-coverage quality axis populated)
+- [x] `project-github` to a real GH issue + PR comment (`--pr` to a human-created PR)
+- [x] `evidence/08-capstone-real-run.md`: both verdicts, comparison artifact, GH mapping + URLs, token grep
+- [x] real backend (codex/OpenAI) + real GitHub push - not just fake-claude / mocked-`gh` tests
+- [x] `README.md` v0.5 status section added
+- [x] milestone tickets 01-07 all done
