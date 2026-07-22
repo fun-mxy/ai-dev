@@ -32,12 +32,22 @@ claude tests stay green. Tests at the public seam (`run_wrapper` run) for both a
 >   --ephemeral [-m <model>]` (cwd = run_dir, prompt on stdin).
 > See `prototype/codex-spike/FINDINGS.md` + `.scratch/ai-dev-v0-5-second-profile/evidence/01-spike-findings.md`.
 
-**Status:** pending
+**Status:** done (2026-07-22) - AgentRunner dispatch + CodexRunner adapter landed in `run_wrapper`;
+claude path behavior-identical (delegates to the existing module helpers, so the 49 claude tests
+exercise the same code). 22 new codex/registry tests at the `run_wrapper`/`run_headless` seam.
+`uv run mypy` clean (27 files); `uv run pytest` 706 passed. Evidence: commit `361712e`
+(`feat(ai-dev-v0.5): AgentRunner dispatch + CodexRunner adapter (ticket 02)`); tests in
+`tests/test_run_wrapper.py` (`TestRunnerRegistry`, `TestCodexRunHeadless`, `TestCodexEnvSnapshot`).
+Real `codex exec` end-to-end is ticket 04 (this ticket is unit-level by its own checklist).
 
-- [ ] `AgentRunner` interface + registry keyed by `profile.cli` (D1)
-- [ ] `ClaudeRunner` extracted from current `run_wrapper` (behavior-identical; existing tests green)
-- [ ] `CodexRunner`: `codex exec`, `--remote-auth-token-env <auth_env>`, `-s workspace-write`, `-m` if model set, cwd=workspace (D2/D3/D4)
-- [ ] thin adapter: reuses role prompts, no output translation (D5)
-- [ ] dispatch on `cli` not `backend` (D2)
-- [ ] unit tests for both adapters at the `run_wrapper` seam
-- [ ] `uv run mypy` + `uv run pytest` green
+- [x] `AgentRunner` interface + registry keyed by `profile.cli` (D1)
+- [x] `ClaudeRunner` extracted from current `run_wrapper` (behavior-identical; existing tests green)
+- [x] `CodexRunner`: `codex exec`, `-s workspace-write`, `-m` if model set — **implemented per the
+      amended D3/D4** in the spike-findings block above, NOT the literal checklist text: no
+      `--remote-auth-token-env` (codex exec rejects it; OPENAI_API_KEY injected into child env
+      instead), `cwd = run_dir` (not `workspace/`), plus `--ephemeral`/`--skip-git-repo-check`/
+      `--color never`, prompt on stdin (`codex exec -`) (D2/D3/D4)
+- [x] thin adapter: reuses role prompts, no output translation (D5)
+- [x] dispatch on `cli` not `backend` (D2) — `cc-minimaxm3` (cli:claude) -> `ClaudeRunner`
+- [x] unit tests for both adapters at the `run_wrapper` seam
+- [x] `uv run mypy` + `uv run pytest` green
