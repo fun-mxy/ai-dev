@@ -15,13 +15,13 @@ rejected alternative; record why: a req->file map doesn't exist, ACs aren't exec
 **Blocked by:** none - independent (implementer prompt + §14 + `final_report`; profile-agnostic).
 Ideally lands before 04 so 04 evidences populated Q2/Q3.
 
-**Status:** pending
+**Status:** done
 
-- [ ] implementer prompt requires `related_requirements`/`related_acceptance_criteria`
-- [ ] §14 well-formedness check: present + real REQ/AC ids; fail if missing/malformed (D2)
-- [ ] `final_report` Q2/Q3 populate from declarations (existing compute; verify) (D1)
-- [ ] Spec Gap Analyst cross-check unchanged (D3)
-- [ ] `known_gaps` Q2/Q3 note retires on declaring runs
-- [ ] no orchestrator inference (D4 - rejected alternative, documented)
-- [ ] tests: declaring run -> populated Q2/Q3; non-declaring -> §14 fail
-- [ ] `uv run mypy` + `uv run pytest` green
+- [x] implementer prompt requires `related_requirements`/`related_acceptance_criteria`
+- [x] §14 well-formedness check: present + real REQ/AC ids; fail if missing/malformed (D2)
+- [x] `final_report` Q2/Q3 populate from declarations (existing compute; verify) (D1)
+- [x] Spec Gap Analyst cross-check unchanged (D3)
+- [x] `known_gaps` Q2/Q3 note retires on declaring runs
+- [x] no orchestrator inference (D4 - rejected alternative, documented)
+- [x] tests: declaring run -> populated Q2/Q3; non-declaring -> §14 fail
+- [x] `uv run mypy` + `uv run pytest` green

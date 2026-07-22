@@ -750,11 +750,21 @@ def _final_report_json(
             "traceability index is empty (v0.3 collects changed_files per run; "
             "an empty index means none were captured for this feature run)"
         )
-    if acceptance_verification:
+    # ADR-0007: Q3 coverage is implementer self-attestation, cross-checked by
+    # the Spec Gap Analyst. When at least one AC was declared (verified), the
+    # section is genuinely populated and the old "no AC->test index" caveat
+    # retires. The caveat now surfaces only when the section is non-empty yet
+    # *nothing* was declared - i.e. every AC reads NOT verified because no run
+    # owned up to it.
+    acceptance_declared = any(
+        row.get("evidence_runs") for row in acceptance_verification
+    )
+    if acceptance_verification and not acceptance_declared:
         known_gaps.append(
-            "acceptance_verification: v0.3 has no AC->test traceability index; "
-            "verification evidence is run-declared (related_acceptance_criteria), "
-            "not a mapped test"
+            "acceptance_verification: no implementer run declared these "
+            "acceptance criteria in related_acceptance_criteria; coverage is "
+            "self-attested (ADR-0007) and the Spec Gap Analyst cross-checks "
+            "honesty"
         )
 
     report: dict[str, Any] = {

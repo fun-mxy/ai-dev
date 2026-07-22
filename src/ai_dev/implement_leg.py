@@ -8,7 +8,7 @@ are *frozen* (§4.2), it:
    allowed-files read from ``04-lane-graph.yml``'s expected/exclusive files for
    the lane - by *reusing* the v0.1 ``prepare_run`` (no new run mechanism);
 2. runs it headless via the v0.1 ``run_headless`` and validates it with the v0.1
-   ``validate_run`` (the §14 three checks);
+   ``validate_run`` (the §14 checks, including §14.4 traceability);
 3. writes the run's ``result.json`` task status back to canonical
    ``task-status.yml`` as ``proposed_done`` - via the deterministic
    ``mark_task_proposed_done`` writer, never the model (§4.3);
@@ -71,6 +71,30 @@ _IMPLEMENTER_ROLE = "Implementer"
 # The §9.2/§13.1 result status that triggers the proposed_done writeback. Any
 # other status (``failed``) leaves canonical task status untouched.
 _PROPOSED_DONE = "proposed_done"
+
+# ADR-0007 D2: the implementer is *required* to declare which REQs/ACs the run
+# addressed, so final-report Q2 (requirement_coverage) / Q3
+# (acceptance_verification) populate from the declaration and §14.4 validates
+# it. Appended to the frozen task text (not written into the frozen artifact) so
+# the requirement reaches the implementer prompt without mutating 03-tasks.md.
+# Partial-scope is honoured: the lane declares only its own subset, not every
+# requirement - an honest ``[]`` is allowed when the lane addressed none.
+_TRACEABILITY_INSTRUCTION = (
+    "\n\n## Requirement / Acceptance-Criteria Traceability (MANDATORY)\n"
+    "\n"
+    "In `output/result.json` you MUST declare the requirements and acceptance "
+    "criteria this run addressed, using the exact REQ-NNN / AC-NNN ids from "
+    "`../01-requirements.json` (read it for the real ids):\n"
+    "\n"
+    '- `"related_requirements"`: the REQ-NNN ids this run actually addressed.\n'
+    '- `"related_acceptance_criteria"`: the AC-NNN ids this run satisfied.\n'
+    "\n"
+    "Declare only what this lane addressed - a partial-scope lane declares its "
+    "own subset (e.g. `[\"REQ-001\"]`), not every requirement. Declare `[]` only "
+    "if this run genuinely addressed none. This is validated (spec §14.4): the "
+    "run FAILS if the fields are missing or reference ids that do not exist in "
+    "`../01-requirements.json`."
+)
 
 
 @dataclass(frozen=True)
@@ -289,6 +313,10 @@ def build_implementer_input_package(
             "freeze them at the task gate first"
         )
     task_text = read_task_text(feature_root)
+    # ADR-0007 D2: the implementer must declare its addressed REQs/ACs. The
+    # instruction is appended to the (frozen) task text so it reaches the
+    # implementer prompt without modifying the frozen 03-tasks.md artifact.
+    task_text = f"{task_text}{_TRACEABILITY_INSTRUCTION}"
     if task_context_append is not None and task_context_append.strip():
         task_text = f"{task_text}\n\n{task_context_append.strip()}"
     lane = read_lane_entry(feature_root, lane_id)
@@ -525,7 +553,8 @@ def run_implementer_leg(
 
     Composes the v0.1 seams unchanged: ``build_implementer_input_package`` (which
     reuses ``prepare_run``), ``run_headless`` (env isolation + capture), and
-    ``validate_run`` (the §14 three checks). The §9.2 limits fall out of this
+    ``validate_run`` (the §14 checks, including the §14.4 traceability
+    declaration this leg's prompt now requires). The §9.2 limits fall out of this
     composition: the boundary is the existing ``validate-run`` (reused, not
     rebuilt), and the ``proposed_done`` writeback is *gated on a passing
     validation* - a boundary-breaching or schema-invalid run never reaches

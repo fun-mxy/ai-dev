@@ -25,6 +25,7 @@ from ai_dev.final_report import (
     FinalReportResult,
     generate_final_report,
 )
+from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON
 from ai_dev.json_artifact import write_json
 from ai_dev.templates import REQUIREMENTS_JSON
 from ai_dev.triage import REQUEST_CHANGE_PROPOSAL, apply_triage
@@ -152,9 +153,39 @@ class TestPassReportSections:
         assert ver[0]["verified"] is True
         assert ver[0]["evidence_runs"] == ["RUN-001"]
         assert ver[0]["lane_verification"] == "pass"
-        # AC->test traceability is a known v0.3 limitation once the section is
-        # non-empty (D5 constraint 3's sibling discipline).
-        assert any("acceptance_verification" in g for g in report["meta"]["known_gaps"])
+        # ADR-0007: when the implementer declared the AC (verified=True with
+        # evidence), the old "no AC->test traceability index" known-gap retires
+        # - the section is genuinely populated from the self-attested declaration.
+        assert not any(
+            "acceptance_verification" in g for g in report["meta"]["known_gaps"]
+        )
+
+    def test_acceptance_gap_note_when_nothing_declared(self, repo_root: Path) -> None:
+        # ADR-0007: when no run declared the AC (verified=False across the board)
+        # the Q3 section is non-empty but uncovered -> the known-gap note stays.
+        feature_id, lane_id = _stage_coherence_inputs(repo_root)
+        _seed_requirements(repo_root, feature_id)
+        # Rewrite the implement-result to drop the AC declaration so AC-001 reads
+        # NOT verified, then regenerate.
+        impl_path = (
+            _feature_root(repo_root, feature_id)
+            / "lanes"
+            / lane_id
+            / IMPLEMENT_RESULT_JSON
+        )
+        impl = json.loads(impl_path.read_text())
+        impl["related_acceptance_criteria"] = []
+        write_json(impl_path, impl)
+        evaluate_coherence_gate(repo_root, feature_id)
+
+        report = _generate(repo_root, feature_id)
+
+        ver = report["acceptance_verification"]
+        assert ver[0]["verified"] is False
+        assert ver[0]["evidence_runs"] == []
+        assert any(
+            "acceptance_verification" in g for g in report["meta"]["known_gaps"]
+        )
 
     def test_agent_timeline_records_profile_role_and_times(self, repo_root: Path) -> None:
         feature_id, _lane_id = _stage_coherence_inputs(repo_root)
