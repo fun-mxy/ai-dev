@@ -13,12 +13,14 @@ is NOT done on the fake-codex test alone.**
 
 **Blocked by:** 02, 03.
 
-**Status:** pending
+**Status:** done
 
-- [ ] full happy path on real `codex-default` -> `verdict=pass` / `status=done`
-- [ ] `--dry-run` pre-flighted the chain (no spawn / no state change) before the real spend
-- [ ] `list-features` / `show-status` / `log` observed gate-by-gate advance
-- [ ] token never persisted (`grep -rlF` -> 0 matches; env-snapshot redacted)
-- [ ] IDs continuous (RUN/LANE/ISSUE); no re-issue / mis-scope
-- [ ] `evidence/04-codex-real-run.md` captured
-- [ ] deterministic fake-codex e2e test locks the seam in CI
+- [x] full happy path on real `codex-default` -> `verdict=pass` / `status=done`
+- [x] `--dry-run` pre-flighted the chain (no spawn / no state change) before the real spend
+- [x] `list-features` / `show-status` / `log` observed gate-by-gate advance
+- [x] token never persisted (`grep -rlF` -> 0 matches; env-snapshot redacted)
+- [x] IDs continuous (RUN/LANE/ISSUE); no re-issue / mis-scope
+- [x] `evidence/04-codex-real-run.md` captured
+- [x] deterministic fake-codex e2e test locks the seam in CI
+      (`tests/test_e2e_integration.py::TestV05CodexMultiCliE2E`; real-run evidence of record:
+      `evidence/04-codex-real-run.md`)

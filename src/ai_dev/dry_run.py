@@ -78,8 +78,9 @@ from ai_dev.run_prepare import (
 from ai_dev.run_wrapper import (
     DEFAULT_MAX_TURNS,
     DEFAULT_PERMISSION_MODE,
-    build_cli_flags,
+    Invocation,
     build_prompt,
+    get_runner,
 )
 from ai_dev.status import (
     FROZEN_ARTIFACTS,
@@ -142,26 +143,35 @@ def _build_invocation(
     run_root: Path,
     max_turns: int,
     permission_mode: str,
-) -> list[str]:
-    """Build the exact ``claude -p`` argv a real run would spawn (§11.1).
+) -> Invocation:
+    """Build the exact argv (+ stdin) a real run would spawn (§11.1), per ``cli``.
 
-    Reuses ``build_prompt`` + ``build_cli_flags`` verbatim, against the would-be
-    run root (the temp dir for prepare-style commands, the real run dir for
-    ``run-headless``). The binary is the profile-declared ``cli`` name — the
-    wrapper's ``shutil.which`` resolution is the spawn-time concern, not the
-    plan's.
+    Dispatches through ``get_runner`` (ADR-0005 D1) so each adapter owns its
+    invocation shape: claude gets ``-p <prompt>`` (prompt in argv) and codex gets
+    ``exec -`` (prompt on stdin, ``-s workspace-write`` sandbox). The binary is
+    the profile-declared ``cli`` *name* — the wrapper's ``shutil.which`` resolution
+    is the spawn-time concern, not the plan's (a dry-run must not require the
+    binary on ``PATH``).
 
-    The ``--settings`` flag references the would-be ``.run-settings.json`` path
-    (the path a real spawn writes, ``run_wrapper._RUN_SETTINGS``) — but the file
-    is **not** materialised. Dry-run writes nothing (glossary pin ``dry-run``),
-    so for ``run-headless`` (whose run root is the *real* ``runs/RUN-NNN/``) the
-    feature tree stays byte-for-byte unchanged. The argv is still faithful: the
-    path is what the spawn would pass.
+    ``run_wrapper`` builds the prompt verbatim (``build_prompt``); the adapter's
+    ``build_invocation`` wires it into the per-CLI argv. The claude ``--settings``
+    flag references the would-be ``.run-settings.json`` path (the path a real
+    spawn writes, ``run_wrapper._RUN_SETTINGS``) — the file is **not** materialised.
+    Dry-run writes nothing (glossary pin ``dry-run``), so for ``run-headless``
+    (whose run root is the *real* ``runs/RUN-NNN/``) the feature tree stays
+    byte-for-byte unchanged. The argv is still faithful: the path is what the
+    spawn would pass.
     """
-    settings_path = run_root / OUTPUT_DIR / ".run-settings.json"
     prompt = build_prompt(run_id, run_root)
-    flags = build_cli_flags(settings_path, max_turns, permission_mode)
-    return [profile.cli, "-p", prompt, *flags]
+    runner = get_runner(profile)
+    return runner.build_invocation(
+        profile=profile,
+        output_dir=run_root / OUTPUT_DIR,
+        binary=profile.cli,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        prompt=prompt,
+    )
 
 
 def _env_target_names(profile: AgentProfile) -> dict[str, str | None]:
@@ -177,10 +187,18 @@ def _env_target_names(profile: AgentProfile) -> dict[str, str | None]:
     }
 
 
-def _require_token_source(profile: AgentProfile) -> str:
-    """§24.2: the token source name must be set before a run can be planned."""
+def _require_token_source(profile: AgentProfile) -> str | None:
+    """§24.2: the token source name must be set before a run can be planned.
+
+    A token-required adapter (claude - ``ClaudeRunner.token_required``) fails loud
+    when the source is unset: it has no non-env auth path. A codex profile
+    (``token_required=False``) may proceed without an env token via codex's native
+    stored ``~/.codex/auth.json`` (ADR-0005 D3 amended), so its source may be
+    ``None`` - the plan reports ``token_source: None`` and the run spawns anyway.
+    Either way the value is never read (§10.2): only the name is resolved.
+    """
     source = token_source_var(profile)
-    if source is None:
+    if source is None and get_runner(profile).token_required:
         raise ValueError(
             f"token source not set for profile {profile.name!r} "
             f"({profile.token_source_description()} is unset); set it before "
@@ -207,7 +225,11 @@ def _agent_invocation_details(
         "env_target_names": _env_target_names(profile),
         "max_turns": max_turns,
         "permission_mode": permission_mode,
-        "invocation": invocation,
+        "invocation": invocation.argv,
+        # claude rides the prompt in argv (``-p <prompt>``); codex pipes it on
+        # stdin (``exec -``), so the argv carries no prompt - flag the difference
+        # so the plan is faithful about where the prompt goes (ADR-0005 D1).
+        "prompt_on_stdin": invocation.stdin is not None,
         "would_spawn": True,
         "would_write_run_outputs": _WRAPPER_OUTPUTS,
     }

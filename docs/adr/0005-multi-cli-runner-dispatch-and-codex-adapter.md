@@ -74,15 +74,17 @@ contract every other profile obeys.
 >   `OPENAI_API_KEY` from the child env **directly**. The adapter satisfies
 >   `auth_env: OPENAI_API_KEY` by injecting the token value into that env var - the same
 >   env-injection pattern the claude adapter uses for `ANTHROPIC_AUTH_TOKEN`. No flag.
->   **This path is inferred from codex's documented behavior, NOT exercised by the spike**
->   (`OPENAI_API_KEY` was unset in the dev env; `run.sh` never injected it) - ticket 04's
->   real OpenAI-provider end-to-end must confirm it.
+>   **This path is inferred from codex's documented behavior, NOT exercised** - neither the
+>   spike nor ticket 04's real e2e had a real `api.openai.com` key (`OPENAI_API_KEY` was unset
+>   in both). Ticket 04's real capstone ran on the **stored-cred custom-provider path** (below)
+>   and reached `verdict=pass`; the OpenAI env-injection path is unit-covered
+>   (`TestCodexEnvSnapshot`) and remains **inferred, pending a real `api.openai.com` key**.
 > - **Custom provider** (this dev env's `crs`, `requires_openai_auth = true`): codex uses
 >   the stored `~/.codex/auth.json` credential from `codex login --with-api-key`. This is
 >   the auth model the original "Rejected" paragraph dismissed - but it is codex's native
->   non-interactive path for custom providers, and **this is the path both spike runs used**
->   (they succeeded with `OPENAI_API_KEY` unset). Ticket 03 decides the profile's provider;
->   ticket 04 wires real auth.
+>   non-interactive path for custom providers, and **this is the path both spike runs and
+>   ticket 04's real e2e used** (ticket 04 reached `verdict=pass` with `OPENAI_API_KEY` unset).
+>   Ticket 03 decides the profile's provider; ticket 04 closed the real stored-cred run.
 >
 > Either way, **`--remote-auth-token-env` is not in the `codex exec` argv.** Invariant #11
 > holds: the OpenAI path injects by name (like claude); the stored-cred path carries no
@@ -199,3 +201,11 @@ a codex-specific prompt variant) and this ADR amended.
     (D3's stored-cred vs env-var) - the spike exercised only the stored-cred (`crs`)
     path; the OpenAI env-injection path is inferred, pending ticket 04's real
     end-to-end.
+  - **Update (ticket 04, 2026-07-22):** the real codex capstone **has run** - the full
+    happy path on `codex-default` reached `verdict=pass` / `status=done`
+    (`evidence/04-codex-real-run.md`). It exercised the **stored-cred `crs` path** (path b)
+    end-to-end across all three agent roles (Implementer, Code Reviewer, Spec Gap Analyst -
+    D5 holds for all three). The **OpenAI env-injection path** (path a) is **still
+    inferred**: this env has no real `api.openai.com` key, so ticket 04 could not exercise
+    it (unit-covered by `TestCodexEnvSnapshot`). Path (a) awaits a real OpenAI key to close;
+    until then D3 path (a) remains inferred, path (b) is proven.

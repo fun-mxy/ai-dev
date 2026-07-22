@@ -1077,6 +1077,32 @@ class TestCliRoleDefaultsResolution:
         assert "profile: cc-glm52" in out
         assert "codex-default" not in out
 
+    def test_implement_codex_no_token_source_proceeds(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # codex is token-not-required (ADR-0005 D3 amended): with OPENAI_API_KEY
+        # unset the dry-run plan still succeeds on the stored-cred path (b) - it
+        # does NOT refuse with "token source not set". Locks the dry_run.py
+        # _require_token_source None-branch fix (ticket 04); the sibling test
+        # above sets OPENAI_API_KEY=codex-tok and so never exercises this branch.
+        write_profiles(repo_root, ROLE_DEFAULTS_YAML)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        feature_id, lane_id = _seed_frozen_feature(repo_root)
+
+        code = main(
+            ["implement", feature_id, lane_id, "--dry-run", "--repo-root", str(repo_root)]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "profile: codex-default" in out
+        assert "token source not set" not in out
+
     def test_no_role_defaults_no_profile_exits_1_with_hint(
         self,
         repo_root: Path,
