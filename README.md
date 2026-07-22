@@ -37,6 +37,21 @@ v0.4 — polish and dogfood (§26.5) complete: actionable error messages + top-l
 example target repo (ticket 05), pytest-cov 91% baseline (ticket 06), and a dogfood happy-path
 end-to-end run on `examples/string-utils/` reaching verdict=pass on real cc-glm52/Ark (ticket 07).
 
+v0.5 — second Agent Profile + multi-CLI (§26.6 / §27.1) complete: a codex-exec spike + the
+`CodexRunner` adapter dispatching on `cli: codex` (ticket 02, ADR-0005), a second profile
+`codex-default` + the `role -> profile` `role_defaults` policy (ticket 03), §14.4 traceability
+declaration closing the v0.4 Q2/Q3 gap so `final_report` requirement/acceptance coverage now
+populates from real implementer declarations (ticket 05, ADR-0007), a read-only
+`compare-profiles` projection side-by-side across two parallel feature-runs (ticket 06), and a
+`project-github` projection pushing canonical issues → GitHub + the final-report as a PR comment
+(ticket 07, ADR-0006). The milestone closes with a dogfood capstone (ticket 08): the **same
+intent** run through **both** `cc-glm52` (Ark/glm-5.2) **and** `codex-default` (codex/OpenAI) —
+two full pipelines, both reaching `verdict=pass` — then compared, then projected to **real**
+GitHub issues + a PR comment. The capstone surfaced and fixed a real ticket-07 seam bug (the
+PR-comment edit path built an argv real `gh` rejects; the mocked-`gh` test couldn't catch it).
+Evidence of record: `.scratch/ai-dev-v0-5-second-profile/evidence/` (the genuine backend +
+real-GitHub proof, not the fake-claude / mocked-`gh` tests).
+
 ## Test coverage
 
 `uv run pytest` reports line + branch coverage of `ai_dev` (via `pytest-cov`, configured in

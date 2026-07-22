@@ -544,8 +544,14 @@ def _push_pr_comment(
     """Post or update the final-report PR comment (D1/D2).
 
     First projection (no stored comment id) -> ``gh pr comment`` (create; parse
-    + store the id). Re-projection -> ``gh pr comment --edit <id>`` (update in
-    place). Either way the comment body is the re-computed final-report, so the
+    + store the id). Re-projection -> ``gh api`` PATCH on the stored comment id
+    (update in place). ``gh pr comment`` has no edit-by-id flag (its ``--edit``
+    / ``--edit-last`` flags take no id and edit only the authed user's *last*
+    comment, which is ambiguous once a human comments), so an id-resolved edit
+    goes through the REST endpoint ``issues/comments/<id>`` (PR conversation
+    comments are issue comments in the REST API). ``{owner}/{repo}`` is resolved
+    by ``gh`` from the repo's git remote (the projection runs from the repo
+    root). Either way the comment body is the re-computed final-report, so the
     projection tracks ``final-report`` (ADR-0003: re-computable).
     """
     marker = _PROJECTION_MARKER.format(feature=feature_id)
@@ -554,9 +560,9 @@ def _push_pr_comment(
     if isinstance(comment_id, int) and not isinstance(comment_id, bool):
         _run_or_raise(
             gh_runner,
-            ["pr", "comment", str(pr_number), "--edit", str(comment_id),
-             "--body", full_body],
-            f"gh pr comment edit #{pr_number}/{comment_id}",
+            ["api", f"repos/{{owner}}/{{repo}}/issues/comments/{comment_id}",
+             "--method", "PATCH", "-f", f"body={full_body}"],
+            f"gh api issues/comments/{comment_id} edit #{pr_number}",
         )
         return "updated"
     result = _run_or_raise(

@@ -40,8 +40,8 @@ class FakeGh:
     * ``pr view <N>`` -> ok (the PR "exists") unless ``pr_missing``.
     * ``issue create`` -> ok, returns a URL with the next monotonic number.
     * ``issue edit <N>`` -> ok unless that number is in ``fail_edit``.
-    * ``pr comment <PR>`` / ``pr comment <PR> --edit <id>`` -> ok, returns a
-      comment URL (create) or empty (edit).
+    * ``pr comment <PR>`` -> ok, returns a comment URL (create);
+      ``api repos/{owner}/{repo}/issues/comments/<id>`` -> ok (edit in place).
 
     ``fail_create_on`` halts after the Nth create (mid-stream failure test):
     the issue is *not* recorded as pushed and its mapping entry is not written.
@@ -93,12 +93,14 @@ class FakeGh:
                 return GhResult(1, "", f"edit #{number} failed")
             return GhResult(0, "", "")
         if head == "pr" and len(argv) > 1 and argv[1] == "comment":
-            if "--edit" in argv:
-                return GhResult(0, "", "")
             cid = self._next_comment
             self._next_comment += 1
             url = f"https://github.com/owner/repo/pull/{argv[2]}#issuecomment-{cid}"
             return GhResult(0, url, "")
+        if head == "api" and len(argv) > 1 and argv[1].startswith(
+            "repos/{owner}/{repo}/issues/comments/"
+        ):
+            return GhResult(0, "", "")
         return GhResult(1, "", f"unexpected gh argv: {argv}")
 
 
@@ -228,9 +230,7 @@ def test_with_pr_posts_comment_and_stores_pr(repo_root: Path) -> None:
     assert mapping["pr_number"] == 42
     assert mapping["pr_comment_id"] == 9001
     # The comment body carries the final-report + the projection marker.
-    comment_call = next(
-        c for c in gh.calls if c[:2] == ["pr", "comment"] and "--edit" not in c
-    )
+    comment_call = next(c for c in gh.calls if c[:2] == ["pr", "comment"])
     body = comment_call[comment_call.index("--body") + 1]
     assert "Final Report" in body
     assert f"feature={feature_id}" in body
@@ -245,10 +245,20 @@ def test_with_pr_re_run_updates_comment_in_place(repo_root: Path) -> None:
     result = project_github(repo_root, feature_id, pr_number=42, gh_runner=gh2, gh_available=lambda: True)
 
     assert result.pr_comment_action == "updated"
-    # Second run edits the stored comment id (no new comment created).
-    edit_call = next(c for c in gh2.calls if c[:2] == ["pr", "comment"] and "--edit" in c)
-    assert "--edit" in edit_call
-    assert "9001" in edit_call
+    # Second run PATCHes the stored comment id via gh api (no new comment created).
+    edit_call = next(
+        c for c in gh2.calls
+        if c[:1] == ["api"] and "/issues/comments/" in c[1]
+    )
+    assert edit_call[1].endswith("/issues/comments/9001")
+    assert "--method" in edit_call and "PATCH" in edit_call
+    # The PATCH carries the re-computed final-report body (ADR-0003: re-computable
+    # tracking holds on update, not just create) — guards against the body field
+    # being silently dropped from the edit argv.
+    body_field = edit_call[edit_call.index("-f") + 1]
+    assert body_field.startswith("body=")
+    assert "Final Report" in body_field
+    assert f"feature={feature_id}" in body_field
 
 
 def test_pr_without_final_report_fails_loud(repo_root: Path) -> None:
