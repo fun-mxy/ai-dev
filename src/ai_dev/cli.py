@@ -138,6 +138,7 @@ from ai_dev.dry_run import (
     plan_final_report,
     plan_fix_run,
     plan_freeze,
+    plan_project_github,
     plan_implement,
     plan_lane_gate,
     plan_review,
@@ -149,6 +150,10 @@ from ai_dev.dry_run import (
 from ai_dev.feature_run import create_feature_run
 from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
+from ai_dev.github_projection import (
+    GithubProjectionResult,
+    project_github,
+)
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
@@ -766,6 +771,32 @@ def _build_parser() -> argparse.ArgumentParser:
              "feature-run whose implementer used it.",
     )
 
+    # v0.5 ticket 07 / ADR-0006: the basic GitHub projection — push canonical
+    # ISSUE-NNN -> GitHub issues (gh create/edit) + post/update final-report as a
+    # PR comment. Network-bound + writes projections/github/mapping.json (the
+    # first non-deterministic canonical write). One-way (invariant #10); token by
+    # env-var name (invariant #11).
+    project_github_cmd = subparsers.add_parser(
+        "project-github",
+        help="Push canonical issues to GitHub issues + post the final-report as "
+        "a PR comment (v0.5 ticket 07, ADR-0006). Network-bound; idempotent via "
+        "projections/github/mapping.json.",
+        parents=[repo_root_parent],
+    )
+    project_github_cmd.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical issues/ + final-report to project.",
+    )
+    project_github_cmd.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="A PR number to comment the final-report on (ADR-0006 D3). Stored "
+        "as feature -> PR on first projection; without it projection is "
+        "issues-only. The orchestrator never creates the PR — a human does.",
+    )
+
     # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
     # rather than repeating the add_argument per command. Read-only commands are
     # excluded (a dry-run flag on a command with no side effects is noise).
@@ -794,6 +825,7 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "final-report",
         "lane-gate",
         "compare-profiles",
+        "project-github",
     }
 )
 
@@ -1298,6 +1330,45 @@ def _run_compare_profiles(
     return 0
 
 
+def _run_project_github(
+    repo_root: Path, feature_id: str, pr_number: int | None
+) -> int:
+    """``project-github``: push issues + PR comment to GitHub (v0.5 ticket 07).
+
+    Delegates to ``project_github`` (preflight -> per-issue gh create/edit ->
+    optional PR comment, all idempotent via ``projections/github/mapping.json``).
+    Returns ``0`` on a complete projection, ``1`` on a pre-flight failure or a
+    mid-stream push failure (D4: successes + their mapping entries are kept
+    either way; re-running resumes from the mapping). A missing feature run is a
+    fail-loud §24.2 precondition surfaced as a clean ``error:`` line.
+    """
+    try:
+        result: GithubProjectionResult = project_github(
+            repo_root, feature_id, pr_number
+        )
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    if result.failure_reason is not None:
+        _render_error(
+            ValueError(result.failure_reason),
+            hint=(
+                "re-run `ai-dev project-github` to resume from the mapping "
+                "(already-pushed items are edited, not re-created)"
+            ),
+        )
+        return 1
+    created = [i.issue_id for i in result.issues if i.action == "created"]
+    updated = [i.issue_id for i in result.issues if i.action == "updated"]
+    pr = f" pr={result.pr_number} comment={result.pr_comment_action}" if result.pr_number else ""
+    print(
+        f"PROJECT-GITHUB - feature={result.feature_id} "
+        f"issues_created={created} issues_updated={updated}{pr} "
+        f"mapping={result.mapping_path}"
+    )
+    return 0
+
+
 def _run_fix_run(
     repo_root: Path,
     feature_id: str,
@@ -1776,6 +1847,17 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             )
         return _run_compare_profiles(
             Path(args.repo_root), args.feature_id, profile_names, args.json
+        )
+
+    if args.command == "project-github":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_project_github(
+                    Path(args.repo_root), args.feature_id, args.pr
+                )
+            )
+        return _run_project_github(
+            Path(args.repo_root), args.feature_id, args.pr
         )
 
     if args.command == "fix-run":

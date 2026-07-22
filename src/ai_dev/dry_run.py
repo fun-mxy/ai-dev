@@ -33,6 +33,7 @@ refused" is a successful answer to "what would happen?".
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,10 @@ from ai_dev.checking_legs import (
 from ai_dev.coherence_gate import COHERENCE_DECISION_JSON, compute_coherence
 from ai_dev.final_report import FINAL_REPORT_JSON, FINAL_REPORT_MD, compute_final_report
 from ai_dev.fix_run import _current_request_fix_targets
+from ai_dev.github_projection import (
+    GITHUB_TOKEN_ENV,
+    compute_github_plan,
+)
 from ai_dev.implement_leg import (
     _IMPLEMENTER_ROLE,
     lane_allowed_files,
@@ -854,6 +859,92 @@ def plan_compare_profiles(
         ),
         details=details,
     )
+
+
+def plan_project_github(
+    repo_root: Path, feature_id: str, pr_number: int | None
+) -> DryRunPlan:
+    """Plan a ``project-github``: non-network preflight + plan, no push (ADR-0006).
+
+    Runs the *non-network* preconditions the operator can fix without touching
+    GitHub (feature exists, ``GITHUB_TOKEN`` env name set, ``gh`` on ``PATH``)
+    and reports what the run would push — which issues would be *created* vs
+    *edited* (read from the mapping), whether the PR comment would post, and the
+    mapping it would write. The *network* pre-flight (rate-limit probe, PR
+    existence) and the pushes themselves are the expensive/irreversible steps
+    dry-run skips, so they are listed as ``would_run`` rather than executed.
+    """
+    # The pure seam: create-vs-edit split + effective PR (read from the mapping),
+    # so the dry-run faithfully previews D2 idempotency (already-pushed issues
+    # show as edits, not creates). Raises ValueError on a missing feature or a
+    # corrupt mapping (fail loud, §24.2) -> surfaced as a clean error: + exit 1.
+    plan = compute_github_plan(repo_root, feature_id, pr_number)
+    # Non-network preflight (ADR-0004: skip the network steps).
+    token_set = os.environ.get(GITHUB_TOKEN_ENV) not in (None, "")
+    gh_on_path = _which_gh()
+    preflight_ok = token_set and gh_on_path
+    has_pr = plan.pr_number is not None
+    would_write = [
+        "projections/github/mapping.json "
+        "(ISSUE-NNN -> GH number; feature -> PR; non-deterministic canonical write)",
+    ]
+    if has_pr:
+        would_write.append("PR comment (final-report.md) — create or update")
+    details: dict[str, Any] = {
+        "pr_number": plan.pr_number,
+        "issues_total": plan.issues_total,
+        "would_create": plan.would_create,
+        "would_edit": plan.would_edit,
+        "has_pr_comment": has_pr,
+        "github_token_set": token_set,
+        "gh_on_path": gh_on_path,
+        "preflight_non_network_ok": preflight_ok,
+        "would_run": [
+            "preflight: GITHUB_TOKEN set, gh on PATH, rate-limit probe, "
+            "PR exists (if --pr) — note: PR existence is a network check this "
+            "dry-run does NOT perform; a bad --pr surfaces only on the real run",
+            "gh issue create/edit per ISSUE-NNN",
+            "gh pr comment (if --pr)",
+        ],
+        "would_mint_ids": [],
+        "would_write": would_write,
+        "audited": False,
+    }
+    if not preflight_ok:
+        missing = []
+        if not token_set:
+            missing.append(f"{GITHUB_TOKEN_ENV} env var")
+        if not gh_on_path:
+            missing.append("`gh` on PATH")
+        details["would_be_refused"] = True
+        details["refusal_reason"] = (
+            "pre-flight would fail: missing " + " + ".join(missing)
+        )
+        summary = (
+            f"PROJECT-GITHUB DRY-RUN - would be REFUSED: pre-flight missing "
+            + " + ".join(missing)
+        )
+    else:
+        details["would_be_refused"] = False
+        summary = (
+            f"PROJECT-GITHUB DRY-RUN - would push {plan.issues_total} issue(s) "
+            f"({len(plan.would_create)} create, {len(plan.would_edit)} edit; "
+            f"{'with' if has_pr else 'no'} PR comment; no network call)"
+        )
+    return DryRunPlan(
+        command="project-github",
+        feature_id=feature_id,
+        summary=summary,
+        details=details,
+    )
+
+
+def _which_gh() -> bool:
+    """Whether ``gh`` is on ``PATH`` (no spawn). Local so dry_run imports no
+    private name from ``github_projection`` (the compute seam is the boundary)."""
+    from shutil import which
+
+    return which("gh") is not None
 
 
 # ---------------------------------------------------------------------------

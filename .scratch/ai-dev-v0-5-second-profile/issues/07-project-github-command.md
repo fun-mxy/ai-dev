@@ -14,13 +14,13 @@ network side-effect) - document this consequence.
 
 **Blocked by:** none - build + unit-test with mocked `gh`/fixtures; real-GitHub evidence is part of 08.
 
-**Status:** pending
+**Status:** done
 
-- [ ] `project-github` command: `gh issue create`/`edit` + PR comment (D1)
-- [ ] canonical `projections/github/mapping.json` + upsert (D2); idempotent re-run
-- [ ] `--pr N` stored as `feature -> PR`; issues-only without it (D3)
-- [ ] pre-flight + per-item fail-loud; re-run resumes from mapping (D4)
-- [ ] `GITHUB_TOKEN` by env-var name (invariant #11); one-way (invariant #10)
-- [ ] unit tests with mocked `gh` (create / update / pre-flight fail / mid-stream fail + resume)
-- [ ] `mapping.json` recognized as non-deterministic canonical write (documented)
-- [ ] `uv run mypy` + `uv run pytest` green
+- [x] `project-github` command: `gh issue create`/`edit` + PR comment (D1)
+- [x] canonical `projections/github/mapping.json` + upsert (D2); idempotent re-run
+- [x] `--pr N` stored as `feature -> PR`; issues-only without it (D3)
+- [x] pre-flight + per-item fail-loud; re-run resumes from mapping (D4)
+- [x] `GITHUB_TOKEN` by env-var name (invariant #11); one-way (invariant #10)
+- [x] unit tests with mocked `gh` (create / update / pre-flight fail / mid-stream fail + resume)
+- [x] `mapping.json` recognized as non-deterministic canonical write (documented)
+- [x] `uv run mypy` + `uv run pytest` green
