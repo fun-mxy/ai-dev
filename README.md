@@ -31,9 +31,11 @@ apply_triage command + DEC promotion, lane-gate blocking formula, bounded fix-ru
 coherence-gate evaluator (terminal verdict), and final-report generator, with PASS + FAIL end-to-end
 evidence on ark (tickets 01-10).
 
-v0.4 — polish and dogfood (§26.5) in progress: actionable error messages + top-level `--debug`
+v0.4 — polish and dogfood (§26.5) complete: actionable error messages + top-level `--debug`
 (ticket 01), audit `elapsed_ms` + `origin` fields (ticket 02), read-only `list-features` /
-`show-status` / `log` + global `--json` (ticket 03), and `--dry-run` mode (ticket 04 / ADR-0004).
+`show-status` / `log` + global `--json` (ticket 03), `--dry-run` mode (ticket 04 / ADR-0004),
+example target repo (ticket 05), pytest-cov 91% baseline (ticket 06), and a dogfood happy-path
+end-to-end run on `examples/string-utils/` reaching verdict=pass on real cc-glm52/Ark (ticket 07).
 
 ## Test coverage
 
