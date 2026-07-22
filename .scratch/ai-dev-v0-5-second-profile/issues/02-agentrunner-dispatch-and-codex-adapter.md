@@ -13,6 +13,25 @@ claude tests stay green. Tests at the public seam (`run_wrapper` run) for both a
 
 **Blocked by:** 01 (spike confirms codex honors the §13 contract - avoids D5 rework).
 
+> **Spike findings (ticket 01, 2026-07-22) - READ BEFORE IMPLEMENTING:** the spike verified
+> D5 (codex honors the §13 prompt-written contract - no output translation) AND amended two
+> mechanisms in ADR-0005. The `CodexRunner` argv below must follow the **amended** ADR, not
+> the original checklist text:
+> - **D3 amended:** do **NOT** pass `--remote-auth-token-env` - `codex exec` rejects it
+>   (`Error: ... only supported for interactive TUI commands, not codex exec`). For the
+>   OpenAI provider, inject `OPENAI_API_KEY` into the child env (same pattern claude uses
+>   for `ANTHROPIC_AUTH_TOKEN`); for custom providers, codex uses stored `~/.codex/auth.json`.
+> - **D4 amended:** `cwd = run_dir` (the `RUN-NNN` directory), **not** `workspace/`. The
+>   §13 contract needs `output/result.json` at RUN-level; rooting the sandbox at
+>   `workspace/` would block it. `-s workspace-write` confines writes to
+>   `[workdir, /tmp, /tmp]` and both `output/` + `workspace/` are reachable.
+> - **Hygiene:** pass `--ephemeral` (suppress `~/.codex/` session persistence; codex
+>   analogue of claude's `--settings autoMemoryEnabled=false`, §14.2) and `--skip-git-repo-check`
+>   + `--color never` for clean capture. Prompt via stdin (`codex exec -`).
+> - Verified argv shape: `codex exec - -s workspace-write --skip-git-repo-check --color never
+>   --ephemeral [-m <model>]` (cwd = run_dir, prompt on stdin).
+> See `prototype/codex-spike/FINDINGS.md` + `.scratch/ai-dev-v0-5-second-profile/evidence/01-spike-findings.md`.
+
 **Status:** pending
 
 - [ ] `AgentRunner` interface + registry keyed by `profile.cli` (D1)

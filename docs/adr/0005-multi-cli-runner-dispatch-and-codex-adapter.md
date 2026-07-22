@@ -50,7 +50,15 @@ and `auth_env` -> `--remote-auth-token-env`. So dispatch is on `cli`; profile fi
 env/argv uniformly. (This is why `cc-glm52` is `cli: claude` + `backend: glm` - the claude
 CLI talking to a glm backend - and the adapter is oblivious to `backend`.)
 
-### D3 - Codex auth via `--remote-auth-token-env <profile.auth_env>`
+### D3 - Codex auth via `--remote-auth-token-env <profile.auth_env>` ⚠ AMENDED by spike (ticket 01)
+
+> **Spike amendment (2026-07-22, ticket 01):** this decision is **wrong as written**.
+> `codex exec` rejects `--remote-auth-token-env` outright:
+> `Error: --remote-auth-token-env is only supported for interactive TUI commands, not
+> codex exec`. The flag is a **top-level** option naming the env var whose value is sent as
+> a bearer token to a **remote app-server websocket** (`--remote` mode) - it is not
+> OpenAI/crs model-API auth. The original decision text is retained below for audit; the
+> **corrected** mechanism follows it.
 
 The codex adapter passes `--remote-auth-token-env` with the profile's resolved token-source
 var (`auth_env`, falling back to `auth_env_fallback` as today). This honors invariant #11
@@ -61,12 +69,54 @@ var (`auth_env`, falling back to `auth_env_fallback` as today). This honors inva
 credentials in `~/.codex/`, straining invariant #11 and diverging from the env-var-name
 contract every other profile obeys.
 
-### D4 - Codex sandbox = `-s workspace-write`, spawned with `cwd` = run workspace
+> **Corrected mechanism (partially spike-verified):**
+> - **OpenAI provider** (`codex-default`'s declared `backend: openai`): codex reads
+>   `OPENAI_API_KEY` from the child env **directly**. The adapter satisfies
+>   `auth_env: OPENAI_API_KEY` by injecting the token value into that env var - the same
+>   env-injection pattern the claude adapter uses for `ANTHROPIC_AUTH_TOKEN`. No flag.
+>   **This path is inferred from codex's documented behavior, NOT exercised by the spike**
+>   (`OPENAI_API_KEY` was unset in the dev env; `run.sh` never injected it) - ticket 04's
+>   real OpenAI-provider end-to-end must confirm it.
+> - **Custom provider** (this dev env's `crs`, `requires_openai_auth = true`): codex uses
+>   the stored `~/.codex/auth.json` credential from `codex login --with-api-key`. This is
+>   the auth model the original "Rejected" paragraph dismissed - but it is codex's native
+>   non-interactive path for custom providers, and **this is the path both spike runs used**
+>   (they succeeded with `OPENAI_API_KEY` unset). Ticket 03 decides the profile's provider;
+>   ticket 04 wires real auth.
+>
+> Either way, **`--remote-auth-token-env` is not in the `codex exec` argv.** Invariant #11
+> holds: the OpenAI path injects by name (like claude); the stored-cred path carries no
+> token in profile config at all. The "Rejected - `codex login`" paragraph is
+> softened: stored creds are acceptable for custom providers (a different auth model, not a
+> violation of #11 since no token sits in profile config), but the env-var-name path remains
+> preferred for the OpenAI provider.
+
+### D4 - Codex sandbox = `-s workspace-write`, spawned with `cwd` = run dir ⚠ AMENDED by spike (ticket 01)
+
+> **Spike amendment (2026-07-22, ticket 01):** the original "cwd = the run's `workspace/`
+> dir" is **incompatible with the §13 contract** and is corrected to `cwd = run_dir`. The
+> role prompts and `allowed-files.txt` require `output/result.json` / `output/result.md` at
+> RUN-level (siblings of `workspace/`, outside it); a `workspace-write` sandbox rooted at
+> `workspace/` would block those writes. The spike ran with `cwd = run_dir` (matching the
+> claude wrapper) and confirmed both `output/` and `workspace/` are reachable and confined.
+> Original text retained below for audit.
 
 The codex adapter runs `codex exec -s workspace-write` with `cwd` = the run's `workspace/`
 dir. The engine confines model writes to that workspace; the orchestrator's §14.2
 allowed-files gate stays the fine-grained allowlist on top - **defense in depth** (engine
 sandbox = coarse workspace isolation; §14.2 = declared-path allowlist).
+
+> **Corrected mechanism (spike-verified):** `codex exec -s workspace-write` with `cwd =
+> run_dir` (the `RUN-NNN` directory, **not** `workspace/`). The engine confines writes to
+> `[workdir, /tmp, $TMPDIR]` (per the codex stderr banner: `sandbox: workspace-write
+> [workdir, /tmp, $TMPDIR]`); the run dir holds both `output/` and `workspace/`, so the §13
+> outputs and the task files are both writable and both within the §14.2 RUN-dir mtime-diff.
+> The spike confirmed writes are confined to the run dir in **both** a non-git work root and
+> a `git init` work root - codex's `workdir` is the cwd (run dir), **not** the git repo
+> root, so the CodexRunner is safe in a git-tracked target project. Writes to `/tmp` /
+> `$TMPDIR` are out-of-band harness state (same treatment as claude's
+> `~/.claude/projects/` transcript per the §14.2 note) - not in the diff, not a boundary
+> violation.
 
 **Rejected - `--dangerously-bypass-approvals-and-sandbox`** (no engine sandbox, mirroring
 the claude path which has none today): loses codex's defense-in-depth and hands a headless
@@ -89,7 +139,7 @@ role prompts (implementer / reviewer / spec-gap) instruct the agent to write
 couples §14's trust boundary to adapter correctness and creates a second code path the
 gate must reason about. The uniform-contract path keeps one contract, enforced once.
 
-### D6 - Spike-first de-risk
+### D6 - Spike-first de-risk ✅ RESOLVED by spike (ticket 01, 2026-07-22)
 
 The one genuine unknown is whether `codex exec` respects "write `result.json` to
 `workspace/`" vs. insisting on emitting its native diff/patch. Before building the full
@@ -99,6 +149,33 @@ the declared paths. This matches the `prototype/` culture (DEVELOPMENT.md: "giti
 throwaway de-risk artifact"). The adapter is built on the spike's findings; if the spike
 shows codex won't honor the prompt-written contract, D5 is revisited (a thicker adapter or
 a codex-specific prompt variant) and this ADR amended.
+
+> **Spike outcome (ticket 01, 2026-07-22):** **D5 holds - codex honors the §13
+> prompt-written contract.** Two runs (`prototype/codex-spike/runs/RUN-001` non-git,
+> `RUN-002` in-git-repo) reused the slugify implementer input package verbatim; both
+> exited 0 with schema-valid `result.json` (§14.1), all `changed_files` within
+> `allowed-files.txt` (§14.2), `result.md` written, and exit/stdout/stderr captured like
+> claude's. codex writes files via its internal `apply patch` tool **and** emits a native
+> `diff --git` block to stderr; the thin adapter ignores the diff and reads the files (D5).
+> `--output-schema` (codex native structured output) was deliberately not used (§13.3).
+>
+> The spike did force **two mechanism corrections** (neither is D5, which stands):
+> - **D3 amended** - `codex exec` rejects `--remote-auth-token-env` (TUI-only); auth is
+>   env-injection of `OPENAI_API_KEY` (OpenAI provider) or stored `~/.codex/auth.json`
+>   (custom providers).
+> - **D4 amended** - `cwd = run_dir`, not `workspace/` (the latter would block
+>   RUN-level `output/result.json`).
+>
+> Findings: `prototype/codex-spike/FINDINGS.md` (detailed) +
+> `.scratch/ai-dev-v0-5-second-profile/evidence/01-spike-findings.md` (committed summary).
+> The thin-adapter contract is now spike-verified, not just committed; v0.5's real-codex
+> end-to-end (ticket 04, mirroring v0.1/v0.4) remains the milestone capstone that closes
+> the auth-provider uncertainty (D3's stored-cred vs env-var path).
+>
+> **Hygiene note for ticket 02:** codex persists a session to `~/.codex/` (`session id:`
+> in the stderr banner). Pass `--ephemeral` to suppress on-disk session persistence - the
+> codex analogue of the claude path's `--settings autoMemoryEnabled=false` (§14.2).
+> Adapter hygiene, not a contract gate.
 
 ## Consequences
 
@@ -115,3 +192,10 @@ a codex-specific prompt variant) and this ADR amended.
 - The spike (D6) may force a revision of D5; until it runs, the thin-adapter contract is
   the committed direction, not a proven one. v0.5's real-codex end-to-end evidence (the
   milestone capstone, mirroring v0.1/v0.4) is what closes that uncertainty.
+  - **Update (ticket 01, 2026-07-22):** the spike **has run** and confirmed D5 (codex
+    honors the prompt-written §13 contract) while amending D3/D4 (auth is not
+    `--remote-auth-token-env`; cwd is `run_dir` not `workspace/`). The thin-adapter
+    contract is now spike-verified. The remaining uncertainty is the auth *provider* path
+    (D3's stored-cred vs env-var) - the spike exercised only the stored-cred (`crs`)
+    path; the OpenAI env-injection path is inferred, pending ticket 04's real
+    end-to-end.

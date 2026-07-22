@@ -15,10 +15,17 @@ codex-specific prompt variant) - surface that in findings and amend ADR-0005 bef
 
 **Blocked by:** none - start immediately (parallel with 05, 07).
 
-**Status:** pending
+**Status:** done (2026-07-22) - spike PASS; D5 holds; ADR-0005 D3 + D4 amended. Evidence:
+`prototype/codex-spike/FINDINGS.md` (detailed) +
+`.scratch/ai-dev-v0-5-second-profile/evidence/01-spike-findings.md` (committed summary).
 
-- [ ] `codex exec` runs non-interactively on the dogfood target with env-auth (`--remote-auth-token-env`) + `workspace-write`
-- [ ] confirms codex writes `result.json`/`result.md` at declared paths (§13 contract) - OR documents that it won't and proposes the D5 revision
-- [ ] `changed_files` land in `workspace/`; exit/stdout/stderr capturable like claude's
-- [ ] findings recorded (`prototype/` or `evidence/01-spike-findings.md`)
-- [ ] if codex won't honor the contract: amend ADR-0005 D5 before 02 starts
+- [x] `codex exec` runs non-interactively on the dogfood target with `workspace-write`
+      (auth via stored `~/.codex/auth.json` on the `crs` custom-provider path - the path
+      both runs exercised. `--remote-auth-token-env` is rejected by `codex exec`, D3
+      amended. The OpenAI-provider `OPENAI_API_KEY` env-injection path is **inferred, not
+      exercised** here - deferred to ticket 04)
+- [x] confirms codex writes `result.json`/`result.md` at declared paths (§13 contract) -
+      schema-valid, both runs (RUN-001 non-git, RUN-002 in-git-repo); D5 holds, no revision needed
+- [x] `changed_files` land in `workspace/`; exit/stdout/stderr capturable like claude's
+- [x] findings recorded (`prototype/codex-spike/FINDINGS.md` + `evidence/01-spike-findings.md`)
+- [x] ADR-0005 amended before 02 starts (D3 + D4 mechanism corrections; D5 unchanged)
