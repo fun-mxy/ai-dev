@@ -30,8 +30,10 @@ from ai_dev.status import (
     LANE_STATUS_FILE,
     TASK_STATUS_FILE,
     FrozenArtifactError,
+    agent_profiles,
     derive_feature_status,
     freeze_artifact,
+    record_agent_profile,
     record_coherence_verdict,
     set_current_gate,
     write_initial_feature_status,
@@ -106,6 +108,104 @@ class TestWriteInitialFeatureStatus:
         # gone from the file entirely.
         assert "verdict: null" in text
         assert "final_verdict" not in text
+
+    def test_initial_agent_profiles_is_empty_mapping(self, tmp_path: Path) -> None:
+        # v0.5 ticket 06: the role->profile config starts empty (no legs run yet).
+        write_initial_feature_status(tmp_path, "FEATURE-001")
+
+        assert _load(tmp_path)["feature"]["agent_profiles"] == {}
+
+
+class TestRecordAgentProfile:
+    """status.record_agent_profile — the v0.5 ticket-06 feature-level profile record.
+
+    Each agent leg records the profile it ran on into ``feature-status.yml``'s
+    ``agent_profiles`` ``role -> profile`` dict, audited. This is the deterministic
+    record ``compare-profiles`` reads to tell two parallel feature-runs apart.
+    """
+
+    def test_records_role_to_profile_and_audits(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+
+        record_agent_profile(feature_root, "implementer", "codex-default")
+
+        doc = _feature_doc(feature_root)
+        assert doc["feature"]["agent_profiles"] == {"implementer": "codex-default"}
+        # The reader returns the same mapping.
+        assert agent_profiles(feature_root) == {"implementer": "codex-default"}
+        # Audited as a single agent_profile record carrying role + profile.
+        records = _audit_records(feature_root)
+        assert records[-1]["event"] == "agent_profile"
+        assert records[-1]["payload"] == {"role": "implementer", "profile": "codex-default"}
+
+    def test_records_each_role_independently_into_one_dict(self, tmp_path: Path) -> None:
+        # A feature's legs may mix profiles (role_defaults); each role is its own slot.
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+
+        record_agent_profile(feature_root, "implementer", "codex-default")
+        record_agent_profile(feature_root, "reviewer", "cc-glm52")
+        record_agent_profile(feature_root, "spec_gap_analyst", "cc-glm52")
+
+        assert agent_profiles(feature_root) == {
+            "implementer": "codex-default",
+            "reviewer": "cc-glm52",
+            "spec_gap_analyst": "cc-glm52",
+        }
+
+    def test_rerun_same_profile_is_idempotent_in_value(self, tmp_path: Path) -> None:
+        # Re-running a leg (e.g. fix loop re-implement) re-audits but leaves the
+        # slot at the same value.
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+
+        record_agent_profile(feature_root, "implementer", "codex-default")
+        record_agent_profile(feature_root, "implementer", "codex-default")
+
+        assert agent_profiles(feature_root) == {"implementer": "codex-default"}
+
+    def test_rerun_different_profile_updates_the_slot(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+
+        record_agent_profile(feature_root, "implementer", "cc-glm52")
+        record_agent_profile(feature_root, "implementer", "codex-default")
+
+        assert agent_profiles(feature_root) == {"implementer": "codex-default"}
+
+    def test_does_not_advance_gate_or_verdict(self, tmp_path: Path) -> None:
+        # Recording a profile is a pure record — it must not move gate state.
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+        before = _feature_doc(feature_root)["feature"]
+
+        record_agent_profile(feature_root, "implementer", "codex-default")
+
+        after = _feature_doc(feature_root)["feature"]
+        assert after["current_gate"] == before["current_gate"]
+        assert after["verdict"] == before["verdict"]
+        assert after["status"] == before["status"]
+
+    def test_empty_role_or_profile_fails_loud(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+
+        with pytest.raises(ValueError):
+            record_agent_profile(feature_root, "", "codex-default")
+        with pytest.raises(ValueError):
+            record_agent_profile(feature_root, "implementer", "")
+
+    def test_reader_returns_empty_for_pre_v0_5_feature(self, tmp_path: Path) -> None:
+        # Older feature-runs have no agent_profiles mapping — legitimate history.
+        feature_root = tmp_path
+        _seed_feature(feature_root)
+        path = feature_root / "status" / FEATURE_STATUS_FILE
+        doc = yaml.safe_load(path.read_text())
+        del doc["feature"]["agent_profiles"]
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+        assert agent_profiles(feature_root) == {}
 
 
 class TestDeriveFeatureStatus:

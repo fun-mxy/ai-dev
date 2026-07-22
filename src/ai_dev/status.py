@@ -83,6 +83,16 @@ _COHERENCE_GATE_EVENT = "coherence_gate"
 _FEATURE_COHERENCE_GATE = GATES[-1]
 _COHERENCE_VERDICTS = ("pass", "fail")
 
+# v0.5 ticket 06: the feature's Agent Profile configuration — a ``role -> profile``
+# dict (implementer / reviewer / spec_gap_analyst, planner in the future) recording
+# which profile each agent leg of *this* feature run used. Populated by the
+# orchestrator as each leg runs (``record_agent_profile``); read by the
+# ``compare-profiles`` projection to identify the two parallel feature-runs. This is
+# a record of resolved config, not a single value: a feature's legs may legitimately
+# mix profiles (``role_defaults``), so the whole mapping is persisted.
+AGENT_PROFILES_KEY = "agent_profiles"
+_AGENT_PROFILE_EVENT = "agent_profile"
+
 
 class FrozenArtifactError(ValueError):
     """An already-frozen artifact was written again (§4.2 monotonic freeze).
@@ -180,6 +190,9 @@ def _initial_feature_status(feature_id: str) -> dict[str, Any]:
             },
             "current_gate": _INITIAL_GATE,
             "verdict": None,
+            # v0.5 ticket 06: empty until the orchestrator runs each agent leg;
+            # ``record_agent_profile`` fills ``role -> profile`` as legs execute.
+            AGENT_PROFILES_KEY: {},
         }
     }
 
@@ -568,6 +581,72 @@ def record_coherence_verdict(
     _mutate_feature_status(
         feature_root, _write_verdict, timestamp=timestamp, origin=origin
     )
+
+
+def record_agent_profile(
+    feature_root: Path,
+    role: str,
+    profile: str,
+    *,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> None:
+    """Record that this feature's ``role`` leg ran on ``profile`` (v0.5 ticket 06).
+
+    The feature's Agent Profile configuration is a ``role -> profile`` dict on
+    ``feature-status.yml`` (``implementer`` / ``reviewer`` / ``spec_gap_analyst``,
+    ``planner`` in the future) — the resolved config each agent leg uses, recorded
+    by the orchestrator as the leg runs. It is the primary record
+    ``compare-profiles`` reads to tell two parallel feature-runs apart (one
+    profile each, identical intent): unlike run ``metadata.json`` (per-run, role
+    inferred), this is a single feature-level mapping. ``compare-profiles`` falls
+    back to the implement run's ``metadata.json`` ``profile`` for pre-v0.5 runs
+    that predate this record.
+
+    Idempotent in value: re-running a leg on the same profile overwrites the slot
+    with the same value and re-audits (legs are re-runnable, e.g. the fix loop's
+    re-implement); a leg re-run on a *different* profile updates the slot to the
+    new value, which is the honest record of what the feature ended up using. A
+    non-empty ``role`` / ``profile`` is required (§24.2). The
+    ``feature.status`` derivation (ADR-0003 D3) is unchanged — recording a profile
+    moves neither ``current_gate`` nor ``verdict``.
+    """
+    if not role:
+        raise ValueError("role must be a non-empty string")
+    if not profile:
+        raise ValueError("profile must be a non-empty string")
+
+    def _record(feature: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        slots = feature.get(AGENT_PROFILES_KEY)
+        if not isinstance(slots, dict):
+            raise ValueError(
+                "feature-status.yml has no 'agent_profiles' mapping (§24.2)"
+            )
+        slots[role] = profile
+        return [(_AGENT_PROFILE_EVENT, {"role": role, "profile": profile})]
+
+    _mutate_feature_status(feature_root, _record, timestamp=timestamp, origin=origin)
+
+
+def agent_profiles(feature_root: Path) -> Mapping[str, str]:
+    """Return the feature's ``role -> profile`` config (v0.5 ticket 06).
+
+    Read-side companion to ``record_agent_profile``. Defensive on the field's
+    absence — older feature-runs created before v0.5 have no ``agent_profiles``
+    mapping, which is legitimate history, not corruption: return ``{}`` rather
+    than failing. A *present but malformed* mapping (not a dict) is corruption
+    (§24.2) and fails loud, mirroring ``fix_loop_budget``'s reader.
+    """
+    feature = load_feature_status(feature_root).get("feature", {})
+    slots = feature.get(AGENT_PROFILES_KEY)
+    if slots is None:
+        return {}
+    if not isinstance(slots, dict):
+        raise ValueError(
+            f"feature-status.yml at {_feature_status_path(feature_root)} has a "
+            f"malformed 'agent_profiles' (not a mapping, §24.2)"
+        )
+    return {str(k): str(v) for k, v in slots.items()}
 
 
 def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:

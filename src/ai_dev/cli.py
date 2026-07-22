@@ -134,6 +134,7 @@ from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
 from ai_dev.dry_run import (
     DryRunPlan,
     plan_coherence_gate,
+    plan_compare_profiles,
     plan_final_report,
     plan_fix_run,
     plan_freeze,
@@ -152,6 +153,12 @@ from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
+from ai_dev.profile_comparison import (
+    PROFILE_COMPARISON_JSON,
+    PROFILE_COMPARISON_MD,
+    ProfileComparisonResult,
+    generate_profile_comparison,
+)
 from ai_dev.profiles import (
     ProfileError,
     ROLE_IMPLEMENTER,
@@ -174,7 +181,12 @@ from ai_dev.query import (
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.shell_verifier import CommandResult, run_verifier
-from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
+from ai_dev.status import (
+    FROZEN_ARTIFACTS,
+    FrozenArtifactError,
+    freeze_artifact,
+    record_agent_profile,
+)
 from ai_dev.triage import DISPOSITIONS, TriageRefusedError, TriageResult, apply_triage
 from ai_dev.validate import ValidationIssue, validate_run
 
@@ -729,6 +741,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
     )
 
+    # v0.5 ticket 06: non-canonical side-by-side projection of two parallel
+    # feature-runs (same intent, one profile each). Read-only over canonical
+    # state; writes only the non-canonical projection. Supports the global
+    # ``--json`` flag (stdout form) and ``--dry-run`` (plan only).
+    compare_profiles = subparsers.add_parser(
+        "compare-profiles",
+        help="Project a side-by-side comparison of two parallel feature-runs "
+             "(same intent, one profile each) into "
+             "projections/profile-comparison.{json,md} (v0.5 ticket 06, "
+             "ADR-0003-style non-canonical projection). Read-only.",
+        parents=[repo_root_parent, json_parent],
+    )
+    compare_profiles.add_argument(
+        "feature_id",
+        help="The anchor FEATURE-NNN (one of the two compared runs; the "
+             "projection lands in its projections/ dir).",
+    )
+    compare_profiles.add_argument(
+        "--profiles",
+        required=True,
+        help="Exactly two comma-separated profile names to compare, e.g. "
+             "cc-glm52,codex-default. Each is matched to the intent-sibling "
+             "feature-run whose implementer used it.",
+    )
+
     # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
     # rather than repeating the add_argument per command. Read-only commands are
     # excluded (a dry-run flag on a command with no side effects is noise).
@@ -756,6 +793,7 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "coherence-gate",
         "final-report",
         "lane-gate",
+        "compare-profiles",
     }
 )
 
@@ -1228,6 +1266,38 @@ def _run_final_report(repo_root: Path, feature_id: str) -> int:
     return 0
 
 
+def _run_compare_profiles(
+    repo_root: Path,
+    feature_id: str,
+    profile_names: list[str],
+    as_json: bool,
+) -> int:
+    """``compare-profiles``: project two parallel feature-runs (v0.5 ticket 06).
+
+    Always writes the non-canonical ``projections/profile-comparison.{json,md}``
+    under the anchor feature; ``--json`` additionally emits the full report as
+    JSON to stdout, otherwise a one-line human summary. Non-canonical: no audit
+    append, no canonical-state mutation. Returns ``1`` with a clean ``error:``
+    line on any §24.2 precondition miss (missing sibling, missing final-report).
+    """
+    try:
+        result: ProfileComparisonResult = generate_profile_comparison(
+            repo_root, feature_id, profile_names
+        )
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    if as_json:
+        _print_json(json.loads(result.projection_json_path.read_text()))
+    else:
+        print(
+            f"COMPARE-PROFILES - feature={result.feature_id} "
+            f"profiles={','.join(profile_names)} "
+            f"projection={result.projection_json_path}"
+        )
+    return 0
+
+
 def _run_fix_run(
     repo_root: Path,
     feature_id: str,
@@ -1560,6 +1630,15 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     permission_mode=args.permission_mode,
                 )
             )
+        # v0.5 ticket 06: record the resolved implementer profile on the feature's
+        # agent_profiles config (the record compare-profiles reads). Dry-run skips
+        # it — recording is a canonical status write.
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_IMPLEMENTER,
+            profile_name,
+            origin=ORIGIN_IMPLEMENT_LEG,
+        )
         return _run_implement(
             repo_root,
             args.feature_id,
@@ -1589,6 +1668,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     permission_mode=args.permission_mode,
                 )
             )
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_REVIEWER,
+            profile_name,
+            origin=ORIGIN_REVIEW_LEG,
+        )
         return _run_checking(
             repo_root,
             args.feature_id,
@@ -1621,6 +1706,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     permission_mode=args.permission_mode,
                 )
             )
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_SPEC_GAP_ANALYST,
+            profile_name,
+            origin=ORIGIN_SPEC_GAP_LEG,
+        )
         return _run_checking(
             repo_root,
             args.feature_id,
@@ -1675,6 +1766,18 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             )
         return _run_final_report(Path(args.repo_root), args.feature_id)
 
+    if args.command == "compare-profiles":
+        profile_names = [p.strip() for p in args.profiles.split(",") if p.strip()]
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_compare_profiles(
+                    Path(args.repo_root), args.feature_id, profile_names
+                )
+            )
+        return _run_compare_profiles(
+            Path(args.repo_root), args.feature_id, profile_names, args.json
+        )
+
     if args.command == "fix-run":
         repo_root = Path(args.repo_root)
         # --profile (override) applies to all three legs; when absent each leg
@@ -1707,6 +1810,21 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     verify_timeout=args.verify_timeout,
                 )
             )
+        # v0.5 ticket 06: fix-run drives all three legs — record each resolved
+        # profile onto the feature's agent_profiles config (compare-profiles record).
+        fix_feature_root = feature_dir(repo_root, args.feature_id)
+        record_agent_profile(
+            fix_feature_root, ROLE_IMPLEMENTER, implement_name, origin=ORIGIN_FIX_RUN_DRIVER
+        )
+        record_agent_profile(
+            fix_feature_root, ROLE_REVIEWER, reviewer_name, origin=ORIGIN_FIX_RUN_DRIVER
+        )
+        record_agent_profile(
+            fix_feature_root,
+            ROLE_SPEC_GAP_ANALYST,
+            spec_gap_name,
+            origin=ORIGIN_FIX_RUN_DRIVER,
+        )
         return _run_fix_run(
             repo_root,
             args.feature_id,

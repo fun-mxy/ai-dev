@@ -12,12 +12,12 @@ non-determinism from independent planning). Read-only, non-canonical, re-computa
 
 **Blocked by:** 04 (two runnable profiles), 05 (quality axis = requirement coverage).
 
-**Status:** pending
+**Status:** done
 
-- [ ] `compare-profiles` read-only command; reads two feature `final-report`s + audit timelines
-- [ ] emits `projections/profile-comparison.{json,md}` (non-canonical, ADR-0003-style)
-- [ ] metrics: per-leg `elapsed_ms`, verifier pass/fail, verdict + `failure_class`, issue count by severity, requirement coverage
-- [ ] lane/RUN model untouched (two parallel feature-runs)
-- [ ] `meta.known_gaps` for caveats (reviewer-variance, planner non-determinism)
-- [ ] global `--json` support (v0.4 ticket 03)
-- [ ] tests at the public seam; `uv run mypy` green
+- [x] `compare-profiles` read-only command; reads two feature `final-report`s + audit timelines
+- [x] emits `projections/profile-comparison.{json,md}` (non-canonical, ADR-0003-style)
+- [x] metrics: per-leg `elapsed_ms`, verifier pass/fail, verdict + `failure_class`, issue count by severity, requirement coverage
+- [x] lane/RUN model untouched (two parallel feature-runs)
+- [x] `meta.known_gaps` for caveats (reviewer-variance, planner non-determinism)
+- [x] global `--json` support (v0.4 ticket 03)
+- [x] tests at the public seam; `uv run mypy` green

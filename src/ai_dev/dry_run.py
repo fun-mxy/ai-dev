@@ -69,6 +69,11 @@ from ai_dev.paths import (
     lane_dir,
     run_dir,
 )
+from ai_dev.profile_comparison import (
+    PROFILE_COMPARISON_JSON,
+    PROFILE_COMPARISON_MD,
+    compute_profile_comparison,
+)
 from ai_dev.profiles import AgentProfile, token_source_var
 from ai_dev.run_prepare import (
     ALLOWED_FILES_FILE,
@@ -813,6 +818,39 @@ def plan_final_report(repo_root: Path, feature_id: str) -> DryRunPlan:
         summary=(
             f"FINAL-REPORT DRY-RUN - would render verdict={compute.verdict} "
             f"failure_class={compute.failure_class}"
+        ),
+        details=details,
+    )
+
+
+def plan_compare_profiles(
+    repo_root: Path, feature_id: str, profile_names: list[str]
+) -> DryRunPlan:
+    """Plan a ``compare-profiles``: compute the projection, write nothing (§23.5).
+
+    Reuses the pure ``compute_profile_comparison`` so the dry-run exercises the
+    full discovery + metric projection (and its §24.2 preconditions) without
+    writing the non-canonical products.
+    """
+    compute = compute_profile_comparison(repo_root, feature_id, profile_names)
+    meta = compute.report.get("meta", {})
+    profiles_compared = meta.get("profiles_compared", profile_names)
+    details = {
+        "profiles_compared": profiles_compared,
+        "feature_ids": meta.get("feature_ids", []),
+        "would_mint_ids": [],
+        "would_write": [
+            f"projections/{PROFILE_COMPARISON_JSON}",
+            f"projections/{PROFILE_COMPARISON_MD}",
+        ],
+        "audited": False,
+    }
+    return DryRunPlan(
+        command="compare-profiles",
+        feature_id=feature_id,
+        summary=(
+            f"COMPARE-PROFILES DRY-RUN - would project "
+            f"profiles={','.join(profiles_compared)}"
         ),
         details=details,
     )
