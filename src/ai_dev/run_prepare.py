@@ -38,6 +38,11 @@ from typing import Any, Mapping, Sequence
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
 from ai_dev.paths import INPUT_DIR, OUTPUT_DIR, WORKSPACE_DIR, feature_dir, run_dir
+from ai_dev.planner_schemas import (
+    PLANNER_ROLE,
+    PLANNING_STAGES,
+    planner_output_schema,
+)
 
 # §12.2 input-package file names (public so tests / later tickets reference one
 # source of truth for the on-disk layout).
@@ -124,6 +129,39 @@ _OUTPUT_SCHEMA: dict[str, object] = {
 # declares them via ``prepare_run(..., allowed_files=...)`` (ticket 05 seam) so
 # the §14.2 boundary check passes on a run that writes workspace files.
 _ALLOWED_FILES_SEED: tuple[str, ...] = ("output/result.json", "output/result.md")
+
+
+def output_schema_for_role(
+    role: str, *, stage: str | None = None
+) -> Mapping[str, Any]:
+    """Role-aware §14.1 schema lookup: the output-schema a ``role``'s run writes.
+
+    ADR-0008 Consequences: Planner proposal schemas differ from the implementer's
+    ``result.json``, so §14.1 validation becomes role-aware. This is the one
+    lookup a leg driver calls to pick the contract passed to
+    ``prepare_run(..., output_schema=...)`` — and because ``validate-run`` reads
+    whatever ``input/output-schema.json`` was written, role-awareness lives
+    entirely in *which* schema this returns:
+
+    * ``PLANNER_ROLE`` (the Planner, §9.1) -> the proposal schema for ``stage``
+      (``stage`` required; fails loud for an unwired stage, §24.2). The model
+      authors id-free content; promote (ticket 01) allocates the ids.
+    * any other role (Implementer / Reviewer / Spec-Gap, §9.2-9.4) -> the
+      implementer ``result.json`` schema (``_OUTPUT_SCHEMA``), the v0.1 default.
+
+    The Planner branch fails loud when ``stage`` is omitted: a Planner run
+    without a stage is a config error (the driver forgot which artifact it is
+    producing), not a silent fallback to the implementer schema — which would
+    validate the wrong contract and let a malformed proposal pass.
+    """
+    if role == PLANNER_ROLE:
+        if stage is None:
+            raise ValueError(
+                f"role {role!r} requires a --stage (one of {PLANNING_STAGES}); "
+                f"a Planner run must declare which artifact it produces (§24.2)"
+            )
+        return planner_output_schema(stage)
+    return _OUTPUT_SCHEMA
 
 # Header comment block for allowed-files.txt (the prototype's seed header).
 _ALLOWED_FILES_HEADER = (

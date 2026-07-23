@@ -16,11 +16,11 @@ is ticket 02. Read ADR-0008 D1/D2 and CONTEXT.md ("Authoring target & stable IDs
 
 **Blocked by:** none — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `promote` reads an id-free proposal JSON and allocates canonical REQ/AC ids from the counter
-- [ ] generic local-ref resolver built + unit-tested synthetically (so 03/04 reuse it without rework)
-- [ ] promote writes canonical `01-requirements.json` and **renders** `01-requirements.md` (sole renderer)
-- [ ] reference-integrity check fails loud on unresolvable local refs
-- [ ] Planner proposal output-schema(s) defined as data + role-aware §14.1 schema lookup wired
-- [ ] unit tests at the promote seam (synthetic proposals); `uv run mypy` + `uv run pytest` green
+- [x] `promote` reads an id-free proposal JSON and allocates canonical REQ/AC ids from the counter
+- [x] generic local-ref resolver built + unit-tested synthetically (so 03/04 reuse it without rework)
+- [x] promote writes canonical `01-requirements.json` and **renders** `01-requirements.md` (sole renderer)
+- [x] reference-integrity check fails loud on unresolvable local refs
+- [x] Planner proposal output-schema(s) defined as data + role-aware §14.1 schema lookup wired
+- [x] unit tests at the promote seam (synthetic proposals); `uv run mypy` + `uv run pytest` green
