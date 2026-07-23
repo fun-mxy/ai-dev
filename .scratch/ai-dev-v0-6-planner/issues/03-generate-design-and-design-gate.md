@@ -16,11 +16,11 @@ promote.) Real cc-glm52/Ark evidence required.
 
 **Blocked by:** 02 (needs frozen requirements to stitch against, and the generate→promote→freeze flow proven).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `generate-design` command: Planner role, input package = intent + frozen `01-requirements.json`
-- [ ] run emits id-free design proposal (DES slots, architecture, data model, API/CLI, file layout, invariants, risks, `requirement_mapping` with local REQ refs)
-- [ ] `promote` allocates DES ids + stitches `requirement_mapping` against frozen requirements (generic resolver from 01, live for the first time) + renders `02-design.md`
-- [ ] refinement loop (`--feedback`) + human `freeze` advances design_gate → task_gate
-- [ ] **freeze-gate coverage precheck** (reusable helper): every REQ in ≥1 `requirement_mapping`, else refuse to freeze (no self-heal)
-- [ ] real cc-glm52/Ark evidence; `uv run mypy` + `uv run pytest` green
+- [x] `generate-design` command: Planner role, input package = intent + frozen `01-requirements.json`
+- [x] run emits id-free design proposal (DES slots, architecture, data model, API/CLI, file layout, invariants, risks, `requirement_mapping` with local REQ refs)
+- [x] `promote` allocates DES ids + stitches `requirement_mapping` against frozen requirements (generic resolver from 01, live for the first time) + renders `02-design.md`
+- [x] refinement loop (`--feedback`) + human `freeze` advances design_gate → task_gate
+- [x] **freeze-gate coverage precheck** (reusable helper): every REQ in ≥1 `requirement_mapping`, else refuse to freeze (no self-heal)
+- [x] real cc-glm52/Ark evidence; `uv run mypy` + `uv run pytest` green
