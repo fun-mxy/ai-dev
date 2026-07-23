@@ -30,6 +30,13 @@ the seam) and the feature-run root (for id allocation + the frozen guard). It is
 unit-tested with synthetic proposals; **no real model run** is involved here —
 ticket 02's ``generate-requirements`` reads the run's ``result.json`` and calls
 this.
+
+The **design** stage (ticket 03) is wired here too: ``promote_design`` is the
+first stage with a real frozen upstream - its ``requirement_mapping`` REQ refs
+resolve against the frozen ``01-requirements.json`` via ``add_upstream`` (the
+root never calls it), and its ``design_elements`` local refs resolve via
+``register_local`` as DES ids are allocated. ``generate-design`` (ticket 03's
+leg) reads the run's ``result.json`` and calls ``promote_design``.
 """
 
 from __future__ import annotations
@@ -41,9 +48,14 @@ from typing import Any, Mapping
 
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
-from ai_dev.json_artifact import write_json
+from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.status import frozen_artifacts_status
-from ai_dev.templates import REQUIREMENTS_JSON, REQUIREMENTS_MD
+from ai_dev.templates import (
+    DESIGN_JSON,
+    DESIGN_MD,
+    REQUIREMENTS_JSON,
+    REQUIREMENTS_MD,
+)
 
 # The audit event for a promote (the planning-leg analogue of ``implement-result``
 # / ``mark_task_proposed_done``). One record per promote, carrying the stage, the
@@ -53,6 +65,10 @@ _PROMOTE_EVENT = "promote"
 # The §4.2 artifact name this stage writes (mirrors ``FROZEN_ARTIFACTS``). Public
 # so ticket 02 can reference the artifact promote targets from one source.
 REQUIREMENTS_ARTIFACT = "requirements"
+
+# The §4.2 artifact name the design stage writes (ticket 03). Public so the
+# design leg / coverage precheck reference it from one source.
+DESIGN_ARTIFACT = "design"
 
 
 class UnresolvedRefError(ValueError):
@@ -379,6 +395,39 @@ def _render_inline(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _render_list_facets(
+    lines: list[str],
+    facets: tuple[str, ...],
+    headings: Mapping[str, str],
+    doc: Mapping[str, Any],
+) -> None:
+    """Append the optional list-prose facets to ``lines`` (shared by both stages).
+
+    Each facet renders as a ``## <heading>`` section: a bullet list when the
+    proposal supplied a list (``_None._`` when empty), or inline prose when it
+    supplied a scalar. Facets absent from the doc (``None``) are skipped. The
+    requirements and design renderers differ only in which facets + headings they
+    pass, so the loop body is shared (it was byte-identical across the two before
+    extraction).
+    """
+    for facet in facets:
+        value = doc.get(facet)
+        if value is None:
+            continue
+        lines.append(f"## {headings[facet]}")
+        lines.append("")
+        if isinstance(value, list):
+            if not value:
+                lines.append("_None._\n")
+            else:
+                for item in value:
+                    lines.append(f"- {_render_inline(item)}")
+                lines.append("")
+        else:
+            lines.append(_render_inline(value))
+            lines.append("")
+
+
 def render_requirements_md(feature_id: str, doc: Mapping[str, Any]) -> str:
     """Render the human ``01-requirements.md`` mirror from the canonical doc.
 
@@ -439,22 +488,7 @@ def render_requirements_md(feature_id: str, doc: Mapping[str, Any]) -> str:
             lines.append("")
             lines.append(_render_inline(doc[facet]))
             lines.append("")
-    for facet in _LIST_FACETS:
-        value = doc.get(facet)
-        if value is None:
-            continue
-        lines.append(f"## {_FACET_HEADINGS[facet]}")
-        lines.append("")
-        if isinstance(value, list):
-            if not value:
-                lines.append("_None._\n")
-            else:
-                for item in value:
-                    lines.append(f"- {_render_inline(item)}")
-                lines.append("")
-        else:
-            lines.append(_render_inline(value))
-            lines.append("")
+    _render_list_facets(lines, _LIST_FACETS, _FACET_HEADINGS, doc)
 
     return "\n".join(lines)
 
@@ -525,6 +559,328 @@ def promote_requirements(
     return PromoteResult(
         stage="requirements",
         artifact=REQUIREMENTS_ARTIFACT,
+        json_path=json_path,
+        md_path=md_path,
+        allocated={k: tuple(v) for k, v in allocated.items()},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Design stage (ticket 03): stitch requirement_mapping against the FROZEN
+# requirements upstream (first live use of RefResolver.add_upstream) + allocate
+# DES ids + render 02-design.{json,md}.
+# ---------------------------------------------------------------------------
+
+
+def read_frozen_requirements_doc(feature_root: Path) -> Mapping[str, Any]:
+    """Read the frozen ``01-requirements.json`` (the design upstream, ADR-0008 D2).
+
+    Design may only stitch cross-references against a *frozen* requirements
+    artifact - the upstream ids a design proposal's ``requirement_mapping`` refs
+    resolve against. The authoritative frozen state is
+    ``status.frozen_artifacts_status`` (``status/feature-status.yml``), **not**
+    the requirements doc's ``frozen`` field: promote always writes that field
+    ``False`` and the human ``freeze`` never touches the doc, so the doc field
+    is a decorative mirror that stays ``False`` even when frozen. Fails loud
+    (§24.2) if requirements is not frozen (freeze requirements first) or if the
+    canonical doc is missing/unreadable.
+    """
+    frozen = frozen_artifacts_status(feature_root)
+    if not frozen.get(REQUIREMENTS_ARTIFACT):
+        raise ValueError(
+            f"artifact {REQUIREMENTS_ARTIFACT!r} is not frozen; design may only "
+            f"stitch against a frozen upstream (ADR-0008 D2). Freeze requirements "
+            f"first (§4.2)."
+        )
+    doc = read_json_object(feature_root / REQUIREMENTS_JSON)
+    if doc is None:
+        raise ValueError(
+            f"{REQUIREMENTS_JSON} missing or unreadable at {feature_root} (§24.2)"
+        )
+    return doc
+
+
+def frozen_req_ids(req_doc: Mapping[str, Any]) -> list[str]:
+    """The frozen REQ ids a design refs resolve against (the upstream id set).
+
+    Shared by :func:`build_canonical_design` (registers them via
+    ``add_upstream``) and :mod:`coverage` (the set every ``requirement_mapping``
+    must cover at the freeze gate). Returns the ids in doc order; callers that
+    need set semantics wrap in ``set(...)``. Defensive against a hand-edited doc
+    (skips non-mapping entries / non-string ids).
+    """
+    return [
+        r["id"]
+        for r in req_doc.get("requirements", [])
+        if isinstance(r, Mapping) and isinstance(r.get("id"), str) and r["id"]
+    ]
+
+
+# The optional §7.3 prose facets a design proposal may carry alongside its
+# design_elements / requirement_mapping. Split by render shape: the
+# "structural" facets (architecture decision / data model / API-CLI contract /
+# file layout) are free-form (string or compound) and render in a fenced block;
+# the list facets (invariants / risks / dependencies) render as bullets. Listed
+# once so adding a facet is a one-place edit.
+_DESIGN_STRUCTURAL_FACETS: tuple[str, ...] = (
+    "architecture_decision",
+    "data_model",
+    "api_cli_contract",
+    "file_layout",
+)
+_DESIGN_LIST_FACETS: tuple[str, ...] = ("invariants", "risks", "dependencies")
+_DESIGN_FACETS: tuple[str, ...] = _DESIGN_STRUCTURAL_FACETS + _DESIGN_LIST_FACETS
+_DESIGN_FACET_HEADINGS: Mapping[str, str] = {
+    "architecture_decision": "Architecture decision",
+    "data_model": "Data model",
+    "api_cli_contract": "API / CLI contract",
+    "file_layout": "File layout",
+    "invariants": "Invariants",
+    "risks": "Risks",
+    "dependencies": "Dependencies",
+}
+
+
+def build_canonical_design(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    origin: str | None,
+    timestamp: str | None = None,
+) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    """Allocate DES ids + stitch requirement_mapping -> canonical design doc.
+
+    The pure allocation/stitch core of ``promote_design`` (split out for the same
+    reason as ``build_canonical_requirements``: a thin render/write/audit shell
+    over a unit-testable core). Returns ``(canonical_doc, allocated)`` where
+    ``allocated`` is ``{"DES": [...]}`` in allocation order.
+
+    Two resolution paths exercise the generic :class:`RefResolver` against two
+    different ref kinds - this is the first stage with a real frozen upstream:
+
+    * **DES local refs** - each ``requirement_mapping`` entry's
+      ``design_elements`` are *local* keys of this proposal's
+      ``design_elements[]``. Allocated ``DES-NNN`` ids are registered local
+      (``register_local``) as the proposal is walked, then each mapping's
+      ``design_elements`` list resolves to the allocated DES ids (same shape as
+      AC -> REQ in requirements).
+    * **REQ upstream refs** - each ``requirement_mapping`` entry's
+      ``requirement`` is a canonical ``REQ-NNN`` read from the *frozen*
+      ``01-requirements.json`` (the model references REQs by their canonical id;
+      it does not re-allocate them). ``add_upstream("REQ", frozen_req_ids)``
+      registers the frozen set, then ``resolve`` verifies each ref is a real
+      frozen REQ - a ref to a non-existent REQ (e.g. ``REQ-099``) raises
+      :class:`UnresolvedRefError` (D3 reference-integrity) and the whole promote
+      fails loud, no partial artifact.
+
+    ``requirement_mapping`` entries are not a §5.2 id type, so promote allocates
+    no id for them - the model's local ``key`` is carried as provenance (as AC
+    ``key`` is). ``timestamp`` threads into every ``allocate_id`` call so all
+    id-allocation audit records inside one promote share its timestamp.
+    """
+    resolver = RefResolver()
+    allocated: dict[str, list[str]] = {"DES": []}
+
+    # Upstream: the frozen REQ ids design refs resolve against (the first live
+    # use of add_upstream - requirements, the root, never calls it).
+    req_doc = read_frozen_requirements_doc(feature_root)
+    resolver.add_upstream("REQ", frozen_req_ids(req_doc))
+
+    design_elements: list[dict[str, Any]] = []
+    for i, entry in enumerate(
+        _entries(proposal.get("design_elements"), "design_elements")
+    ):
+        key = _required_str(entry, "key", i, what="design_elements")
+        name = _required_str(entry, "name", i, what="design_elements")
+        des_id = allocate_id(
+            feature_root, "DES", origin=origin, timestamp=timestamp
+        )
+        resolver.register_local("DES", key, des_id)
+        allocated["DES"].append(des_id)
+        element: dict[str, Any] = {"id": des_id, "key": key, "name": name}
+        for opt in ("description", "rationale", "type"):
+            if opt in entry and entry.get(opt) is not None:
+                element[opt] = entry[opt]
+        design_elements.append(element)
+
+    requirement_mapping: list[dict[str, Any]] = []
+    for i, entry in enumerate(
+        _entries(proposal.get("requirement_mapping"), "requirement_mapping")
+    ):
+        key = _required_str(entry, "key", i, what="requirement_mapping")
+        # D3 reference-integrity: resolve raises UnresolvedRefError if the
+        # mapping's REQ ref is not a real frozen REQ id - fail loud, write nothing.
+        req_id = resolver.resolve(
+            "REQ", _required_str(entry, "requirement", i, what="requirement_mapping")
+        )
+        # design_elements are local DES refs; resolve_list fails loud on a
+        # non-list or an unresolvable member.
+        des_ids = resolver.resolve_list("DES", entry.get("design_elements"))
+        mapping: dict[str, Any] = {
+            "key": key,
+            "requirement": req_id,
+            "design_elements": des_ids,
+        }
+        if "rationale" in entry and entry.get("rationale") is not None:
+            mapping["rationale"] = entry["rationale"]
+        requirement_mapping.append(mapping)
+
+    doc: dict[str, Any] = {
+        "feature": feature_id,
+        # D1: promote writes the canonical-unfrozen artifact; the frozen flag is
+        # the human gate's to flip. The frozen guard in ``promote_design``
+        # refuses a frozen artifact outright, so this is always false here.
+        "frozen": False,
+        "design_elements": design_elements,
+        "requirement_mapping": requirement_mapping,
+    }
+    # Optional §7.3 prose facets carried through verbatim when present.
+    for facet in _DESIGN_FACETS:
+        if facet in proposal and proposal.get(facet) is not None:
+            doc[facet] = proposal[facet]
+
+    return doc, allocated
+
+
+def render_design_md(feature_id: str, doc: Mapping[str, Any]) -> str:
+    """Render the human ``02-design.md`` mirror from the canonical doc.
+
+    The sole md renderer for the design stage (ADR-0008 D2): markdown is always a
+    rendered mirror of canonical JSON, never authored independently. Deterministic
+    given the doc. The header carries the frozen state and points at the canonical
+    JSON; the requirement-mapping section shows the stitched REQ/DES refs.
+    """
+    frozen = bool(doc.get("frozen", False))
+    lines: list[str] = [
+        f"# Design - {feature_id}",
+        "",
+        f"Frozen: {str(frozen).lower()}",
+        "",
+        "> Stable IDs (DES-NNN) are allocated by `promote` from the per-type id",
+        "> counter and recorded in `02-design.json`. This markdown is a rendered",
+        "> mirror; the JSON is canonical (§4.3, ADR-0008 D2). The",
+        "> `requirement_mapping` `requirement` refs are stitched canonical REQ ids,",
+        "> resolved from the frozen `01-requirements.json`; `design_elements` refs",
+        "> are stitched DES ids, resolved from the proposal's local keys.",
+        "",
+        "## Design elements (DES-NNN)",
+        "",
+    ]
+
+    elements = doc.get("design_elements") or []
+    if not elements:
+        lines.append("_None yet._\n")
+    for el in elements:
+        eid = el.get("id", "?")
+        name = el.get("name", "")
+        lines.append(f"### {eid} - {name}")
+        if el.get("description") is not None:
+            lines.append("")
+            lines.append(str(el["description"]))
+        if el.get("type") is not None:
+            lines.append(f"- type: {_render_inline(el['type'])}")
+        if el.get("rationale") is not None:
+            lines.append(f"- rationale: {_render_inline(el['rationale'])}")
+        lines.append("")
+
+    lines.append("## Requirement mapping (-> REQ / DES)")
+    lines.append("")
+    mapping = doc.get("requirement_mapping") or []
+    if not mapping:
+        lines.append("_None yet._\n")
+    for m in mapping:
+        req_ref = m.get("requirement", "?")
+        des_refs = ", ".join(m.get("design_elements", [])) or "-"
+        line = f"- REQ **{req_ref}** <- [{des_refs}]"
+        if m.get("rationale"):
+            line += f" - {m['rationale']}"
+        lines.append(line)
+    if mapping:
+        lines.append("")
+
+    # Optional §7.3 prose facets. Structural facets render in a fenced block
+    # (string verbatim, compound as JSON); list facets render as bullets.
+    for facet in _DESIGN_STRUCTURAL_FACETS:
+        if doc.get(facet) is None:
+            continue
+        lines.append(f"## {_DESIGN_FACET_HEADINGS[facet]}")
+        lines.append("")
+        value = doc[facet]
+        if isinstance(value, str):
+            lines.append(value)
+        else:
+            lines.append("```json")
+            lines.append(json.dumps(value, indent=2, ensure_ascii=False))
+            lines.append("```")
+        lines.append("")
+    _render_list_facets(lines, _DESIGN_LIST_FACETS, _DESIGN_FACET_HEADINGS, doc)
+
+    return "\n".join(lines)
+
+
+def promote_design(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> PromoteResult:
+    """Promote an id-free design proposal to the canonical artifact (ticket 03).
+
+    The deterministic stitcher/renderer (ADR-0008 D2) for the design stage:
+    allocates DES ids from the counter, stitches each ``requirement_mapping``
+    entry's ``requirement`` ref to its frozen REQ id and its ``design_elements``
+    local refs to their allocated DES ids (reference-integrity, D3 - fails loud on
+    an unresolvable ref), writes ``02-design.json``, and renders ``02-design.md``
+    (the sole md renderer). Refuses to overwrite a frozen design artifact (§4.2)
+    and refuses if the requirements upstream is not yet frozen (D2 - design may
+    only stitch against a frozen upstream). Appends one ``promote`` audit record
+    carrying the allocated DES ids.
+
+    ``proposal`` is the parsed Planner output (the run's ``result.json``);
+    ticket 03's ``generate-design`` reads that file and calls here. Pure at the
+    seam apart from the deterministic writes (id counter, canonical json/md,
+    audit) - no subprocess, no model.
+    """
+    if not feature_id:
+        raise ValueError("feature_id must be a non-empty string")
+
+    # §4.2 guard: promote targets the canonical-*unfrozen* design artifact (D1).
+    frozen = frozen_artifacts_status(feature_root)
+    if frozen.get(DESIGN_ARTIFACT):
+        raise FrozenArtifactWriteError(
+            f"artifact {DESIGN_ARTIFACT!r} is frozen; promote may only "
+            f"overwrite an unfrozen artifact (use a Change Proposal to change a "
+            f"frozen one, §4.2/§17)"
+        )
+
+    doc, allocated = build_canonical_design(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+
+    json_path = feature_root / DESIGN_JSON
+    md_path = feature_root / DESIGN_MD
+    write_json(json_path, doc)
+    md_path.write_text(render_design_md(feature_id, doc))
+
+    append_audit_event(
+        feature_root,
+        event=_PROMOTE_EVENT,
+        payload={
+            "stage": "design",
+            "artifact": DESIGN_ARTIFACT,
+            "feature": feature_id,
+            "allocated": allocated,
+        },
+        timestamp=timestamp,
+        origin=origin,
+    )
+
+    return PromoteResult(
+        stage="design",
+        artifact=DESIGN_ARTIFACT,
         json_path=json_path,
         md_path=md_path,
         allocated={k: tuple(v) for k, v in allocated.items()},

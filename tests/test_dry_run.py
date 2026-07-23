@@ -33,6 +33,7 @@ from ai_dev.dry_run import (
     plan_final_report,
     plan_fix_run,
     plan_freeze,
+    plan_generate_design,
     plan_implement,
     plan_lane_gate,
     plan_review,
@@ -41,12 +42,15 @@ from ai_dev.dry_run import (
     plan_triage,
     render_plan,
 )
+from ai_dev.feature_run import create_feature_run
 from ai_dev.feature_ids import ID_COUNTERS_FILE
 from ai_dev.final_report import FINAL_REPORT_JSON
 from ai_dev.lane_gate import LANE_DECISION_JSON
 from ai_dev.profiles import load_profile
+from ai_dev.promote import promote_requirements
 from ai_dev.run_prepare import prepare_run
 from ai_dev.status import freeze_artifact
+from ai_dev.templates import DESIGN_JSON, REQUIREMENTS_JSON
 
 from test_checking_legs import _stage_implement_run  # noqa: E402
 from test_implement_leg import _feature_root, _seed_frozen_feature  # noqa: E402
@@ -95,6 +99,53 @@ def _exhaust_fix_loop_budget(feature_root: Path) -> None:
 def _run_cli(repo_root: Path, argv: list[str]) -> int:
     """Run ``main`` with ``--repo-root`` appended; return the exit code."""
     return main([*argv, "--repo-root", str(repo_root)])
+
+
+def _stage_frozen_requirements(repo_root: Path, feature_id: str) -> Path:
+    """Create a feature run + promote + freeze requirements (REQ-001/002).
+
+    The design leg (ticket 03) may only run against a *frozen* requirements
+    upstream (ADR-0008 D2). Promotes + freezes directly (not via the requirements
+    leg) to keep the design dry-run seam the unit under test. Returns the feature
+    root.
+    """
+    feature_root = _feature_root(repo_root, feature_id)
+    promote_requirements(
+        feature_root,
+        feature_id,
+        {
+            "requirements": [
+                {"key": "r1", "statement": "The CLI shall greet a named user."},
+                {"key": "r2", "statement": "The CLI shall exit 0 on success."},
+            ],
+            "acceptance_criteria": [
+                {"key": "a1", "requirement": "r1", "criterion": "greeting contains name"},
+                {"key": "a2", "requirement": "r2", "criterion": "exit 0 on valid name"},
+            ],
+        },
+        origin="test",
+    )
+    freeze_artifact(feature_root, "requirements", origin="test")
+    return feature_root
+
+
+def _write_design_doc(feature_root: Path, *, covered_reqs: list[str]) -> None:
+    """Write a canonical ``02-design.json`` whose ``requirement_mapping`` covers
+    exactly the given REQ ids (the freeze-gate coverage precheck reads this)."""
+    mapping = [
+        {"key": f"m{i}", "requirement": req, "design_elements": ["DES-001"]}
+        for i, req in enumerate(covered_reqs)
+    ]
+    (feature_root / DESIGN_JSON).write_text(
+        json.dumps(
+            {
+                "feature_id": "FEATURE-001",
+                "frozen": False,
+                "design_elements": [{"id": "DES-001", "name": "core"}],
+                "requirement_mapping": mapping,
+            }
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +391,121 @@ class TestFreezeDryRun:
         feature_id = create_feature_run(repo_root, "freeze dry-run test")
         with pytest.raises(ValueError, match="unknown frozen artifact"):
             plan_freeze(repo_root, feature_id, "nope")
+
+    def test_design_coverage_gap_refused_exit_0(self, repo_root: Path) -> None:
+        # ADR-0008 D3: a REQ missing from every design requirement_mapping is a
+        # legality refusal the real freeze would reject - dry-run reports it as
+        # ``would be refused`` and exits 0 (the dry-run convention).
+        feature_id = create_feature_run(repo_root, "design freeze coverage gap")
+        feature_root = _stage_frozen_requirements(repo_root, feature_id)
+        _write_design_doc(feature_root, covered_reqs=["REQ-001"])  # REQ-002 gap
+        before = _inventory(feature_root)
+
+        plan = plan_freeze(repo_root, feature_id, "design")
+        assert plan.details["would_be_refused"] is True
+        assert "coverage" in plan.details["refusal_reason"]
+        assert "REQ-002" in plan.details["refusal_reason"]
+        assert "REFUSED" in plan.summary and "coverage gap" in plan.summary
+        assert _inventory(feature_root) == before
+
+    def test_design_coverage_pass_would_freeze(self, repo_root: Path) -> None:
+        feature_id = create_feature_run(repo_root, "design freeze coverage pass")
+        feature_root = _stage_frozen_requirements(repo_root, feature_id)
+        _write_design_doc(feature_root, covered_reqs=["REQ-001", "REQ-002"])
+        before = _inventory(feature_root)
+
+        plan = plan_freeze(repo_root, feature_id, "design")
+        assert plan.details["would_be_refused"] is False
+        assert plan.details["would_advance_current_gate_to"] == "task_gate"
+        assert _inventory(feature_root) == before
+
+    def test_design_freeze_before_requirements_frozen_raises(
+        self, repo_root: Path
+    ) -> None:
+        # A corrupt precondition (requirements not frozen) is a §24.2 failure,
+        # not a refusal: it raises ValueError (exit 1), mirroring the real CLI.
+        feature_id = create_feature_run(repo_root, "design freeze no upstream")
+        with pytest.raises(ValueError, match="is not frozen"):
+            plan_freeze(repo_root, feature_id, "design")
+
+    def test_design_freeze_no_design_promoted_raises(self, repo_root: Path) -> None:
+        # Requirements frozen but 02-design.json deleted/unreadable - a corrupt
+        # precondition -> ValueError (exit 1), not a refusal. (The seeded empty
+        # design template normally stands in here; deleting it exercises the
+        # missing-artifact guard the real freeze surfaces as a clean error.)
+        feature_id = create_feature_run(repo_root, "design freeze nothing to freeze")
+        feature_root = _stage_frozen_requirements(repo_root, feature_id)
+        (feature_root / DESIGN_JSON).unlink()
+        with pytest.raises(ValueError, match="nothing to freeze"):
+            plan_freeze(repo_root, feature_id, "design")
+
+
+class TestGenerateDesignDryRun:
+    """``generate-design --dry-run``: plan the leg, mint/spell/write nothing."""
+
+    def test_plans_design_leg_no_mint_no_write(
+        self, repo_root: Path, write_profiles, clean_token_env, monkeypatch
+    ) -> None:
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        feature_id = create_feature_run(repo_root, "design dry-run plan")
+        feature_root = _stage_frozen_requirements(repo_root, feature_id)
+        profile = load_profile(repo_root, "cc-glm52")
+        before_counters = _counters(feature_root)
+        before_tree = _inventory(feature_root)
+
+        plan = plan_generate_design(repo_root, feature_id, profile)
+        assert plan.command == "generate-design"
+        assert plan.details["role"] == "Planner"
+        assert plan.details["stage"] == "design"
+        assert any("02-design.json" in w for w in plan.details["would_write"])
+        assert any("02-design.md" in w for w in plan.details["would_write"])
+        assert "frozen REQ" in plan.details["upstream"]
+        assert "design proposal" in plan.details["output_schema"]
+        # No id minted, no canonical write, no audit append.
+        assert _counters(feature_root) == before_counters
+        assert _inventory(feature_root) == before_tree
+
+    def test_not_frozen_requirements_precondition_raises(
+        self, repo_root: Path, write_profiles, clean_token_env, monkeypatch
+    ) -> None:
+        # design may only stitch against a frozen upstream (ADR-0008 D2); an
+        # unfrozen requirements is a §24.2 precondition failure -> ValueError.
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        feature_id = create_feature_run(repo_root, "design dry-run no upstream")
+        profile = load_profile(repo_root, "cc-glm52")
+        with pytest.raises(ValueError, match="is not frozen"):
+            plan_generate_design(repo_root, feature_id, profile)
+
+    def test_missing_feature_raises(
+        self, repo_root: Path, write_profiles, clean_token_env, monkeypatch
+    ) -> None:
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        profile = load_profile(repo_root, "cc-glm52")
+        with pytest.raises(ValueError, match="FEATURE-404"):
+            plan_generate_design(repo_root, "FEATURE-404", profile)
+
+    def test_cli_dry_run_exits_0_prints_plan(
+        self, repo_root: Path, write_profiles, clean_token_env, monkeypatch, capsys
+    ) -> None:
+        write_profiles(repo_root)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "test-token")
+        feature_id = create_feature_run(repo_root, "design dry-run cli")
+        _stage_frozen_requirements(repo_root, feature_id)
+        feature_root = _feature_root(repo_root, feature_id)
+        before_counters = _counters(feature_root)
+        before_tree = _inventory(feature_root)
+
+        rc = _run_cli(repo_root, ["generate-design", feature_id, "--dry-run"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "GENERATE-DESIGN DRY-RUN" in out
+        assert "02-design.json" in out
+        # Dry-run mints/spells/writes nothing.
+        assert _counters(feature_root) == before_counters
+        assert _inventory(feature_root) == before_tree
 
 
 class TestTriageDryRun:

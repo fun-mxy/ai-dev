@@ -74,10 +74,21 @@ from ai_dev.paths import (
     lane_dir,
     run_dir,
 )
-from ai_dev.planner_leg import _planner_task_text, read_intent
+from ai_dev.planner_leg import (
+    _design_task_text,
+    _planner_task_text,
+    _render_frozen_requirements_summary,
+    read_intent,
+)
 # The model-role token lives in planner_schemas (planner_leg only re-exports it);
 # import from its home rather than through the leg (avoid a Middle Man hop).
 from ai_dev.planner_schemas import PLANNER_ROLE as _PLANNER_ROLE
+# The frozen-requirements precondition the design leg stitches against lives in
+# promote (the canonical reader); the freeze-gate coverage precheck lives in
+# coverage. Both are pure read/compute helpers - no canonical write - so importing
+# them here keeps dry-run free of side effects (ADR-0004).
+from ai_dev.promote import read_frozen_requirements_doc
+from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
     PROFILE_COMPARISON_MD,
@@ -458,6 +469,82 @@ def plan_generate_requirements(
     )
 
 
+def plan_generate_design(
+    repo_root: Path,
+    feature_id: str,
+    profile: AgentProfile,
+    *,
+    feedback: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+) -> DryRunPlan:
+    """Plan a ``generate-design`` leg: intent + frozen-requirements read, no spawn.
+
+    Mirrors ``plan_generate_requirements`` but adds the design leg's second
+    precondition: the requirements artifact must be **frozen** (design may only
+    stitch against a frozen upstream, ADR-0008 D2). Reuses the Planner leg's
+    precondition reads (feature exists, intent present, requirements frozen) and
+    renders the would-be Planner design input package into a temp dir instead of
+    minting ``RUN-NNN``. The design proposal schema
+    (``output_schema_for_role("Planner", stage="design")``) is the §14.1 contract
+    the real run writes; the plan reports it as the would-be output schema.
+    Reports the would-be run + the promote targets (``02-design.{json,md}``) so
+    the operator sees the full generate->promote slice before committing to a
+    real run. ``feedback`` (when given) is surfaced in the plan so the refinement
+    channel (ADR-0008 D4) is visible.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    # Preconditions mirror the real leg exactly (so a missing intent or an
+    # unfrozen-requirements rejection fails loud here as it would at run time).
+    # ``read_frozen_requirements_doc`` raises ValueError when requirements is not
+    # frozen - the design gate's gating precondition (ADR-0008 D2).
+    intent = read_intent(feature_root)
+    req_doc = read_frozen_requirements_doc(feature_root)
+    req_summary = _render_frozen_requirements_summary(req_doc)
+    task_text = _design_task_text(feature_id, intent, req_summary, feedback)
+    schema = output_schema_for_role(_PLANNER_ROLE, stage="design")
+    _require_token_source(profile)
+
+    temp_root, input_dir = _render_temp_package(
+        feature_id, _PLANNER_ROLE, task_text, [], schema
+    )
+    details = _agent_invocation_details(
+        profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode
+    )
+    details.update(
+        {
+            "role": _PLANNER_ROLE,
+            "stage": "design",
+            "task_package": str(input_dir / TASK_PACKAGE_FILE),
+            "output_schema": "design proposal (id-free; promote allocates DES ids)",
+            "upstream": "01-requirements.json (frozen REQ ids; stitched via add_upstream)",
+            "feedback": feedback if (feedback is not None and feedback.strip()) else None,
+            "temp_dir": str(temp_root),
+            "would_mint_ids": ["RUN-NNN (next monotonic)"],
+            "would_write": [
+                "runs/RUN-NNN/input/* (design-proposal-schema package)",
+                "runs/RUN-NNN/output/{result.json,result.md,metadata.json,...}",
+                "02-design.json (canonical-unfrozen, via promote)",
+                "02-design.md (rendered mirror, via promote)",
+            ],
+            # promote is gated on a passing validation in the real leg; surfaced
+            # so the plan is honest that a schema-invalid proposal promotes nothing.
+            "would_promote": "gated on validate-run PASS (proposal schema-valid)",
+        }
+    )
+    return DryRunPlan(
+        command="generate-design",
+        feature_id=feature_id,
+        summary=(
+            f"GENERATE-DESIGN DRY-RUN - would prepare {_PLANNER_ROLE} run "
+            f"for {feature_id} + spawn {profile.cli} (no id minted, no spawn)"
+        ),
+        details=details,
+    )
+
+
 def _plan_checking(
     repo_root: Path,
     feature_id: str,
@@ -657,10 +744,15 @@ def plan_fix_run(
 
 
 def plan_freeze(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
-    """Plan a ``freeze``: legality check (unknown / already-frozen), no write.
+    """Plan a ``freeze``: legality check (unknown / already-frozen / coverage gap), no write.
 
-    Unknown artifact → ``ValueError`` (exit 1). Already frozen → reported as
-    ``would be refused`` (exit 0), mirroring the real ``FrozenArtifactError``.
+    Unknown artifact -> ``ValueError`` (exit 1). Already frozen -> reported as
+    ``would be refused`` (exit 0), mirroring the real ``FrozenArtifactError``. A
+    freeze-gate coverage gap (ADR-0008 D3 - an upstream id not referenced, e.g. a
+    REQ missing from every design ``requirement_mapping``) is also reported as
+    ``would be refused`` (exit 0). A corrupt precondition (design freeze before
+    requirements frozen, or no design promoted to freeze) raises ``ValueError``
+    (exit 1), mirroring the real CLI.
     """
     if artifact not in FROZEN_ARTIFACTS:
         raise ValueError(
@@ -677,15 +769,33 @@ def plan_freeze(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
         "artifact": artifact,
         "currently_frozen": already,
     }
-    if already:
+    # ADR-0008 D3: the freeze-gate coverage precheck runs BEFORE the already-frozen
+    # short-circuit, mirroring the real CLI (which runs coverage before the
+    # already-frozen guard inside ``freeze_artifact``) - so dry-run reports the
+    # same refusal *reason* the real command would for every case (a hand-edited
+    # frozen design with a gap reports "coverage gap", not "already frozen").
+    # Stages with no upstream invariant (requirements, lane_graph) return None -
+    # no precheck. A corrupt precondition (design freeze before requirements
+    # frozen, or no 02-design.json to freeze) raises ValueError - which propagates
+    # as exit 1, mirroring the real CLI (a precondition error, not a refusal). A
+    # coverage *gap* (uncovered upstream ids) is a legality refusal the real
+    # command would reject - reported here as ``would be refused`` and exits 0,
+    # the dry-run convention for "this would be refused" (§18.2).
+    coverage = freeze_gate_coverage(artifact, feature_root)
+    if coverage is not None and not coverage.ok:
+        details["would_be_refused"] = True
+        details["refusal_reason"] = coverage.refusal_message(artifact, would=True)
+        summary = (
+            f"FREEZE DRY-RUN - would be REFUSED: {artifact} coverage gap "
+            f"({len(coverage.uncovered)} {coverage.upstream_type} uncovered)"
+        )
+    elif already:
         details["would_be_refused"] = True
         details["refusal_reason"] = (
             f"artifact {artifact!r} is already frozen; use a Change Proposal to "
             f"change it (§4.2)"
         )
-        summary = (
-            f"FREEZE DRY-RUN - would be REFUSED: {artifact} already frozen"
-        )
+        summary = f"FREEZE DRY-RUN - would be REFUSED: {artifact} already frozen"
     else:
         details["would_be_refused"] = False
         details["would_advance_current_gate_to"] = target

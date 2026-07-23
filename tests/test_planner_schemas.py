@@ -87,10 +87,11 @@ class TestPlannerOutputSchemaLookup:
         assert planner_output_schema("requirements") is REQUIREMENTS_PROPOSAL_SCHEMA
 
     def test_unknown_stage_fails_loud(self) -> None:
-        # design/tasks are wired in tickets 03/04; until then an unwired stage is
-        # a config error, not a silent fallback to the implementer schema.
+        # requirements (ticket 01) and design (ticket 03) are wired; tasks is
+        # wired in ticket 04. Until then an unwired stage is a config error, not
+        # a silent fallback to the implementer schema.
         with pytest.raises(ValueError, match="no Planner proposal schema"):
-            planner_output_schema("design")
+            planner_output_schema("tasks")
 
     def test_all_declared_stages_are_documented(self) -> None:
         # The three §23.5 planning stages. Only `requirements` is wired here.

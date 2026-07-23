@@ -140,6 +140,7 @@ from ai_dev.dry_run import (
     plan_freeze,
     plan_project_github,
     plan_implement,
+    plan_generate_design,
     plan_generate_requirements,
     plan_lane_gate,
     plan_review,
@@ -158,8 +159,13 @@ from ai_dev.github_projection import (
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
+from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
-from ai_dev.planner_leg import PlannerLegResult, run_generate_requirements
+from ai_dev.planner_leg import (
+    PlannerLegResult,
+    run_generate_design,
+    run_generate_requirements,
+)
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
     PROFILE_COMPARISON_MD,
@@ -520,6 +526,50 @@ def _build_parser() -> argparse.ArgumentParser:
         "enforces the file boundary post-hoc, §14.2).",
     )
 
+    # v0.6 ticket 03: the second planning gate - generate-design. The Planner
+    # runs against the frozen requirements (the upstream); promote fires
+    # automatically, writing the canonical-unfrozen 02-design.{json,md} with a
+    # stitched requirement_mapping; --feedback refines; freeze design (the
+    # existing command, now running the coverage precheck) is the human gate.
+    gen_design = subparsers.add_parser(
+        "generate-design",
+        help="Run the Planner design leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 02-design against the frozen requirements "
+        "(v0.6 ticket 03, ADR-0008).",
+        parents=[repo_root_parent],
+    )
+    gen_design.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "the Planner designs against. Requirements must be frozen first.",
+    )
+    gen_design.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 02-design until you freeze it.",
+    )
+    gen_design.add_argument(
+        "--profile",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+    gen_design.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    gen_design.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+
     implement = subparsers.add_parser(
         "implement",
         help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
@@ -868,6 +918,7 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "review",
         "spec-gap",
         "generate-requirements",
+        "generate-design",
         "fix-run",
         "freeze",
         "triage",
@@ -918,12 +969,14 @@ def _run_dry_plan(planner: "Callable[[], DryRunPlan]") -> int:
 
 
 def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
-    """Resolve the feature run and delegate to ``freeze_artifact``.
+    """Resolve the feature run, run the freeze-gate coverage precheck, then freeze.
 
-    Returns a process exit code: ``0`` on a successful freeze, ``1`` if the run
-    is missing or the artifact is already frozen (§4.2 monotonic — re-freezing
-    is rejected, not silently reapplied). Other failures propagate (§24.2 fail
-    loud).
+    Returns a process exit code: ``0`` on a successful freeze; ``1`` if the run
+    is missing, the artifact is already frozen (§4.2 monotonic), or the
+    freeze-gate coverage precheck refuses (ADR-0008 D3 - a planning artifact
+    with an upstream coverage invariant may not freeze until every upstream id is
+    referenced, e.g. every REQ in some design ``requirement_mapping`` for the
+    design gate, §18.2). Other failures propagate (§24.2 fail loud).
     """
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
@@ -931,6 +984,23 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
             ValueError(f"feature run {feature_id} not found under {repo_root}"),
             hint=_lookup_hint(repo_root, feature_id),
         )
+        return 1
+    # ADR-0008 D3: coverage-completeness is checked at the freeze action. Stages
+    # with no upstream coverage invariant (requirements = root, lane_graph)
+    # return None - no precheck. A gap refuses to freeze (no self-heal): the
+    # human refines (generate-X --feedback) or routes to Triage. The precheck
+    # gates the freeze here (the CLI layer), not inside ``freeze_artifact``: the
+    # primitive is a pure low-level writer with no artifact-reading dependency,
+    # and the CLI is the sole production freeze path.
+    try:
+        coverage = freeze_gate_coverage(artifact, feature_root)
+    except ValueError as exc:
+        # A corrupt precondition (e.g. design freeze before requirements frozen)
+        # surfaces as a clean error rather than a traceback.
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    if coverage is not None and not coverage.ok:
+        _render_error(ValueError(coverage.refusal_message(artifact)))
         return 1
     try:
         freeze_artifact(feature_root, artifact, origin=ORIGIN_CLI)
@@ -1192,6 +1262,73 @@ def _run_generate_requirements(
         return 1
     print(
         f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_design(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner design leg end to end (v0.6 ticket 03, §9.1, ADR-0008 D2).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_design`` (build the Planner input package from the feature
+    intent + frozen requirements -> run headless -> validate -> promote, gated on
+    validation), and prints a one-line summary. Returns ``0`` when the run
+    validated and promote wrote the canonical-unfrozen ``02-design.{json,md}``;
+    ``1`` when validation failed (a captured run failure is reported, not raised
+    - no canonical artifact is written for a schema-invalid proposal) or when the
+    leg cannot start (missing feature/intent, requirements not frozen, missing
+    token). promote errors (malformed proposal / unresolved ref / frozen artifact)
+    propagate as a clean ``error:`` line via the top-level handler.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        _render_error(exc)
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_design(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
+    # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        des_ids = list(promote.allocated.get("DES", []))
+        print(
+            f"GENERATE-DESIGN PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"DES={des_ids}"
+        )
+        return 0
+    # Distinguish the two no-promote causes honestly (mirrors the requirements leg).
+    if result.validation.passed:
+        print(
+            f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
         f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
         f"§14 validation):"
     )
@@ -1833,6 +1970,45 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             origin=ORIGIN_PLANNER_LEG,
         )
         return _run_generate_requirements(
+            repo_root,
+            args.feature_id,
+            profile_name,
+            args.feedback,
+            args.max_turns,
+            args.permission_mode,
+        )
+
+    if args.command == "generate-design":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_PLANNER, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_generate_design(
+                    repo_root,
+                    args.feature_id,
+                    load_profile(repo_root, profile_name),
+                    feedback=args.feedback,
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
+        # Record the resolved Planner profile on the feature's agent_profiles
+        # config (the record compare-profiles reads). Dry-run skips it -
+        # recording is a canonical status write. Same Planner role as the
+        # requirements leg (the design leg is the Planner's second stage).
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_PLANNER,
+            profile_name,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+        return _run_generate_design(
             repo_root,
             args.feature_id,
             profile_name,

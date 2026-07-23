@@ -23,11 +23,16 @@ from ai_dev.promote import (
     PromoteResult,
     RefResolver,
     UnresolvedRefError,
+    build_canonical_design,
     build_canonical_requirements,
+    promote_design,
     promote_requirements,
+    read_frozen_requirements_doc,
+    render_design_md,
     render_requirements_md,
 )
 from ai_dev.status import freeze_artifact
+from ai_dev.templates import DESIGN_JSON, DESIGN_MD, REQUIREMENTS_JSON
 
 FEATURE_ID = "FEATURE-001"
 
@@ -456,3 +461,349 @@ class TestRenderRequirementsMdEdgeCases:
         }
         md = render_requirements_md(FEATURE_ID, doc)
         assert "_None._" in md
+
+
+# ---------------------------------------------------------------------------
+# Design stage (ticket 03): promote_design stitches requirement_mapping
+# against the FROZEN requirements upstream (first live use of RefResolver's
+# add_upstream path) + allocates DES ids + renders 02-design.{json,md}.
+# ---------------------------------------------------------------------------
+
+
+def _feature_with_frozen_requirements(
+    tmp_path: Path, req_proposal: dict | None = None
+) -> tuple[Path, list[str]]:
+    """Create a feature run, promote + freeze requirements, return (root, req_ids).
+
+    Design may only stitch against a *frozen* requirements artifact (ADR-0008
+    D2), so every design test needs a feature whose requirements are promoted
+    then frozen. Returns the allocated REQ ids (the upstream set design refs).
+    """
+    create_feature_run(tmp_path, "build the foo")
+    root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+    if req_proposal is None:
+        req_proposal = {
+            "requirements": [
+                {"key": "r1", "statement": "The system shall foo."},
+                {"key": "r2", "statement": "The system shall bar."},
+            ],
+            "acceptance_criteria": [
+                {"key": "a1", "requirement": "r1", "criterion": "foo observable"}
+            ],
+        }
+    promote_requirements(root, FEATURE_ID, req_proposal, origin="test")
+    freeze_artifact(root, "requirements", origin="test")
+    doc = json.loads((root / REQUIREMENTS_JSON).read_text())
+    return root, [r["id"] for r in doc["requirements"]]
+
+
+def _design_proposal(req_ids: list[str]) -> dict:
+    """A synthetic id-free design proposal referencing frozen REQ ids + local DES keys."""
+    return {
+        "design_elements": [
+            {
+                "key": "d1",
+                "name": "Greeting module",
+                "description": "formats the greeting string",
+            },
+            {"key": "d2", "name": "Exit-code handling", "type": "module"},
+        ],
+        "requirement_mapping": [
+            {
+                "key": "m1",
+                "requirement": req_ids[0],
+                "design_elements": ["d1"],
+                "rationale": "d1 realizes the greeting REQ",
+            },
+            {"key": "m2", "requirement": req_ids[1], "design_elements": ["d1", "d2"]},
+        ],
+        "architecture_decision": "Single-module CLI",
+        "data_model": {"Greeting": {"name": "str"}},
+        "file_layout": ["src/greet.py"],
+        "invariants": ["greeting is deterministic"],
+        "risks": ["locale differences"],
+        "dependencies": ["stdlib only"],
+    }
+
+
+class TestReadFrozenRequirementsDoc:
+    def test_returns_doc_when_requirements_frozen(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        doc = read_frozen_requirements_doc(root)
+        assert doc["feature"] == FEATURE_ID
+        assert [r["id"] for r in doc["requirements"]] == ["REQ-001", "REQ-002"]
+
+    def test_fails_loud_when_requirements_not_frozen(self, tmp_path: Path) -> None:
+        # A fresh feature run: requirements promoted but NOT frozen.
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        promote_requirements(
+            root,
+            FEATURE_ID,
+            {
+                "requirements": [{"key": "r1", "statement": "foo."}],
+                "acceptance_criteria": [],
+            },
+            origin="test",
+        )
+        with pytest.raises(ValueError, match="not frozen"):
+            read_frozen_requirements_doc(root)
+
+
+class TestBuildCanonicalDesign:
+    def test_allocates_des_ids_in_order(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, allocated = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        assert allocated == {"DES": ["DES-001", "DES-002"]}
+        assert [el["id"] for el in doc["design_elements"]] == ["DES-001", "DES-002"]
+
+    def test_stitches_mapping_requirement_to_frozen_req_ids(
+        self, tmp_path: Path
+    ) -> None:
+        # The first live use of RefResolver.add_upstream: mapping `requirement`
+        # refs (canonical REQ-NNN) resolve against the frozen upstream set.
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, _ = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        req_of = {m["key"]: m["requirement"] for m in doc["requirement_mapping"]}
+        assert req_of["m1"] == "REQ-001"
+        assert req_of["m2"] == "REQ-002"
+        # No local key leaks into the canonical ref - it is the frozen REQ id.
+        assert all(m["requirement"].startswith("REQ-") for m in doc["requirement_mapping"])
+
+    def test_stitches_mapping_design_elements_to_local_des_ids(
+        self, tmp_path: Path
+    ) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, _ = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        des_of = {m["key"]: m["design_elements"] for m in doc["requirement_mapping"]}
+        # m1 -> [d1] -> [DES-001]; m2 -> [d1, d2] -> [DES-001, DES-002].
+        assert des_of["m1"] == ["DES-001"]
+        assert des_of["m2"] == ["DES-001", "DES-002"]
+
+    def test_carries_optional_facets_and_local_keys_as_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, _ = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        assert doc["feature"] == FEATURE_ID
+        assert doc["frozen"] is False
+        assert doc["architecture_decision"] == "Single-module CLI"
+        assert doc["data_model"] == {"Greeting": {"name": "str"}}
+        assert doc["invariants"] == ["greeting is deterministic"]
+        assert doc["risks"] == ["locale differences"]
+        assert doc["dependencies"] == ["stdlib only"]
+        # The model's local keys are retained as provenance.
+        assert doc["design_elements"][0]["key"] == "d1"
+        assert doc["requirement_mapping"][0]["key"] == "m1"
+
+    def test_unresolvable_req_ref_fails_loud(self, tmp_path: Path) -> None:
+        # A mapping ref to a REQ that was never frozen (REQ-099) is a malformed
+        # proposal -> reference-integrity (D3) fails loud, nothing written.
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        proposal = _design_proposal(["REQ-001", "REQ-002"])
+        proposal["requirement_mapping"][1]["requirement"] = "REQ-099"
+        with pytest.raises(UnresolvedRefError, match="REQ-099"):
+            build_canonical_design(root, FEATURE_ID, proposal, origin=None)
+
+    def test_unresolvable_des_local_ref_fails_loud(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        proposal = _design_proposal(req_ids)
+        proposal["requirement_mapping"][0]["design_elements"] = ["d9"]  # no such DES
+        with pytest.raises(UnresolvedRefError, match="d9"):
+            build_canonical_design(root, FEATURE_ID, proposal, origin=None)
+
+    def test_fails_loud_when_requirements_not_frozen(self, tmp_path: Path) -> None:
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        with pytest.raises(ValueError, match="not frozen"):
+            build_canonical_design(
+                root, FEATURE_ID, _design_proposal(["REQ-001", "REQ-002"]), origin=None
+            )
+
+    def test_omits_optional_facets_when_absent(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        proposal = {
+            "design_elements": [{"key": "d1", "name": "only"}],
+            "requirement_mapping": [
+                {"key": "m1", "requirement": req_ids[0], "design_elements": ["d1"]}
+            ],
+        }
+        doc, allocated = build_canonical_design(
+            root, FEATURE_ID, proposal, origin=None
+        )
+        assert allocated == {"DES": ["DES-001"]}
+        for facet in (
+            "architecture_decision",
+            "data_model",
+            "api_cli_contract",
+            "file_layout",
+            "invariants",
+            "risks",
+            "dependencies",
+        ):
+            assert facet not in doc
+
+
+class TestRenderDesignMd:
+    def test_renders_des_ids_and_stitched_mapping(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, _ = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        md = render_design_md(FEATURE_ID, doc)
+        # DES ids appear.
+        assert "DES-001" in md and "DES-002" in md
+        # The stitched mapping: REQ id + DES ids (not local keys).
+        assert "REQ-001" in md and "REQ-002" in md
+        assert "REQ **REQ-001** <- [DES-001]" in md
+        assert "REQ **REQ-002** <- [DES-001, DES-002]" in md
+        # Design-element names render as headings; frozen state mirrored.
+        assert "Greeting module" in md
+        assert "Frozen: false" in md
+
+    def test_renders_empty_artifact_without_ids(self) -> None:
+        doc = {
+            "feature": FEATURE_ID,
+            "frozen": False,
+            "design_elements": [],
+            "requirement_mapping": [],
+        }
+        md = render_design_md(FEATURE_ID, doc)
+        assert "_None yet._" in md
+        assert "### DES-" not in md
+
+    def test_render_is_deterministic(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        doc, _ = build_canonical_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin=None
+        )
+        assert render_design_md(FEATURE_ID, doc) == render_design_md(FEATURE_ID, doc)
+
+
+class TestPromoteDesign:
+    def test_writes_canonical_json_and_md_mirror(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        result = promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+
+        assert isinstance(result, PromoteResult)
+        assert result.stage == "design"
+        assert result.artifact == "design"
+        assert result.json_path == root / DESIGN_JSON
+        assert result.md_path == root / DESIGN_MD
+        assert result.json_path.is_file()
+        assert result.md_path.is_file()
+
+        doc = json.loads(result.json_path.read_text())
+        assert doc["frozen"] is False
+        assert [el["id"] for el in doc["design_elements"]] == ["DES-001", "DES-002"]
+
+    def test_allocates_from_counter_and_persists_it(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+        counters = yaml.safe_load((root / "id-counters.yml").read_text())
+        assert counters["DES"] == 2
+
+    def test_appends_promote_audit_event(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+        records = json.loads((root / "audit.log.json").read_text())
+        promote_records = [r for r in records if r["event"] == "promote" and r["payload"]["stage"] == "design"]
+        assert len(promote_records) == 1
+        payload = promote_records[0]["payload"]
+        assert payload["artifact"] == "design"
+        assert payload["allocated"] == {"DES": ["DES-001", "DES-002"]}
+        assert promote_records[0]["origin"] == "cli"
+
+    def test_unresolvable_ref_writes_nothing(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        seed = (root / DESIGN_JSON).read_text()
+        proposal = _design_proposal(["REQ-001", "REQ-002"])
+        proposal["requirement_mapping"][1]["requirement"] = "REQ-099"
+        with pytest.raises(UnresolvedRefError, match="REQ-099"):
+            promote_design(root, FEATURE_ID, proposal, origin="cli")
+        # The canonical artifact + audit log are unchanged - fail loud, no partial promote.
+        assert (root / DESIGN_JSON).read_text() == seed
+        records = json.loads((root / "audit.log.json").read_text())
+        assert not any(
+            r["event"] == "promote" and r["payload"].get("stage") == "design"
+            for r in records
+        )
+
+    def test_refuses_to_overwrite_a_frozen_design(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+        freeze_artifact(root, "design", origin="cli")
+        with pytest.raises(FrozenArtifactWriteError):
+            promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+
+    def test_re_promote_overwrites_and_reallocates_ids(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        first = promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+        assert list(first.allocated["DES"]) == ["DES-001", "DES-002"]
+        second = promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="cli")
+        # New ids from the bumped counter; canonical file overwritten.
+        assert list(second.allocated["DES"]) == ["DES-003", "DES-004"]
+        doc = json.loads((root / DESIGN_JSON).read_text())
+        assert [el["id"] for el in doc["design_elements"]] == ["DES-003", "DES-004"]
+
+    def test_rejects_empty_feature_id(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        with pytest.raises(ValueError, match="feature_id"):
+            promote_design(root, "", _design_proposal(req_ids), origin="cli")
+
+    def test_refuses_if_requirements_not_frozen(self, tmp_path: Path) -> None:
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        with pytest.raises(ValueError, match="not frozen"):
+            promote_design(
+                root, FEATURE_ID, _design_proposal(["REQ-001", "REQ-002"]), origin="cli"
+            )
+
+
+class TestPromoteDesignMalformedProposal:
+    """§24.2: a malformed design proposal fails loud rather than being silently coerced."""
+
+    def test_design_elements_not_a_list(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        with pytest.raises(ValueError, match="'design_elements' must be a list"):
+            promote_design(
+                root,
+                FEATURE_ID,
+                {"design_elements": {}, "requirement_mapping": []},
+                origin="cli",
+            )
+
+    def test_design_element_missing_key(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        proposal = {
+            "design_elements": [{"name": "no key"}],
+            "requirement_mapping": [],
+        }
+        with pytest.raises(ValueError, match="non-empty string 'key'"):
+            promote_design(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_design_element_missing_name(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        proposal = {
+            "design_elements": [{"key": "d1"}],
+            "requirement_mapping": [],
+        }
+        with pytest.raises(ValueError, match="non-empty string 'name'"):
+            promote_design(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_mapping_missing_requirement_ref(self, tmp_path: Path) -> None:
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        proposal = {
+            "design_elements": [{"key": "d1", "name": "n"}],
+            "requirement_mapping": [{"key": "m1", "design_elements": ["d1"]}],
+        }
+        with pytest.raises(ValueError, match="non-empty string 'requirement'"):
+            promote_design(root, FEATURE_ID, proposal, origin="cli")
