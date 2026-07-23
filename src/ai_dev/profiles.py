@@ -52,6 +52,11 @@ ROLE_DEFAULTS_KEY = "role_defaults"
 ROLE_IMPLEMENTER = "implementer"
 ROLE_REVIEWER = "reviewer"
 ROLE_SPEC_GAP_ANALYST = "spec_gap_analyst"
+# v0.6 ticket 02: the Planner (spec §9.1) — the model role that authors the
+# id-free requirements/design/tasks proposals. The ``generate-X`` legs resolve
+# their profile through this key (``role_defaults[planner]``), exactly as the
+# implementer/reviewer/spec-gap legs resolve theirs.
+ROLE_PLANNER = "planner"
 
 
 class ProfileError(ValueError):

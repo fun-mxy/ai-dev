@@ -74,6 +74,10 @@ from ai_dev.paths import (
     lane_dir,
     run_dir,
 )
+from ai_dev.planner_leg import _planner_task_text, read_intent
+# The model-role token lives in planner_schemas (planner_leg only re-exports it);
+# import from its home rather than through the leg (avoid a Middle Man hop).
+from ai_dev.planner_schemas import PLANNER_ROLE as _PLANNER_ROLE
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
     PROFILE_COMPARISON_MD,
@@ -83,6 +87,7 @@ from ai_dev.profiles import AgentProfile, token_source_var
 from ai_dev.run_prepare import (
     ALLOWED_FILES_FILE,
     TASK_PACKAGE_FILE,
+    output_schema_for_role,
     write_input_package_to,
 )
 from ai_dev.run_wrapper import (
@@ -379,6 +384,75 @@ def plan_implement(
         summary=(
             f"IMPLEMENT DRY-RUN - would prepare {_IMPLEMENTER_ROLE} run for lane "
             f"{lane_id} + spawn {profile.cli} (no id minted, no spawn)"
+        ),
+        details=details,
+    )
+
+
+def plan_generate_requirements(
+    repo_root: Path,
+    feature_id: str,
+    profile: AgentProfile,
+    *,
+    feedback: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+) -> DryRunPlan:
+    """Plan a ``generate-requirements`` leg: intent read + temp-dir package, no spawn.
+
+    Reuses the Planner leg's precondition reads (feature exists, intent present
+    in ``00-intent.md``) and renders the would-be Planner input package into a
+    temp dir instead of minting ``RUN-NNN``. The proposal schema
+    (``output_schema_for_role("Planner", stage="requirements")``) is the §14.1
+    contract the real run writes; the plan reports it as the would-be output
+    schema. Reports the would-be run + the promote targets
+    (``01-requirements.{json,md}``) so the operator sees the full generate→
+    promote slice before committing to a real run. ``feedback`` (when given) is
+    surfaced in the plan so the refinement channel is visible.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    # Precondition: the intent must exist (the Planner elaborates from it). Reads
+    # the same helper the real leg uses, so a missing/empty intent fails loud
+    # here exactly as it would at run time.
+    intent = read_intent(feature_root)
+    task_text = _planner_task_text(feature_id, intent, feedback)
+    schema = output_schema_for_role(_PLANNER_ROLE, stage="requirements")
+    _require_token_source(profile)
+
+    temp_root, input_dir = _render_temp_package(
+        feature_id, _PLANNER_ROLE, task_text, [], schema
+    )
+    details = _agent_invocation_details(
+        profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode
+    )
+    details.update(
+        {
+            "role": _PLANNER_ROLE,
+            "stage": "requirements",
+            "task_package": str(input_dir / TASK_PACKAGE_FILE),
+            "output_schema": "requirements proposal (id-free; promote allocates ids)",
+            "feedback": feedback if (feedback is not None and feedback.strip()) else None,
+            "temp_dir": str(temp_root),
+            "would_mint_ids": ["RUN-NNN (next monotonic)"],
+            "would_write": [
+                "runs/RUN-NNN/input/* (proposal-schema package)",
+                "runs/RUN-NNN/output/{result.json,result.md,metadata.json,...}",
+                "01-requirements.json (canonical-unfrozen, via promote)",
+                "01-requirements.md (rendered mirror, via promote)",
+            ],
+            # promote is gated on a passing validation in the real leg; surfaced
+            # so the plan is honest that a schema-invalid proposal promotes nothing.
+            "would_promote": "gated on validate-run PASS (proposal schema-valid)",
+        }
+    )
+    return DryRunPlan(
+        command="generate-requirements",
+        feature_id=feature_id,
+        summary=(
+            f"GENERATE-REQUIREMENTS DRY-RUN - would prepare {_PLANNER_ROLE} run "
+            f"for {feature_id} + spawn {profile.cli} (no id minted, no spawn)"
         ),
         details=details,
     )

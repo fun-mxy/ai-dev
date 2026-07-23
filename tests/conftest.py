@@ -39,6 +39,7 @@ role_defaults:
   implementer: cc-glm52
   reviewer: cc-glm52
   spec_gap_analyst: cc-glm52
+  planner: cc-glm52
 """
 
 

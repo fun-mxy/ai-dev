@@ -140,6 +140,7 @@ from ai_dev.dry_run import (
     plan_freeze,
     plan_project_github,
     plan_implement,
+    plan_generate_requirements,
     plan_lane_gate,
     plan_review,
     plan_run_headless,
@@ -158,6 +159,7 @@ from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
+from ai_dev.planner_leg import PlannerLegResult, run_generate_requirements
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
     PROFILE_COMPARISON_MD,
@@ -167,6 +169,7 @@ from ai_dev.profile_comparison import (
 from ai_dev.profiles import (
     ProfileError,
     ROLE_IMPLEMENTER,
+    ROLE_PLANNER,
     ROLE_REVIEWER,
     ROLE_SPEC_GAP_ANALYST,
     load_profile,
@@ -205,6 +208,7 @@ ORIGIN_REVIEW_LEG = "review-leg"
 ORIGIN_SPEC_GAP_LEG = "spec-gap-leg"
 ORIGIN_VERIFIER = "verifier"
 ORIGIN_FIX_RUN_DRIVER = "fix-run-driver"
+ORIGIN_PLANNER_LEG = "planner-leg"
 
 
 def _print_validation_issues(issues: Sequence[ValidationIssue]) -> None:
@@ -470,6 +474,51 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
     validate.add_argument("run_id", help="The RUN-NNN id to validate.")
+
+    # v0.6 ticket 02: the first live planning gate — a complete
+    # generate -> promote -> review -> freeze vertical slice for requirements
+    # (ADR-0008). The Planner role (cc-glm52 via role_defaults) runs through the
+    # existing run_wrapper; promote fires automatically after the run, writing
+    # the canonical-unfrozen 01-requirements.{json,md}; --feedback carries the
+    # human's refinement note; freeze (the existing command) is the human gate.
+    gen_req = subparsers.add_parser(
+        "generate-requirements",
+        help="Run the Planner requirements leg: generate -> validate -> auto "
+        "promote the canonical-unfrozen 01-requirements (v0.6 ticket 02, "
+        "ADR-0008).",
+        parents=[repo_root_parent],
+    )
+    gen_req.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose intent (00-intent.md) the Planner elaborates "
+        "into a requirements proposal.",
+    )
+    gen_req.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 01-requirements until you freeze it.",
+    )
+    gen_req.add_argument(
+        "--profile",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+    gen_req.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    gen_req.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
 
     implement = subparsers.add_parser(
         "implement",
@@ -818,6 +867,7 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "implement",
         "review",
         "spec-gap",
+        "generate-requirements",
         "fix-run",
         "freeze",
         "triage",
@@ -1073,6 +1123,78 @@ def _run_implement(
         return 0
     print(f"IMPLEMENT FAIL - {result.run_id} lane={result.lane_id} "
           f"({len(result.validation.issues)} problem(s)):")
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_requirements(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner requirements leg end to end (v0.6 ticket 02, §9.1).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_requirements`` (build the Planner input package from the
+    feature intent -> run headless -> validate -> promote, gated on validation),
+    and prints a one-line summary. Returns ``0`` when the run validated and
+    promote wrote the canonical-unfrozen ``01-requirements.{json,md}``; ``1``
+    when validation failed (a captured run failure is reported, not raised — no
+    canonical artifact is written for a schema-invalid proposal) or when the leg
+    cannot start (missing feature/intent, missing token). promote errors
+    (malformed proposal / frozen artifact) propagate as a clean ``error:`` line
+    via the top-level handler.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        _render_error(exc)
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_requirements(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
+    # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        req_ids = list(promote.allocated.get("REQ", []))
+        ac_ids = list(promote.allocated.get("AC", []))
+        print(
+            f"GENERATE-REQUIREMENTS PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"REQ={req_ids} AC={ac_ids}"
+        )
+        return 0
+    # Distinguish the two no-promote causes honestly. Validation failing is the
+    # expected one (a captured run failure / §14 breach → no canonical write). The
+    # belt-and-braces race where validation passed but no readable result.json
+    # reached promote is reported as the unexpected case it is — NOT as a schema
+    # failure, since validation already attested the proposal is schema-valid.
+    if result.validation.passed:
+        print(
+            f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
     _print_validation_issues(result.validation.issues)
     return 1
 
@@ -1680,6 +1802,44 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "validate-run":
         return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
+
+    if args.command == "generate-requirements":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_PLANNER, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_generate_requirements(
+                    repo_root,
+                    args.feature_id,
+                    load_profile(repo_root, profile_name),
+                    feedback=args.feedback,
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
+        # Record the resolved Planner profile on the feature's agent_profiles
+        # config (the record compare-profiles reads). Dry-run skips it —
+        # recording is a canonical status write.
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_PLANNER,
+            profile_name,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+        return _run_generate_requirements(
+            repo_root,
+            args.feature_id,
+            profile_name,
+            args.feedback,
+            args.max_turns,
+            args.permission_mode,
+        )
 
     if args.command == "implement":
         repo_root = Path(args.repo_root)
