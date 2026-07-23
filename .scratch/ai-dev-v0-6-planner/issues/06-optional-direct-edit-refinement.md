@@ -16,8 +16,8 @@ On accept→freeze, the existing reference-integrity + coverage checks still run
 
 **Status:** ready-for-agent (optional — may be deferred past the v0.6 capstone)
 
-- [ ] human can edit an **unfrozen** canonical `.json`; `render` re-renders the `.md` mirror
-- [ ] `allocate-id` helper assigns the next counter id for human-added items
-- [ ] edits rejected on **frozen** artifacts (frozen ⇒ CP, out of scope for v0.6)
-- [ ] reference-integrity + coverage checks still run at the subsequent freeze
-- [ ] `uv run mypy` + `uv run pytest` green
+- [x] human can edit an **unfrozen** canonical `.json`; `render` re-renders the `.md` mirror
+- [x] `allocate-id` helper assigns the next counter id for human-added items
+- [x] edits rejected on **frozen** artifacts (frozen ⇒ CP, out of scope for v0.6)
+- [x] reference-integrity + coverage checks still run at the subsequent freeze
+- [x] `uv run mypy` + `uv run pytest` green

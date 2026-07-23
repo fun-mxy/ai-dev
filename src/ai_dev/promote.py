@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -1439,3 +1439,335 @@ def promote_tasks(
         md_path=md_path,
         allocated={k: tuple(v) for k, v in allocated.items()},
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct-edit refinement channel (ADR-0008 D4, v0.6 ticket 06 — optional).
+#
+# Alongside the model-mediated feedback loop (the primary refinement path,
+# tickets 02-04), a human may **directly edit the canonical *unfrozen* ``.json``
+# of a planning artifact** for a surgical fix (a typo in a statement, rewording a
+# DES) without a model round-trip. ``render`` is the deterministic bookend that
+# keeps the single-source-of-truth invariant (D2) holding: it re-renders the
+# ``.md`` mirror from the edited ``.json`` so markdown never drifts. It targets
+# the three json+md artifacts (requirements / design / tasks); ``lane_graph`` is a
+# YAML-only artifact with no md mirror, so it is not renderable.
+#
+# §4.3 reserves ids/status/gate-verdict for deterministic scripts — unfrozen
+# *content* is editable; the artifact must still be **unfrozen** (a frozen
+# artifact ⇒ Change Proposal, §17, out of scope for v0.6). ``render`` refuses a
+# frozen artifact outright (the direct-edit channel is closed past freeze). The
+# ``allocate-id`` CLI helper (ticket 06) is the companion that mints the next
+# counter id for any *new* item the human adds, so ids stay in the counter and
+# out of human hands (§4.3).
+# ---------------------------------------------------------------------------
+
+# The audit event for a direct-edit render (the bookend of the human edit
+# channel). One record per render, carrying the artifact re-rendered.
+_RENDER_EVENT = "render"
+
+# The §4.2 artifacts that carry a json+md pair and are therefore renderable:
+# requirements / design / tasks. ``lane_graph`` (``04-lane-graph.yml``) is
+# YAML-only with no md mirror, so it is absent — render has nothing to render
+# for it. Public so the CLI's argparse ``choices`` share one source of truth.
+RENDERABLE_ARTIFACTS: tuple[str, ...] = (
+    REQUIREMENTS_ARTIFACT,
+    DESIGN_ARTIFACT,
+    TASKS_ARTIFACT,
+)
+
+# artifact -> canonical ``.json`` filename (the source of truth render reads).
+# Public + paired with ``artifact_md_file`` so the renderable-artifact → filename
+# knowledge lives in one place (promote owns the artifact model, ADR-0008 D2);
+# dry-run / CLI import these rather than re-declaring the map (no Shotgun Surgery
+# when a json+md artifact is added).
+_ARTIFACT_JSON_FILE: Mapping[str, str] = {
+    REQUIREMENTS_ARTIFACT: REQUIREMENTS_JSON,
+    DESIGN_ARTIFACT: DESIGN_JSON,
+    TASKS_ARTIFACT: TASKS_JSON,
+}
+
+# artifact -> ``.md`` mirror filename (the rendered output render writes).
+_ARTIFACT_MD_FILE: Mapping[str, str] = {
+    REQUIREMENTS_ARTIFACT: REQUIREMENTS_MD,
+    DESIGN_ARTIFACT: DESIGN_MD,
+    TASKS_ARTIFACT: TASKS_MD,
+}
+
+
+def artifact_json_file(artifact: str) -> str:
+    """The canonical ``.json`` filename for a renderable ``artifact``.
+
+    The single source of truth for the artifact → json-filename mapping (paired
+    with :func:`artifact_md_file`); callers that need the filename import this
+    rather than re-declaring the table. Raises ``ValueError`` for a non-renderable
+    artifact, mirroring :func:`render_artifact`.
+    """
+    try:
+        return _ARTIFACT_JSON_FILE[artifact]
+    except KeyError as exc:
+        raise ValueError(
+            f"artifact {artifact!r} is not renderable; expected one of "
+            f"{RENDERABLE_ARTIFACTS} (lane_graph has no md mirror)"
+        ) from exc
+
+
+def artifact_md_file(artifact: str) -> str:
+    """The ``.md`` mirror filename for a renderable ``artifact`` (see :func:`artifact_json_file`)."""
+    try:
+        return _ARTIFACT_MD_FILE[artifact]
+    except KeyError as exc:
+        raise ValueError(
+            f"artifact {artifact!r} is not renderable; expected one of "
+            f"{RENDERABLE_ARTIFACTS} (lane_graph has no md mirror)"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    """Outcome of one direct-edit ``render``: the files read + re-rendered.
+
+    Carries the artifact name and the canonical ``.json`` (read, the source of
+    truth) + ``.md`` (re-rendered, the mirror) paths so a caller or test can
+    assert the mirror was resynced without re-reading it.
+    """
+
+    artifact: str
+    json_path: Path
+    md_path: Path
+
+
+def render_artifact(
+    feature_root: Path,
+    feature_id: str,
+    artifact: str,
+    *,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> RenderResult:
+    """Re-render an artifact's ``.md`` mirror from its canonical ``.json`` (D4).
+
+    The deterministic bookend of the direct-edit refinement channel (ADR-0008
+    D4): after a human surgically edits the canonical *unfrozen* ``.json`` (a
+    typo, a reworded DES), this re-renders the ``.md`` mirror from that JSON so
+    the single-source-of-truth invariant (D2 — markdown is always a rendered
+    mirror of canonical JSON) holds. Delegates to the sole stage renderer
+    (``render_requirements_md`` / ``render_design_md`` / ``render_tasks_md``) —
+    the *same* renderer promote used — so a direct edit + render produces a mirror
+    byte-identical to what a re-promote of equal content would.
+
+    Three guards, mirroring promote:
+
+    * **frozen** — the direct-edit channel is closed past freeze. A frozen
+      artifact is immutable; only a Change Proposal (§17, out of scope for v0.6)
+      may change it. render refuses (``FrozenArtifactWriteError``) rather than
+      silently resyncing frozen content's mirror.
+    * **missing/unreadable JSON** — nothing to render. Fails loud (§24.2): a
+      render on an artifact that was never promoted (no ``.json``) or a corrupt
+      ``.json`` is a broken precondition, not a silent no-op.
+    * **unknown artifact** — ``ValueError`` (``lane_graph`` is not renderable).
+
+    render re-renders content only; it allocates no ids and stitches no refs
+    (those are promote's job). The reference-integrity + coverage invariants are
+    unchanged: a content edit leaves the stitched refs untouched, and the
+    freeze-gate coverage precheck still runs at the subsequent freeze reading the
+    edited JSON. Appends one ``render`` audit record so the direct-edit is
+    traceable. Pure at the seam apart from the deterministic write (md mirror +
+    audit) — no subprocess, no model.
+    """
+    if not feature_id:
+        raise ValueError("feature_id must be a non-empty string")
+    if artifact not in _ARTIFACT_JSON_FILE:
+        raise ValueError(
+            f"artifact {artifact!r} is not renderable; expected one of "
+            f"{RENDERABLE_ARTIFACTS} (lane_graph has no md mirror)"
+        )
+
+    # §4.2 guard (mirrors promote): the direct-edit channel targets the
+    # canonical-*unfrozen* artifact. A frozen artifact is immutable; only a
+    # Change Proposal may change it, so its mirror may not be resynced here.
+    frozen = frozen_artifacts_status(feature_root)
+    if frozen.get(artifact):
+        raise FrozenArtifactWriteError(
+            f"artifact {artifact!r} is frozen; render may only resync an "
+            f"unfrozen artifact's mirror (use a Change Proposal to change a "
+            f"frozen one, §4.2/§17)"
+        )
+
+    json_name = artifact_json_file(artifact)
+    json_path = feature_root / json_name
+    doc = read_json_object(json_path)
+    if doc is None:
+        raise ValueError(
+            f"{json_name} missing or unreadable at "
+            f"{json_path}; nothing to render (promote {artifact} first, §24.2)"
+        )
+
+    # Reference-integrity (ADR-0008 D3) for the direct-edit channel: the human
+    # may have introduced a dangling ref (an AC whose ``requirement`` points at a
+    # REQ that no longer exists, a design mapping's ``design_elements`` member
+    # with no matching DES, an upstream REQ/DES ref that was never allocated).
+    # promote enforces this at stitch time, but the direct-edit path bypasses
+    # promote, so render re-validates the edited doc here — the bookend of the
+    # edit channel — failing loud (§24.2) before resyncing a mirror over a
+    # malformed artifact. This is the realization of issue 06's criterion 4
+    # (reference-integrity still runs) for the direct-edit path; the freeze-gate
+    # coverage precheck handles the coverage half at the subsequent freeze.
+    validate_artifact_refs(artifact, doc, feature_root)
+
+    md_name = artifact_md_file(artifact)
+    md_path = feature_root / md_name
+    md_path.write_text(_ARTIFACT_RENDERER[artifact](feature_id, doc))
+
+    append_audit_event(
+        feature_root,
+        event=_RENDER_EVENT,
+        payload={
+            "artifact": artifact,
+            "feature": feature_id,
+            "source": json_name,
+            "mirror": md_name,
+        },
+        timestamp=timestamp,
+        origin=origin,
+    )
+
+    return RenderResult(artifact=artifact, json_path=json_path, md_path=md_path)
+
+
+def _doc_id_set(doc: Mapping[str, Any], field: str) -> set[str]:
+    """The set of ``id`` strings under a doc's list ``field`` (defensive).
+
+    Shared by the reference-integrity validators: the canonical ids a ref may
+    legitimately point at within this doc (REQ ids, DES ids). Hand-edited docs
+    may carry non-mapping entries or non-string ids — skip them rather than
+    failing (a malformed entry is the renderer's concern, not a ref violation).
+    """
+    out: set[str] = set()
+    for entry in doc.get(field, []) or []:
+        if isinstance(entry, Mapping):
+            value = entry.get("id")
+            if isinstance(value, str) and value:
+                out.add(value)
+    return out
+
+
+def _upstream_id_set(feature_root: Path, json_name: str, field: str) -> set[str] | None:
+    """Read a frozen upstream doc's id set, or ``None`` if it is not readable.
+
+    Best-effort cross-doc reference-integrity: a design's ``requirement`` refs
+    resolve against the frozen requirements upstream, a task's REQ/DES refs
+    against the frozen requirements + design. Returns ``None`` (→ the caller
+    skips cross-doc validation) when the upstream file is absent/unreadable, so a
+    render never fails merely because an upstream read broke for an unrelated
+    reason. Read directly (not via the frozen-guard reader) so validation does
+    not conflate "not frozen" with "dangling ref".
+    """
+    doc = read_json_object(feature_root / json_name)
+    if doc is None:
+        return None
+    return _doc_id_set(doc, field)
+
+
+def validate_artifact_refs(
+    artifact: str, doc: Mapping[str, Any], feature_root: Path
+) -> None:
+    """Re-check reference-integrity on a (possibly hand-edited) canonical doc.
+
+    The direct-edit companion to promote's stitch-time :class:`RefResolver`
+    check (ADR-0008 D3): every reference in the doc must resolve to a real id —
+    an intra-doc id (an AC's ``requirement`` → a REQ in this doc; a design
+    mapping's ``design_elements`` → a DES in this doc) or, for cross-stage refs,
+    a real id in the frozen upstream (a design's ``requirement`` → a frozen REQ;
+    a task's ``related_requirements`` / ``related_design`` → frozen REQ / DES).
+    A dangling ref raises :class:`UnresolvedRefError` (fail loud, §24.2) — the
+    mirror is not resynced over a malformed artifact.
+
+    Cross-doc validation is best-effort (:func:`_upstream_id_set`): if an
+    upstream doc is unreadable its refs are skipped, so the check never fails for
+    an unrelated reason. Intra-doc refs are always checked (the ids live in the
+    same doc). Tasks have no intra-doc refs (their refs are all upstream).
+    """
+    if artifact == REQUIREMENTS_ARTIFACT:
+        req_ids = _doc_id_set(doc, "requirements")
+        for ac in doc.get("acceptance_criteria", []) or []:
+            if not isinstance(ac, Mapping):
+                continue
+            ref = ac.get("requirement")
+            if isinstance(ref, str) and ref and ref not in req_ids:
+                raise UnresolvedRefError(
+                    f"acceptance criterion {ac.get('id', '?')!r} references "
+                    f"{ref!r}, which is not a requirement id in this doc "
+                    f"(known: {sorted(req_ids) or '(none)'}); the edited "
+                    f"requirements artifact is malformed (ADR-0008 D3)"
+                )
+    elif artifact == DESIGN_ARTIFACT:
+        des_ids = _doc_id_set(doc, "design_elements")
+        upstream_req = _upstream_id_set(feature_root, REQUIREMENTS_JSON, "requirements")
+        for m in doc.get("requirement_mapping", []) or []:
+            if not isinstance(m, Mapping):
+                continue
+            req = m.get("requirement")
+            if (
+                isinstance(req, str)
+                and req
+                and upstream_req is not None
+                and req not in upstream_req
+            ):
+                raise UnresolvedRefError(
+                    f"design mapping {m.get('key', '?')!r} references {req!r}, "
+                    f"which is not a frozen requirement id (known REQ: "
+                    f"{sorted(upstream_req) or '(none)'}); the edited design "
+                    f"artifact is malformed (ADR-0008 D3)"
+                )
+            for d in m.get("design_elements", []) or []:
+                if isinstance(d, str) and d and d not in des_ids:
+                    raise UnresolvedRefError(
+                        f"design mapping {m.get('key', '?')!r} references design "
+                        f"element {d!r}, which is not defined in this doc "
+                        f"(known DES: {sorted(des_ids) or '(none)'}); the edited "
+                        f"design artifact is malformed (ADR-0008 D3)"
+                    )
+    elif artifact == TASKS_ARTIFACT:
+        upstream_req = _upstream_id_set(feature_root, REQUIREMENTS_JSON, "requirements")
+        upstream_des = _upstream_id_set(feature_root, DESIGN_JSON, "design_elements")
+        for t in doc.get("tasks", []) or []:
+            if not isinstance(t, Mapping):
+                continue
+            for r in t.get("related_requirements", []) or []:
+                if (
+                    isinstance(r, str)
+                    and r
+                    and upstream_req is not None
+                    and r not in upstream_req
+                ):
+                    raise UnresolvedRefError(
+                        f"task {t.get('id', '?')!r} references requirement {r!r}, "
+                        f"which is not a frozen requirement id; the edited tasks "
+                        f"artifact is malformed (ADR-0008 D3)"
+                    )
+            for d in t.get("related_design", []) or []:
+                if (
+                    isinstance(d, str)
+                    and d
+                    and upstream_des is not None
+                    and d not in upstream_des
+                ):
+                    raise UnresolvedRefError(
+                        f"task {t.get('id', '?')!r} references design element "
+                        f"{d!r}, which is not a frozen design id; the edited "
+                        f"tasks artifact is malformed (ADR-0008 D3)"
+                    )
+    # An unknown / non-renderable artifact has no refs to validate; render's own
+    # guard rejects it before reaching here, so this is a quiet no-op for safety.
+
+
+# artifact -> sole stage renderer (resolved lazily after the renderers are
+# defined, so this table sits next to the render shell that uses it). Each is
+# the *same* renderer promote calls, so a direct edit + render matches a
+# re-promote's mirror byte-for-byte.
+_ARTIFACT_RENDERER: Mapping[str, Callable[[str, Mapping[str, Any]], str]] = {
+    REQUIREMENTS_ARTIFACT: render_requirements_md,
+    DESIGN_ARTIFACT: render_design_md,
+    TASKS_ARTIFACT: render_tasks_md,
+}

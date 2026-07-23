@@ -133,6 +133,7 @@ from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_g
 from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
 from ai_dev.dry_run import (
     DryRunPlan,
+    plan_allocate_id,
     plan_coherence_gate,
     plan_compare_profiles,
     plan_final_report,
@@ -144,6 +145,7 @@ from ai_dev.dry_run import (
     plan_generate_requirements,
     plan_generate_tasks,
     plan_lane_gate,
+    plan_render,
     plan_review,
     plan_run_headless,
     plan_spec_gap,
@@ -151,6 +153,7 @@ from ai_dev.dry_run import (
     render_plan,
 )
 from ai_dev.feature_run import create_feature_run
+from ai_dev.feature_ids import ID_TYPES, allocate_id
 from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
 from ai_dev.github_projection import (
@@ -162,6 +165,12 @@ from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bun
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
+from ai_dev.promote import (
+    FrozenArtifactWriteError,
+    RENDERABLE_ARTIFACTS,
+    RenderResult,
+    render_artifact,
+)
 from ai_dev.planner_leg import (
     PlannerLegResult,
     run_generate_design,
@@ -409,6 +418,46 @@ def _build_parser() -> argparse.ArgumentParser:
         "artifact",
         choices=FROZEN_ARTIFACTS,
         help="Which frozen artifact to flip (one of the §4.2 four).",
+    )
+
+    # v0.6 ticket 06 (optional, ADR-0008 D4): the direct-edit refinement
+    # channel's two deterministic helpers. ``render`` re-renders an unfrozen
+    # artifact's ``.md`` mirror from its hand-edited ``.json``; ``allocate-id``
+    # mints the next counter id for a human-added item. Both are model-free;
+    # both refuse a frozen artifact (frozen => Change Proposal, out of scope).
+    render = subparsers.add_parser(
+        "render",
+        help="Re-render an unfrozen artifact's .md mirror from its (hand-edited) "
+        ".json (v0.6 ticket 06, ADR-0008 D4). Deterministic - no model.",
+        parents=[repo_root_parent],
+    )
+    render.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical .json a human directly edited.",
+    )
+    render.add_argument(
+        "artifact",
+        choices=RENDERABLE_ARTIFACTS,
+        help="Which artifact's mirror to re-render (requirements / design / "
+        "tasks; lane_graph has no md mirror).",
+    )
+
+    allocate = subparsers.add_parser(
+        "allocate-id",
+        help="Allocate the next stable id of a type from the counter "
+        "(v0.6 ticket 06, ADR-0008 D4). Deterministic - no model. For human-"
+        "added items in a direct-edited unfrozen artifact, so ids stay in the "
+        "counter and out of human hands (§4.3).",
+        parents=[repo_root_parent],
+    )
+    allocate.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose per-type id counter to bump.",
+    )
+    allocate.add_argument(
+        "id_type",
+        choices=ID_TYPES,
+        help="Which §5.2 stable-id type to allocate (REQ / AC / DES / TASK / …).",
     )
 
     show = subparsers.add_parser(
@@ -976,6 +1025,8 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "lane-gate",
         "compare-profiles",
         "project-github",
+        "render",
+        "allocate-id",
     }
 )
 
@@ -1057,6 +1108,70 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
         _render_error(exc)
         return 1
     print(f"{feature_id}: froze {artifact}")
+    return 0
+
+
+def _run_render(repo_root: Path, feature_id: str, artifact: str) -> int:
+    """Re-render an unfrozen artifact's ``.md`` mirror from its ``.json``
+    (v0.6 ticket 06, ADR-0008 D4).
+
+    Deterministic bookend of the direct-edit channel - no profile, no token, no
+    model. Delegates to ``render_artifact`` (refuses a frozen artifact, fails
+    loud on a missing/unreadable canonical ``.json``, re-renders the mirror via
+    the sole stage renderer, audits). Returns ``0`` on a successful re-render;
+    ``1`` when the artifact is frozen (the direct-edit channel is closed past
+    freeze - surfaced as a clean ``error:`` line, not a traceback) or when a
+    precondition is missing (unknown/non-renderable artifact, no feature run,
+    nothing promoted to render - §24.2 fail loud).
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        _render_error(
+            ValueError(f"feature run {feature_id} not found under {repo_root}"),
+            hint=_lookup_hint(repo_root, feature_id),
+        )
+        return 1
+    try:
+        result: RenderResult = render_artifact(
+            feature_root, feature_id, artifact, origin=ORIGIN_CLI
+        )
+    except FrozenArtifactWriteError as exc:
+        _render_error(exc)
+        return 1
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    print(
+        f"{feature_id}: re-rendered {result.md_path.name} from "
+        f"{result.json_path.name} ({artifact}, unfrozen)"
+    )
+    return 0
+
+
+def _run_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> int:
+    """Allocate the next stable id of ``id_type`` from the counter (v0.6 ticket
+    06, ADR-0008 D4).
+
+    Deterministic - no profile, no token, no model. Delegates to ``allocate_id``
+    (bumps the per-type high-water mark, appends an ``allocate_id`` audit
+    record) and prints the minted id — the sanctioned way for a human adding an
+    item to a direct-edited unfrozen artifact to get a counter-tracked id, so ids
+    stay in the counter and out of human hands (§4.3). Returns ``0`` on a
+    successful mint; ``1`` on an unknown id type or missing feature run (§24.2).
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        _render_error(
+            ValueError(f"feature run {feature_id} not found under {repo_root}"),
+            hint=_lookup_hint(repo_root, feature_id),
+        )
+        return 1
+    try:
+        allocated_id = allocate_id(feature_root, id_type, origin=ORIGIN_CLI)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    print(allocated_id)
     return 0
 
 
@@ -2009,6 +2124,26 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 )
             )
         return _run_freeze(Path(args.repo_root), args.feature_id, args.artifact)
+
+    if args.command == "render":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_render(
+                    Path(args.repo_root), args.feature_id, args.artifact
+                )
+            )
+        return _run_render(Path(args.repo_root), args.feature_id, args.artifact)
+
+    if args.command == "allocate-id":
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_allocate_id(
+                    Path(args.repo_root), args.feature_id, args.id_type
+                )
+            )
+        return _run_allocate_id(
+            Path(args.repo_root), args.feature_id, args.id_type
+        )
 
     if args.command == "show-profile":
         return _run_show_profile(Path(args.repo_root), args.name)

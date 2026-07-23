@@ -89,7 +89,13 @@ from ai_dev.planner_schemas import PLANNER_ROLE as _PLANNER_ROLE
 # promote (the canonical reader); the freeze-gate coverage precheck lives in
 # coverage. Both are pure read/compute helpers - no canonical write - so importing
 # them here keeps dry-run free of side effects (ADR-0004).
-from ai_dev.promote import read_frozen_design_doc, read_frozen_requirements_doc
+from ai_dev.promote import (
+    RENDERABLE_ARTIFACTS,
+    artifact_json_file,
+    artifact_md_file,
+    read_frozen_design_doc,
+    read_frozen_requirements_doc,
+)
 from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
@@ -123,6 +129,7 @@ from ai_dev.triage import (
 )
 from ai_dev.issue_bundle import ISSUES_DIR
 from ai_dev.json_artifact import read_json_object
+from ai_dev.feature_ids import ID_TYPES, preview_next_id
 
 # Display placeholder for a run id that dry-run does NOT mint. Never a real
 # allocated id (the RUN counter is untouched); appears only inside the temp dir
@@ -895,6 +902,92 @@ def plan_freeze(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
         feature_id=feature_id,
         summary=summary,
         details=details,
+    )
+
+
+def plan_render(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
+    """Plan a ``render``: precondition check, no md write (ADR-0008 D4, ADR-0004).
+
+    The direct-edit bookend's dry-run: it runs the full §24.2 precondition +
+    frozen guard but writes no mirror and appends no audit. Unknown / non-
+    renderable artifact -> ``ValueError`` (exit 1). A frozen artifact is reported
+    as ``would be refused`` (exit 0), mirroring the real
+    ``FrozenArtifactWriteError``. A missing/unreadable canonical ``.json``
+    (nothing to render) raises ``ValueError`` (exit 1), mirroring the real
+    command. Never mints a stable id (render allocates none anyway).
+    """
+    if artifact not in RENDERABLE_ARTIFACTS:
+        raise ValueError(
+            f"artifact {artifact!r} is not renderable; expected one of "
+            f"{RENDERABLE_ARTIFACTS} (lane_graph has no md mirror)"
+        )
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    frozen = frozen_artifacts_status(feature_root)
+    details: dict[str, Any] = {"artifact": artifact}
+    # Frozen -> would be refused (the direct-edit channel is closed past freeze).
+    if frozen.get(artifact):
+        details["would_be_refused"] = True
+        details["refusal_reason"] = (
+            f"artifact {artifact!r} is frozen; render may only resync an "
+            f"unfrozen artifact's mirror (use a Change Proposal to change a "
+            f"frozen one, §4.2/§17)"
+        )
+        return DryRunPlan(
+            command="render",
+            feature_id=feature_id,
+            summary=f"RENDER DRY-RUN - would be REFUSED: {artifact} frozen",
+            details=details,
+        )
+    # Missing/unreadable JSON -> precondition error (exit 1), not a refusal.
+    json_name = artifact_json_file(artifact)
+    json_path = feature_root / json_name
+    if read_json_object(json_path) is None:
+        raise ValueError(
+            f"{json_name} missing or unreadable at {json_path}; nothing to "
+            f"render (promote {artifact} first, §24.2)"
+        )
+    details["would_be_refused"] = False
+    details["source"] = json_name
+    details["mirror"] = artifact_md_file(artifact)
+    details["would_write"] = [details["mirror"], "audit.log.{md,json}"]
+    return DryRunPlan(
+        command="render",
+        feature_id=feature_id,
+        summary=(
+            f"RENDER DRY-RUN - would re-render {details['mirror']} from "
+            f"{json_name}"
+        ),
+        details=details,
+    )
+
+
+def plan_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> DryRunPlan:
+    """Plan an ``allocate-id``: show the would-be id, mint nothing (ADR-0004).
+
+    Uses :func:`preview_next_id` (a pure read) so the never-mint invariant holds
+    — no counter write, no audit. Unknown id type -> ``ValueError`` (exit 1),
+    mirroring the real ``allocate_id``. The would-be id is a *preview*: a real
+    allocation between this call and a later ``allocate-id`` changes it.
+    """
+    if id_type not in ID_TYPES:
+        raise ValueError(
+            f"unknown stable-id type {id_type!r}; expected one of {ID_TYPES}"
+        )
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    would_be = preview_next_id(feature_root, id_type)
+    return DryRunPlan(
+        command="allocate-id",
+        feature_id=feature_id,
+        summary=f"ALLOCATE-ID DRY-RUN - would mint {would_be} (no write)",
+        details={
+            "id_type": id_type,
+            "would_allocate": would_be,
+            "would_write": ["id-counters.yml", "audit.log.{md,json}"],
+        },
     )
 
 

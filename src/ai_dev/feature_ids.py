@@ -142,3 +142,28 @@ def allocate_id(
         origin=origin,
     )
     return allocated
+
+
+def preview_next_id(feature_root: Path, id_type: str) -> str:
+    """Return the id ``allocate_id`` *would* mint next, without minting it.
+
+    The dry-run companion to :func:`allocate_id` (ADR-0004): it reads the
+    per-type high-water mark and returns one greater (starting at ``001`` for a
+    type's first allocation), but writes no counter and appends no audit record
+    — the never-mint-a-stable-id invariant (glossary pin ``dry-run``) holds.
+    Also used by the ``allocate-id`` helper's ``--dry-run`` to show the would-be
+    id for a human-added item (ADR-0008 D4 direct-edit channel). Raises
+    ``ValueError`` if ``id_type`` is not one of the §5.2 types, exactly as
+    :func:`allocate_id` does.
+
+    The returned id is a *preview*: a real allocation that happens between this
+    call and a later ``allocate_id`` changes what the next id actually is, since
+    the counter is read fresh on every allocation.
+    """
+    if id_type not in ID_TYPES:
+        raise ValueError(
+            f"unknown stable-id type {id_type!r}; expected one of {ID_TYPES}"
+        )
+    counters = _read_counters(feature_root)
+    seq = counters.get(id_type, 0) + 1
+    return f"{id_type}-{seq:03d}"
