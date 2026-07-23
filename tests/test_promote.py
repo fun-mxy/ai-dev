@@ -896,24 +896,26 @@ class TestReadFrozenDesignDoc:
 
 
 class TestBuildCanonicalTasks:
-    def test_returns_three_tuple_doc_allocated_status_rows(
+    def test_returns_four_tuple_doc_allocated_status_rows_verify_commands(
         self, tmp_path: Path
     ) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
         result = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
-        # The tasks build core returns (doc, allocated, task_status_rows) - the
-        # extra third element (vs design's 2-tuple) is the runtime rows it seeds.
-        assert isinstance(result, tuple) and len(result) == 3
-        doc, allocated, rows = result
+        # The tasks build core returns (doc, allocated, task_status_rows,
+        # verification_commands) - the runtime rows it seeds + the lane verify
+        # command set it carries out of band to the lane-graph writer (ticket 05).
+        assert isinstance(result, tuple) and len(result) == 4
+        doc, allocated, rows, verify_commands = result
         assert isinstance(doc, dict)
         assert isinstance(allocated, dict)
         assert isinstance(rows, dict)
+        assert isinstance(verify_commands, list)
 
     def test_allocates_task_ids_in_order(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, allocated, _ = build_canonical_tasks(
+        doc, allocated, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         assert allocated == {"TASK": ["TASK-001", "TASK-002"]}
@@ -923,7 +925,7 @@ class TestBuildCanonicalTasks:
         self, tmp_path: Path
     ) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         reqs_of = {t["key"]: t["related_requirements"] for t in doc["tasks"]}
@@ -935,7 +937,7 @@ class TestBuildCanonicalTasks:
 
     def test_stitches_related_design_to_frozen_des_ids(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         des_of = {t["key"]: t["related_design"] for t in doc["tasks"]}
@@ -949,7 +951,7 @@ class TestBuildCanonicalTasks:
         # The lane is structural (allocated at feature-run creation, seeded into
         # 04-lane-graph.yml); promote assigns every task to that one lane (§5.3).
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         assert all(t["lane"] == "LANE-001" for t in doc["tasks"])
@@ -959,7 +961,7 @@ class TestBuildCanonicalTasks:
         self, tmp_path: Path
     ) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         assert doc["feature"] == FEATURE_ID
@@ -994,7 +996,7 @@ class TestBuildCanonicalTasks:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(
             tmp_path, req_proposal
         )
-        doc, _, rows = build_canonical_tasks(
+        doc, _, rows, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         # t1 -> REQ-001 -> [AC-001, AC-002]; t2 -> REQ-002 -> [AC-003].
@@ -1008,7 +1010,7 @@ class TestBuildCanonicalTasks:
 
     def test_status_rows_all_pending_with_refs(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        _, _, rows = build_canonical_tasks(
+        _, _, rows, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         # Every task seeds a pending runtime row (§8.1) carrying its stitched
@@ -1064,7 +1066,7 @@ class TestBuildCanonicalTasks:
 class TestRenderTasksMd:
     def test_renders_task_ids_and_stitched_refs(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         md = render_tasks_md(FEATURE_ID, doc)
@@ -1084,7 +1086,7 @@ class TestRenderTasksMd:
         # The Implementer reads everything after `## Tasks` verbatim, so that
         # section must be LAST; the lane purpose renders in its own section above.
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         md = render_tasks_md(FEATURE_ID, doc)
@@ -1107,7 +1109,7 @@ class TestRenderTasksMd:
 
     def test_render_is_deterministic(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
-        doc, _, _ = build_canonical_tasks(
+        doc, _, _, _ = build_canonical_tasks(
             root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
         )
         assert render_tasks_md(FEATURE_ID, doc) == render_tasks_md(FEATURE_ID, doc)
@@ -1317,4 +1319,119 @@ class TestPromoteTasksMalformedProposal:
         proposal = _tasks_proposal(req_ids, des_ids)
         proposal["tasks"][0]["expected_files"] = ["src/greet.py", 42]
         with pytest.raises(ValueError, match="non-empty string"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+
+def _tasks_proposal_with_verify(req_ids: list[str], des_ids: list[str]) -> dict:
+    """A tasks proposal that also carries the lane verify command set (ticket 05).
+
+    The zero-hand-authored-planning contract: the Planner emits the verify
+    command set (pytest + mypy, workspace-relative) so promote can write it onto
+    the lane and the Verifier runs model-generated commands.
+    """
+    proposal = _tasks_proposal(req_ids, des_ids)
+    proposal["verification_commands"] = [
+        {
+            "name": "pytest",
+            "command": "PYTHONPATH=. python -m pytest -q -p no:cacheprovider -c /dev/null tests",
+        },
+        {"name": "mypy", "command": "python -m mypy greet"},
+    ]
+    return proposal
+
+
+class TestPromoteTasksVerificationCommands:
+    """v0.6 capstone (ticket 05): the Planner-generated lane verify command set.
+
+    promote writes the proposal's optional ``verification_commands`` onto the
+    single lane in ``04-lane-graph.yml`` so the shell Verifier (§9.5) runs
+    model-generated commands - the zero-hand-authored-planning bar (the v0.4
+    dogfood hand-authored them). The verify commands are a lane-level concern, so
+    they must NOT leak into ``03-tasks.json`` (task content).
+    """
+
+    def test_writes_verify_commands_onto_lane(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(
+            root,
+            FEATURE_ID,
+            _tasks_proposal_with_verify(req_ids, des_ids),
+            origin="cli",
+        )
+        lane = yaml.safe_load((root / LANE_GRAPH_YML).read_text())["lanes"][0]
+        assert lane["verification_commands"] == [
+            {
+                "name": "pytest",
+                "command": "PYTHONPATH=. python -m pytest -q -p no:cacheprovider -c /dev/null tests",
+            },
+            {"name": "mypy", "command": "python -m mypy greet"},
+        ]
+        # verification_scope is derived from the command names so the two stay in sync.
+        assert lane["verification_scope"] == ["pytest", "mypy"]
+
+    def test_verify_commands_do_not_leak_into_tasks_json(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(
+            root,
+            FEATURE_ID,
+            _tasks_proposal_with_verify(req_ids, des_ids),
+            origin="cli",
+        )
+        doc = json.loads((root / TASKS_JSON).read_text())
+        # Verify commands are a lane-level concern -> they travel out of band to
+        # the lane-graph, never into the task-content doc.
+        assert "verification_commands" not in doc
+
+    def test_proposal_without_verify_commands_leaves_lane_empty(
+        self, tmp_path: Path
+    ) -> None:
+        # Backward compatible: a refinement draft that omits the verify command
+        # set still promotes; the seeded lane entry has no verification_commands.
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        lane = yaml.safe_load((root / LANE_GRAPH_YML).read_text())["lanes"][0]
+        assert not lane.get("verification_commands")
+
+    def test_build_canonical_tasks_returns_verify_commands(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _, verify_commands = build_canonical_tasks(
+            root,
+            FEATURE_ID,
+            _tasks_proposal_with_verify(req_ids, des_ids),
+            origin=None,
+        )
+        assert [vc["name"] for vc in verify_commands] == ["pytest", "mypy"]
+        # The doc (03-tasks.json content) does not carry the verify commands.
+        assert "verification_commands" not in doc
+
+
+class TestPromoteTasksMalformedVerifyCommands:
+    """§24.2: a malformed verification_commands field fails loud."""
+
+    def test_not_a_list(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["verification_commands"] = {"name": "pytest"}
+        with pytest.raises(ValueError, match="'verification_commands' must be a list"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_entry_not_an_object(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["verification_commands"] = ["pytest"]
+        with pytest.raises(ValueError, match="must be an object"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_entry_missing_name(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["verification_commands"] = [{"command": "python -m pytest"}]
+        with pytest.raises(ValueError, match="no non-empty 'name'"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_entry_missing_command(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["verification_commands"] = [{"name": "pytest"}]
+        with pytest.raises(ValueError, match="no non-empty 'command'"):
             promote_tasks(root, FEATURE_ID, proposal, origin="cli")

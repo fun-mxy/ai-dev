@@ -104,6 +104,55 @@ class TestPlannerOutputSchemaLookup:
         assert PLANNING_STAGES == ("requirements", "design", "tasks")
 
 
+class TestTasksProposalSchema:
+    """The tasks proposal schema (ticket 04) + the verify-command facet (ticket 05)."""
+
+    _VALID_TASKS: dict = {
+        "lane_purpose": "Deliver the greet CLI.",
+        "tasks": [
+            {
+                "key": "t1",
+                "summary": "Greeting formatter",
+                "related_requirements": ["REQ-001"],
+                "related_design": ["DES-001"],
+                "expected_files": ["src/greet.py"],
+                "exclusive_files": ["src/greet.py"],
+            }
+        ],
+    }
+
+    def test_valid_proposal_passes(self) -> None:
+        assert validate_against_schema(self._VALID_TASKS, TASKS_PROPOSAL_SCHEMA) == []
+
+    def test_proposal_with_verification_commands_passes(self) -> None:
+        # v0.6 capstone (ticket 05): the optional top-level lane verify command
+        # set - pytest + mypy, the contract the Verifier (§9.5) runs.
+        proposal = copy.deepcopy(self._VALID_TASKS)
+        proposal["verification_commands"] = [
+            {
+                "name": "pytest",
+                "command": "PYTHONPATH=. python -m pytest -q -p no:cacheprovider -c /dev/null tests",
+            },
+            {"name": "mypy", "command": "python -m mypy greet"},
+        ]
+        assert validate_against_schema(proposal, TASKS_PROPOSAL_SCHEMA) == []
+
+    def test_verification_command_missing_name_rejected(self) -> None:
+        proposal = copy.deepcopy(self._VALID_TASKS)
+        proposal["verification_commands"] = [{"command": "python -m pytest"}]
+        assert validate_against_schema(proposal, TASKS_PROPOSAL_SCHEMA) != []
+
+    def test_verification_command_missing_command_rejected(self) -> None:
+        proposal = copy.deepcopy(self._VALID_TASKS)
+        proposal["verification_commands"] = [{"name": "pytest"}]
+        assert validate_against_schema(proposal, TASKS_PROPOSAL_SCHEMA) != []
+
+    def test_verification_commands_optional(self) -> None:
+        # A refinement draft may omit the verify command set entirely.
+        assert "verification_commands" not in self._VALID_TASKS
+        assert validate_against_schema(self._VALID_TASKS, TASKS_PROPOSAL_SCHEMA) == []
+
+
 class TestOutputSchemaForRole:
     def test_planner_requirements_returns_proposal_schema(self) -> None:
         assert (

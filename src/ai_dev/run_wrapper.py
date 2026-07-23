@@ -278,6 +278,16 @@ CODEX_WRAPPER_OWNED_RE: re.Pattern[str] = re.compile(
     r"^output/(stdout\.log|stderr\.log|metadata\.json|env-snapshot\.txt)$"
 )
 
+# Compiler-emitted Python bytecode cache - subtracted from the diff regardless of
+# adapter, alongside the adapter's wrapper-owned set. A ``.pyc`` under
+# ``__pycache__/`` is a non-deterministic build artifact (its name stamps the
+# Python/pytest version, e.g. ``test_x.cpython-312-pytest-9.1.1.pyc``), emitted
+# when the agent imports or runs the module during implementation - it is never
+# source the agent *authors*. Excluding it keeps ``changed_files`` (and thus the
+# §14.2 boundary check + the final-report Q1 traceability index) to authored
+# files only. Shared across adapters because any Python-touching run may emit it.
+_BUILD_ARTIFACT_RE: re.Pattern[str] = re.compile(r"(^|/)__pycache__/.*\.pyc$")
+
 
 def snapshot_tree(run_dir: Path) -> dict[str, tuple[int, int]]:
     """Inventory ``run_dir`` as ``{RUN-relative path: (size, mtime_ns)}``.
@@ -314,14 +324,21 @@ def compute_changed_files(
     ``(size, mtime_ns)`` tuple that differs from ``before`` (new or modified).
     Wrapper-owned artifacts (matched by ``wrapper_owned``) are subtracted even
     when new, so stdout/stderr/metadata/snapshots/settings never pollute the
-    list. Deletions (in ``before``, gone in ``after``) are not reported - the
-    list captures what the agent wrote, not what it removed. Sorted for
-    diff-stable output matching the prototype.
+    list. Compiler-emitted Python bytecode (``__pycache__/*.pyc``, matched by
+    ``_BUILD_ARTIFACT_RE``) is subtracted too, regardless of adapter: it is a
+    non-deterministic build artifact the toolchain emits when a module is
+    imported, never source the agent authors - so it stays out of both the
+    boundary check and the final-report traceability index. Deletions (in
+    ``before``, gone in ``after``) are not reported - the list captures what the
+    agent wrote, not what it removed. Sorted for diff-stable output matching the
+    prototype.
     """
     changed = [
         path
         for path, meta in after.items()
-        if not wrapper_owned.search(path) and before.get(path) != meta
+        if not wrapper_owned.search(path)
+        and not _BUILD_ARTIFACT_RE.search(path)
+        and before.get(path) != meta
     ]
     return sorted(changed)
 

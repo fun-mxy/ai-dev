@@ -18,8 +18,8 @@ populates from the Planner-originated ids, not hand-written ones. Record evidenc
 
 **Status:** ready-for-agent
 
-- [ ] one feature driven intent → … → final-report with **zero hand-authored** planning content
-- [ ] all four planning artifacts Planner-generated + promoted + human-frozen
-- [ ] `verdict=pass` on real cc-glm52/Ark (not the fake-claude test)
-- [ ] ADR-0007 coverage self-attestation in `final-report` populates from the Planner-originated ids (Q2/Q3)
-- [ ] evidence recorded under `.scratch/ai-dev-v0-6-planner/evidence/`; `uv run mypy` + `uv run pytest` green
+- [x] one feature driven intent → … → final-report with **zero hand-authored** planning content
+- [x] all four planning artifacts Planner-generated + promoted + human-frozen
+- [x] `verdict=pass` on real cc-glm52/Ark (not the fake-claude test)
+- [x] ADR-0007 coverage self-attestation in `final-report` populates from the Planner-originated ids (Q2/Q3)
+- [x] evidence recorded under `.scratch/ai-dev-v0-6-planner/evidence/`; `uv run mypy` + `uv run pytest` green

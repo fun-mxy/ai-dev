@@ -700,8 +700,25 @@ def _tasks_task_text(
         "one MVP lane all tasks run on (the lane itself is structural; you do NOT "
         "assign lanes).",
         "- Each task also declares `expected_files` and `exclusive_files` - the "
-        "file paths it will touch (the lane's file boundary the Implementer later "
-        "enforces).",
+        "file paths it will touch. These are **RUN-relative paths under `workspace/`** "
+        "(the Implementer writes there): e.g. `workspace/<pkg>/cli.py`, "
+        "`workspace/tests/test_<x>.py`. The file-boundary check (§14.2) is an exact "
+        "match against these, so the `workspace/` prefix is mandatory; an unprefixed "
+        "path like `<pkg>/cli.py` will be rejected. List every file the task touches, "
+        "including `workspace/<pkg>/__init__.py` when you create a package.",
+        "- Declare the lane's top-level `verification_commands`: the shell "
+        "commands the Verifier (§9.5) runs to prove the lane works. Each entry "
+        "is `{\"name\": <label>, \"command\": <shell string>}`. The commands run "
+        "with the implementer run's `workspace/` as the working directory, where "
+        "the implemented package + `tests/` live - so emit **workspace-relative** "
+        "commands. Use exactly this two-command set for a Python package "
+        "`<pkg>` with a `tests/` dir (substitute the real package name):\n"
+        "  - `{\"name\": \"pytest\", \"command\": \"PYTHONPATH=. python -m pytest "
+        "-q -p no:cacheprovider -c /dev/null tests\"}`\n"
+        "  - `{\"name\": \"mypy\", \"command\": \"python -m mypy <pkg>\"}`\n"
+        "  These are the commands the Verifier executes; if you omit "
+        "`verification_commands` the Verifier fails loud (no verify command set "
+        "declared), so always emit them.",
         "- `tasks[]` needs a non-empty `key`, `summary`, `related_requirements` "
         "(real frozen REQ-NNN ids), `related_design` (real frozen DES-NNN ids), "
         "`expected_files`, and `exclusive_files`.",

@@ -262,6 +262,43 @@ _TASK_ITEM_SCHEMA: dict[str, Any] = {
 # §14.1 schema concern). The lane is structural (already allocated as LANE-001),
 # so the model does not re-author it; each task is assigned to that one lane by
 # promote (single-lane assignment, §5.3).
+# A single declared verify command (§9.5/§7.5) a tasks proposal may carry at
+# the top level - the single MVP lane's verify command set (pytest/mypy/build).
+# Each entry mirrors the lane-graph ``verification_commands`` shape: a short
+# label (``name``) + the verbatim shell string (``command``). Both non-empty: a
+# nameless or commandless entry is a malformed declaration (§24.2). The model
+# authors this so the lane-graph's verify command set is Planner-generated (the
+# v0.6 capstone's zero-hand-authored-planning bar: §9.5's source is the
+# lane-graph, which the Planner now fills rather than a human); promote writes it
+# onto the lane entry. ``command`` is unconstrained prose (a shell string like
+# ``PYTHONPATH=. python -m pytest ... tests``), not a ref, so it is
+# ``minLength: 1`` only.
+_VERIFY_COMMAND_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["name", "command"],
+    "additionalProperties": True,
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "command": {"type": "string", "minLength": 1},
+    },
+}
+
+# ADR-0008 D2: the tasks proposal - id-free structured JSON. ``lane_purpose`` is
+# the purpose the model assigns to the single MVP lane (promote writes it into
+# 04-lane-graph.yml); ``tasks`` is the required array of TASK slots (the
+# structure must be present, but it carries no ``minItems``: a proposal is
+# *expected to be incomplete* while being refined, D3, and coverage-completeness
+# - every REQ+DES referenced by >=1 task - is a freeze-gate concern, not a
+# §14.1 schema concern). The lane is structural (already allocated as LANE-001),
+# so the model does not re-author it; each task is assigned to that one lane by
+# promote (single-lane assignment, §5.3).
+#
+# ``verification_commands`` (v0.6 capstone, ticket 05) is the OPTIONAL top-level
+# lane verify command set. Optional (not in ``required``, no ``minItems``): a
+# refinement draft may omit it, and promote leaves the lane entry's verify
+# commands empty in that case. When present, promote writes it onto the lane in
+# 04-lane-graph.yml so the shell Verifier (§9.5) runs Planner-generated commands
+# - the zero-hand-authored-planning bar (the v0.4 dogfood hand-authored them).
 TASKS_PROPOSAL_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "PlannerTasksProposal",
@@ -273,6 +310,10 @@ TASKS_PROPOSAL_SCHEMA: dict[str, Any] = {
         "tasks": {
             "type": "array",
             "items": _TASK_ITEM_SCHEMA,
+        },
+        "verification_commands": {
+            "type": "array",
+            "items": _VERIFY_COMMAND_ITEM_SCHEMA,
         },
     },
 }

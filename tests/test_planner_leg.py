@@ -261,7 +261,11 @@ with open("output/result.json", "w") as f:
                     "expected_files": ["src/cli.py"],
                     "exclusive_files": ["src/cli.py"]
                 }
-            ]
+            ],
+            "verification_commands": [
+                {"name": "pytest", "command": "PYTHONPATH=. python -m pytest -q tests"},
+                {"name": "mypy", "command": "python -m mypy src"},
+            ],
         },
         f,
     )
@@ -1261,6 +1265,11 @@ class TestRunGenerateTasks:
         assert lane["tasks"] == ["TASK-001", "TASK-002"]
         assert lane["expected_files"] == ["src/cli.py", "src/greet.py"]
         assert lane["exclusive_files"] == ["src/cli.py", "src/greet.py"]
+        # v0.6 capstone (ticket 05): the Planner-generated verify command set is
+        # promoted onto the lane so the Verifier runs model-generated commands
+        # (zero hand-authored planning).
+        assert [vc["name"] for vc in lane["verification_commands"]] == ["pytest", "mypy"]
+        assert lane["verification_scope"] == ["pytest", "mypy"]
 
     def test_passing_run_allocates_task_ids_from_counter(
         self, repo_root: Path, feature_with_frozen_reqs_and_design: str,

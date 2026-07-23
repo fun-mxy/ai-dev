@@ -977,6 +977,50 @@ def _str_list(
     return out
 
 
+def _normalize_verify_commands(raw: Any) -> list[dict[str, str]]:
+    """Validate the proposal's top-level ``verification_commands`` (fail loud, §24.2).
+
+    The optional lane verify command set (v0.6 capstone, ticket 05): a list of
+    ``{name, command}`` mappings the model authors and promote writes onto the
+    single lane in ``04-lane-graph.yml`` so the shell Verifier (§9.5) runs
+    Planner-generated commands - the zero-hand-authored-planning bar. Returns the
+    normalized ``[{"name": ..., "command": ...}, ...]`` (stripped), or ``[]`` when
+    the proposal omits the field (a refinement draft may lag; the lane entry's
+    verify commands are then left empty). A non-list field or a mapping lacking a
+    non-empty ``name`` / ``command`` is a malformed proposal, not a silent skip -
+    mirroring ``implement_leg._require_dict_list`` (shape) plus the verifier's own
+    semantic check (the verifier re-validates each entry it executes).
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            "proposal 'verification_commands' must be a list (§24.2); "
+            f"got {type(raw).__name__}"
+        )
+    out: list[dict[str, str]] = []
+    for j, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"proposal 'verification_commands'[{j}] must be an object with "
+                f"'name' and 'command' (§9.5/§24.2); got {type(item).__name__}"
+            )
+        name = item.get("name")
+        command = item.get("command")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"proposal 'verification_commands'[{j}] has no non-empty 'name' "
+                f"(§9.5/§24.2)"
+            )
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(
+                f"proposal 'verification_commands'[{j}] (name={name!r}) has no "
+                f"non-empty 'command' (§9.5/§24.2)"
+            )
+        out.append({"name": name.strip(), "command": command.strip()})
+    return out
+
+
 def _read_lane_graph(feature_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load ``04-lane-graph.yml`` + return ``(graph, first_lane)`` (MVP one lane).
 
@@ -1028,15 +1072,21 @@ def build_canonical_tasks(
     *,
     origin: str | None,
     timestamp: str | None = None,
-) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]], list[dict[str, str]]]:
     """Allocate TASK ids + stitch REQ/DES refs -> canonical tasks doc + status rows.
 
     The pure allocation/stitch core of ``promote_tasks`` (split out for the same
     reason as the other build cores: a thin render/write/audit shell over a
-    unit-testable core). Returns ``(canonical_doc, allocated, task_status_rows)``
-    where ``allocated`` is ``{"TASK": [...]}`` in allocation order and
+    unit-testable core). Returns
+    ``(canonical_doc, allocated, task_status_rows, verification_commands)`` where
+    ``allocated`` is ``{"TASK": [...]}`` in allocation order,
     ``task_status_rows`` is ``{task_id: §8.1-row}`` (all ``pending``) for the
-    runtime ``task-status.yml`` promote seeds.
+    runtime ``task-status.yml`` promote seeds, and ``verification_commands`` is
+    the validated lane verify command set (v0.6 capstone, ticket 05) promote
+    writes onto the lane in ``04-lane-graph.yml`` - ``[]`` when the proposal
+    omits it. The verify commands are a lane-level concern, so they are NOT
+    written into ``03-tasks.json`` (the task-content doc); they travel out of
+    band to the lane-graph writer.
 
     Three resolution paths exercise the generic :class:`RefResolver` - this is the
     first stage with TWO frozen upstreams:
@@ -1157,7 +1207,11 @@ def build_canonical_tasks(
         "lane_purpose": lane_purpose,
         "tasks": tasks,
     }
-    return doc, allocated, task_status_rows
+    # v0.6 capstone (ticket 05): the optional lane verify command set travels out
+    # of band to the lane-graph writer (it is a lane-level concern, not task
+    # content), so it is NOT stored on the doc that becomes 03-tasks.json.
+    verification_commands = _normalize_verify_commands(proposal.get("verification_commands"))
+    return doc, allocated, task_status_rows, verification_commands
 
 
 def render_tasks_md(feature_id: str, doc: Mapping[str, Any]) -> str:
@@ -1247,9 +1301,13 @@ def _seed_task_status(
 
 
 def _populate_lane_graph_from_doc(
-    feature_root: Path, doc: Mapping[str, Any]
+    feature_root: Path,
+    doc: Mapping[str, Any],
+    *,
+    verification_commands: list[dict[str, str]] | None = None,
 ) -> None:
-    """Populate the single lane's purpose/tasks/files in ``04-lane-graph.yml``.
+    """Populate the single lane's purpose/tasks/files (+ verify commands) in
+    ``04-lane-graph.yml``.
 
     Reads the seeded lane-graph (one MVP lane), writes the lane's ``purpose``
     (from the proposal), its ``tasks`` (the allocated TASK ids, in order), and the
@@ -1259,6 +1317,13 @@ def _populate_lane_graph_from_doc(
     preserved - promote fills only what the tasks proposal carries. The lane's
     files are the union of task files so the Implementer's ``lane_allowed_files``
     (which reads the lane entry) sees every file any task touches.
+
+    v0.6 capstone (ticket 05): when ``verification_commands`` is non-empty, write
+    the Planner-generated lane verify command set onto the lane entry so the
+    shell Verifier (§9.5) runs model-generated commands - the
+    zero-hand-authored-planning bar (the v0.4 dogfood hand-authored these). When
+    empty/None the lane entry's existing ``verification_commands`` is left
+    untouched (backward compatible with proposals that omit it).
     """
     graph, lane = _read_lane_graph(feature_root)
 
@@ -1283,6 +1348,11 @@ def _populate_lane_graph_from_doc(
     lane["tasks"] = task_ids
     lane["expected_files"] = sorted(expected)
     lane["exclusive_files"] = sorted(exclusive)
+    if verification_commands:
+        lane["verification_commands"] = verification_commands
+        # ``verification_scope`` is the human label set (§7.5) - the names of the
+        # commands above, derived so the two never drift.
+        lane["verification_scope"] = [vc["name"] for vc in verification_commands]
     with (feature_root / LANE_GRAPH_YML).open("w") as f:
         yaml.safe_dump(
             graph, f, sort_keys=False, default_flow_style=False, allow_unicode=True
@@ -1332,7 +1402,7 @@ def promote_tasks(
             f"Proposal to change a frozen one, §4.2/§17)"
         )
 
-    doc, allocated, task_status_rows = build_canonical_tasks(
+    doc, allocated, task_status_rows, verification_commands = build_canonical_tasks(
         feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
     )
 
@@ -1341,9 +1411,13 @@ def promote_tasks(
     write_json(json_path, doc)
     md_path.write_text(render_tasks_md(feature_id, doc))
     # Seed task-status.yml (runtime state, all pending) + populate the single
-    # lane in 04-lane-graph.yml. Both are deterministic writes, no model.
+    # lane in 04-lane-graph.yml. Both are deterministic writes, no model. The
+    # Planner-generated verification_commands (ticket 05) ride along onto the
+    # lane entry so the Verifier runs model-generated commands.
     _seed_task_status(feature_root, task_status_rows)
-    _populate_lane_graph_from_doc(feature_root, doc)
+    _populate_lane_graph_from_doc(
+        feature_root, doc, verification_commands=verification_commands
+    )
 
     append_audit_event(
         feature_root,

@@ -435,6 +435,26 @@ class TestComputeChangedFiles:
 
         assert changed == ["output/result.json"]
 
+    def test_subtracts_python_bytecode_artifacts(self) -> None:
+        # The toolchain emits ``__pycache__/*.pyc`` when a module is imported
+        # during implementation; its name stamps the Python/pytest version
+        # (e.g. ``test_greet.cpython-312-pytest-9.1.1.pyc``). It is a
+        # non-deterministic build artifact, never source the agent authors, so
+        # it must not pollute changed_files regardless of adapter (keeps it out
+        # of the boundary check + final-report traceability index). Authored
+        # source alongside it is still listed.
+        before: dict[str, tuple[int, int]] = {}
+        after = {
+            "workspace/string_utils/__pycache__/__init__.cpython-312.pyc": (200, 1),
+            "workspace/string_utils/__pycache__/cli.cpython-312.pyc": (400, 2),
+            "workspace/tests/__pycache__/test_greet.cpython-312-pytest-9.1.1.pyc": (300, 3),
+            "workspace/string_utils/cli.py": (120, 4),
+        }
+
+        changed = compute_changed_files(before, after, WRAPPER_OWNED_RE)
+
+        assert changed == ["workspace/string_utils/cli.py"]
+
     def test_result_is_sorted(self) -> None:
         before: dict[str, tuple[int, int]] = {}
         after = {
