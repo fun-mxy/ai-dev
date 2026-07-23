@@ -142,6 +142,7 @@ from ai_dev.dry_run import (
     plan_implement,
     plan_generate_design,
     plan_generate_requirements,
+    plan_generate_tasks,
     plan_lane_gate,
     plan_review,
     plan_run_headless,
@@ -165,6 +166,7 @@ from ai_dev.planner_leg import (
     PlannerLegResult,
     run_generate_design,
     run_generate_requirements,
+    run_generate_tasks,
 )
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
@@ -570,6 +572,52 @@ def _build_parser() -> argparse.ArgumentParser:
         "enforces the file boundary post-hoc, §14.2).",
     )
 
+    # v0.6 ticket 04: the third planning gate - generate-tasks. The Planner runs
+    # against the frozen requirements AND design (two upstreams); promote fires
+    # automatically, writing four files (03-tasks.{json,md} + seeded
+    # task-status.yml + populated 04-lane-graph.yml) with stitched REQ+DES refs;
+    # --feedback refines; freeze tasks (running the REQ+DES coverage precheck) is
+    # the human gate that advances to lane_gate.
+    gen_tasks = subparsers.add_parser(
+        "generate-tasks",
+        help="Run the Planner tasks leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 03-tasks (+ task-status.yml + 04-lane-graph.yml) "
+        "against the frozen requirements and design (v0.6 ticket 04, ADR-0008).",
+        parents=[repo_root_parent],
+    )
+    gen_tasks.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "AND design (02-design.json) the Planner tasks against. Both must be "
+        "frozen first.",
+    )
+    gen_tasks.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 03-tasks until you freeze it.",
+    )
+    gen_tasks.add_argument(
+        "--profile",
+        default=None,
+        help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+    gen_tasks.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Bounded --max-turns for the headless call (default: 12).",
+    )
+    gen_tasks.add_argument(
+        "--permission-mode",
+        default=DEFAULT_PERMISSION_MODE,
+        help="claude --permission-mode (default: bypassPermissions; the wrapper "
+        "enforces the file boundary post-hoc, §14.2).",
+    )
+
     implement = subparsers.add_parser(
         "implement",
         help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
@@ -919,6 +967,7 @@ _DRY_RUN_COMMANDS: frozenset[str] = frozenset(
         "spec-gap",
         "generate-requirements",
         "generate-design",
+        "generate-tasks",
         "fix-run",
         "freeze",
         "triage",
@@ -1329,6 +1378,72 @@ def _run_generate_design(
         return 1
     print(
         f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_tasks(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner tasks leg end to end (v0.6 ticket 04, §9.1, ADR-0008 D2).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_tasks`` (build the Planner input package from the feature
+    intent + frozen requirements + frozen design -> run headless -> validate ->
+    promote, gated on validation), and prints a one-line summary. Returns ``0``
+    when the run validated and promote wrote the canonical-unfrozen
+    ``03-tasks.{json,md}`` (+ seeded ``task-status.yml`` + populated
+    ``04-lane-graph.yml``); ``1`` when validation failed (a captured run failure
+    is reported, not raised - no canonical artifact is written for a schema-invalid
+    proposal) or when the leg cannot start (missing feature/intent, requirements or
+    design not frozen, missing token). promote errors (malformed proposal /
+    unresolved ref / frozen artifact) propagate as a clean ``error:`` line via the
+    top-level handler.
+    """
+    try:
+        profile = load_profile(repo_root, profile_name)
+    except ProfileError as exc:
+        _render_error(exc)
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_tasks(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
+        return 1
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        task_ids = list(promote.allocated.get("TASK", []))
+        print(
+            f"GENERATE-TASKS PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"TASK={task_ids}"
+        )
+        return 0
+    if result.validation.passed:
+        print(
+            f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
         f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
         f"§14 validation):"
     )
@@ -2009,6 +2124,45 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             origin=ORIGIN_PLANNER_LEG,
         )
         return _run_generate_design(
+            repo_root,
+            args.feature_id,
+            profile_name,
+            args.feedback,
+            args.max_turns,
+            args.permission_mode,
+        )
+
+    if args.command == "generate-tasks":
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(
+                repo_root, ROLE_PLANNER, args.profile
+            )
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
+        if args.dry_run:
+            return _run_dry_plan(
+                lambda: plan_generate_tasks(
+                    repo_root,
+                    args.feature_id,
+                    load_profile(repo_root, profile_name),
+                    feedback=args.feedback,
+                    max_turns=args.max_turns,
+                    permission_mode=args.permission_mode,
+                )
+            )
+        # Record the resolved Planner profile on the feature's agent_profiles
+        # config (the record compare-profiles reads). Dry-run skips it -
+        # recording is a canonical status write. Same Planner role as the
+        # requirements/design legs (the tasks leg is the Planner's third stage).
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id),
+            ROLE_PLANNER,
+            profile_name,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+        return _run_generate_tasks(
             repo_root,
             args.feature_id,
             profile_name,

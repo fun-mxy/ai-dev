@@ -77,7 +77,9 @@ from ai_dev.paths import (
 from ai_dev.planner_leg import (
     _design_task_text,
     _planner_task_text,
+    _render_frozen_design_summary,
     _render_frozen_requirements_summary,
+    _tasks_task_text,
     read_intent,
 )
 # The model-role token lives in planner_schemas (planner_leg only re-exports it);
@@ -87,7 +89,7 @@ from ai_dev.planner_schemas import PLANNER_ROLE as _PLANNER_ROLE
 # promote (the canonical reader); the freeze-gate coverage precheck lives in
 # coverage. Both are pure read/compute helpers - no canonical write - so importing
 # them here keeps dry-run free of side effects (ADR-0004).
-from ai_dev.promote import read_frozen_requirements_doc
+from ai_dev.promote import read_frozen_design_doc, read_frozen_requirements_doc
 from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.profile_comparison import (
     PROFILE_COMPARISON_JSON,
@@ -539,6 +541,90 @@ def plan_generate_design(
         feature_id=feature_id,
         summary=(
             f"GENERATE-DESIGN DRY-RUN - would prepare {_PLANNER_ROLE} run "
+            f"for {feature_id} + spawn {profile.cli} (no id minted, no spawn)"
+        ),
+        details=details,
+    )
+
+
+def plan_generate_tasks(
+    repo_root: Path,
+    feature_id: str,
+    profile: AgentProfile,
+    *,
+    feedback: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+) -> DryRunPlan:
+    """Plan a ``generate-tasks`` leg: intent + frozen-reqs + frozen-design read, no spawn.
+
+    Mirrors ``plan_generate_design`` but adds the tasks leg's third precondition:
+    the design artifact must also be **frozen** (tasks may only stitch against
+    frozen upstreams - requirements AND design, ADR-0008 D2 - the first stage with
+    two). Reuses the Planner leg's precondition reads (feature exists, intent
+    present, requirements frozen, design frozen) and renders the would-be Planner
+    tasks input package into a temp dir instead of minting ``RUN-NNN``. The tasks
+    proposal schema (``output_schema_for_role("Planner", stage="tasks")``) is the
+    §14.1 contract the real run writes; the plan reports it as the would-be output
+    schema. Reports the would-be run + the promote targets (``03-tasks.{json,md}``
+    + the seeded ``task-status.yml`` + the populated ``04-lane-graph.yml``) so the
+    operator sees the full generate->promote slice (the four-file write) before
+    committing to a real run. ``feedback`` (when given) is surfaced so the
+    refinement channel (ADR-0008 D4) is visible.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    # Preconditions mirror the real leg exactly: tasks stitches against TWO frozen
+    # upstreams (REQ + DES), so both must be frozen (ADR-0008 D2). The
+    # ``read_frozen_*_doc`` helpers raise ValueError when either is not frozen -
+    # the task gate's gating precondition.
+    intent = read_intent(feature_root)
+    req_doc = read_frozen_requirements_doc(feature_root)
+    des_doc = read_frozen_design_doc(feature_root)
+    req_summary = _render_frozen_requirements_summary(req_doc)
+    des_summary = _render_frozen_design_summary(des_doc)
+    task_text = _tasks_task_text(feature_id, intent, req_summary, des_summary, feedback)
+    schema = output_schema_for_role(_PLANNER_ROLE, stage="tasks")
+    _require_token_source(profile)
+
+    temp_root, input_dir = _render_temp_package(
+        feature_id, _PLANNER_ROLE, task_text, [], schema
+    )
+    details = _agent_invocation_details(
+        profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode
+    )
+    details.update(
+        {
+            "role": _PLANNER_ROLE,
+            "stage": "tasks",
+            "task_package": str(input_dir / TASK_PACKAGE_FILE),
+            "output_schema": "tasks proposal (id-free; promote allocates TASK ids)",
+            "upstream": (
+                "01-requirements.json + 02-design.json (frozen REQ+DES ids; "
+                "stitched via add_upstream)"
+            ),
+            "feedback": feedback if (feedback is not None and feedback.strip()) else None,
+            "temp_dir": str(temp_root),
+            "would_mint_ids": ["RUN-NNN (next monotonic)"],
+            "would_write": [
+                "runs/RUN-NNN/input/* (tasks-proposal-schema package)",
+                "runs/RUN-NNN/output/{result.json,result.md,metadata.json,...}",
+                "03-tasks.json (canonical-unfrozen, via promote)",
+                "03-tasks.md (rendered mirror, via promote)",
+                "status/task-status.yml (seeded, all pending, via promote)",
+                "04-lane-graph.yml (single lane populated, via promote)",
+            ],
+            # promote is gated on a passing validation in the real leg; surfaced
+            # so the plan is honest that a schema-invalid proposal promotes nothing.
+            "would_promote": "gated on validate-run PASS (proposal schema-valid)",
+        }
+    )
+    return DryRunPlan(
+        command="generate-tasks",
+        feature_id=feature_id,
+        summary=(
+            f"GENERATE-TASKS DRY-RUN - would prepare {_PLANNER_ROLE} run "
             f"for {feature_id} + spawn {profile.cli} (no id minted, no spawn)"
         ),
         details=details,

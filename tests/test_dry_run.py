@@ -364,10 +364,14 @@ class TestFreezeDryRun:
         feature_root = _feature_root(repo_root, feature_id)
         before = _inventory(feature_root)
 
-        plan = plan_freeze(repo_root, feature_id, "tasks")
+        # ``requirements`` is the root (no upstream coverage precheck), so a fresh
+        # feature plans a clean freeze + advance with no refusal. (``tasks`` now
+        # carries a REQ+DES coverage precheck that raises on a fresh feature -
+        # its dry-run is covered in TestTasksFreezeDryRun.)
+        plan = plan_freeze(repo_root, feature_id, "requirements")
         assert plan.details["currently_frozen"] is False
         assert plan.details["would_be_refused"] is False
-        assert plan.details["would_advance_current_gate_to"] == "lane_gate"
+        assert plan.details["would_advance_current_gate_to"] == "design_gate"
         assert _inventory(feature_root) == before
 
     def test_already_frozen_reported_not_raised(self, repo_root: Path) -> None:

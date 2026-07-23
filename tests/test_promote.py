@@ -25,14 +25,25 @@ from ai_dev.promote import (
     UnresolvedRefError,
     build_canonical_design,
     build_canonical_requirements,
+    build_canonical_tasks,
     promote_design,
     promote_requirements,
+    promote_tasks,
+    read_frozen_design_doc,
     read_frozen_requirements_doc,
     render_design_md,
     render_requirements_md,
+    render_tasks_md,
 )
 from ai_dev.status import freeze_artifact
-from ai_dev.templates import DESIGN_JSON, DESIGN_MD, REQUIREMENTS_JSON
+from ai_dev.templates import (
+    DESIGN_JSON,
+    DESIGN_MD,
+    LANE_GRAPH_YML,
+    REQUIREMENTS_JSON,
+    TASKS_JSON,
+    TASKS_MD,
+)
 
 FEATURE_ID = "FEATURE-001"
 
@@ -807,3 +818,503 @@ class TestPromoteDesignMalformedProposal:
         }
         with pytest.raises(ValueError, match="non-empty string 'requirement'"):
             promote_design(root, FEATURE_ID, proposal, origin="cli")
+
+
+# ---------------------------------------------------------------------------
+# Tasks stage (ticket 04): promote_tasks stitches each task's REQ+DES refs
+# against the FROZEN requirements AND design upstreams (first stage with two
+# frozen upstreams) + allocates TASK ids + renders 03-tasks.{json,md} + seeds
+# status/task-status.yml + populates the single lane in 04-lane-graph.yml.
+# ---------------------------------------------------------------------------
+
+
+def _feature_with_frozen_requirements_and_design(
+    tmp_path: Path, req_proposal: dict | None = None
+) -> tuple[Path, list[str], list[str]]:
+    """Create a feature run, promote+freeze requirements AND design, return ids.
+
+    Tasks may only stitch against *frozen* requirements AND design (ADR-0008 D2),
+    so every tasks test needs a feature whose requirements and design are both
+    promoted then frozen. Returns ``(root, req_ids, des_ids)`` - the two upstream
+    id sets a tasks proposal's ``related_requirements`` / ``related_design`` refs
+    resolve against.
+    """
+    root, req_ids = _feature_with_frozen_requirements(tmp_path, req_proposal)
+    promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="test")
+    freeze_artifact(root, "design", origin="test")
+    des_doc = json.loads((root / DESIGN_JSON).read_text())
+    des_ids = [el["id"] for el in des_doc["design_elements"]]
+    return root, req_ids, des_ids
+
+
+def _tasks_proposal(req_ids: list[str], des_ids: list[str]) -> dict:
+    """A synthetic id-free tasks proposal referencing frozen REQ+DES ids.
+
+    Two tasks across the single MVP lane: t1 realizes REQ-001 via DES-001, t2
+    realizes REQ-002 via DES-001+DES-002. Each declares its expected/exclusive
+    files (the lane file boundary the Implementer later enforces).
+    """
+    return {
+        "lane_purpose": "Implement the greet CLI end to end.",
+        "tasks": [
+            {
+                "key": "t1",
+                "summary": "Implement greeting formatter",
+                "related_requirements": [req_ids[0]],
+                "related_design": [des_ids[0]],
+                "expected_files": ["src/greet.py"],
+                "exclusive_files": ["src/greet.py"],
+                "description": "Formats the greeting string.",
+            },
+            {
+                "key": "t2",
+                "summary": "Wire greet CLI entrypoint",
+                "related_requirements": [req_ids[1]],
+                "related_design": [des_ids[1], des_ids[0]],
+                "expected_files": ["src/cli.py"],
+                "exclusive_files": ["src/cli.py"],
+            },
+        ],
+    }
+
+
+class TestReadFrozenDesignDoc:
+    def test_returns_doc_when_design_frozen(self, tmp_path: Path) -> None:
+        root, _, _ = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc = read_frozen_design_doc(root)
+        assert doc["feature"] == FEATURE_ID
+        assert [el["id"] for el in doc["design_elements"]] == ["DES-001", "DES-002"]
+
+    def test_fails_loud_when_design_not_frozen(self, tmp_path: Path) -> None:
+        # Requirements frozen but design only promoted (not frozen).
+        root, _ = _feature_with_frozen_requirements(tmp_path)
+        promote_design(
+            root, FEATURE_ID, _design_proposal(["REQ-001", "REQ-002"]), origin="test"
+        )
+        with pytest.raises(ValueError, match="not frozen"):
+            read_frozen_design_doc(root)
+
+
+class TestBuildCanonicalTasks:
+    def test_returns_three_tuple_doc_allocated_status_rows(
+        self, tmp_path: Path
+    ) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        result = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        # The tasks build core returns (doc, allocated, task_status_rows) - the
+        # extra third element (vs design's 2-tuple) is the runtime rows it seeds.
+        assert isinstance(result, tuple) and len(result) == 3
+        doc, allocated, rows = result
+        assert isinstance(doc, dict)
+        assert isinstance(allocated, dict)
+        assert isinstance(rows, dict)
+
+    def test_allocates_task_ids_in_order(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, allocated, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        assert allocated == {"TASK": ["TASK-001", "TASK-002"]}
+        assert [t["id"] for t in doc["tasks"]] == ["TASK-001", "TASK-002"]
+
+    def test_stitches_related_requirements_to_frozen_req_ids(
+        self, tmp_path: Path
+    ) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        reqs_of = {t["key"]: t["related_requirements"] for t in doc["tasks"]}
+        assert reqs_of["t1"] == ["REQ-001"]
+        assert reqs_of["t2"] == ["REQ-002"]
+        # No local key leaks - the stitched canonical frozen REQ id.
+        for t in doc["tasks"]:
+            assert all(r.startswith("REQ-") for r in t["related_requirements"])
+
+    def test_stitches_related_design_to_frozen_des_ids(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        des_of = {t["key"]: t["related_design"] for t in doc["tasks"]}
+        # t2 -> [d2, d1] -> [DES-002, DES-001] (order preserved, no dedupe needed).
+        assert des_of["t1"] == ["DES-001"]
+        assert des_of["t2"] == ["DES-002", "DES-001"]
+        for t in doc["tasks"]:
+            assert all(d.startswith("DES-") for d in t["related_design"])
+
+    def test_assigns_single_seeded_lane_to_each_task(self, tmp_path: Path) -> None:
+        # The lane is structural (allocated at feature-run creation, seeded into
+        # 04-lane-graph.yml); promote assigns every task to that one lane (§5.3).
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        assert all(t["lane"] == "LANE-001" for t in doc["tasks"])
+        assert doc["lane_purpose"] == "Implement the greet CLI end to end."
+
+    def test_carries_optional_facets_and_local_key_as_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        assert doc["feature"] == FEATURE_ID
+        assert doc["frozen"] is False
+        # The model's local key is retained as provenance on each task.
+        assert doc["tasks"][0]["key"] == "t1"
+        # Optional prose carried through when present...
+        assert doc["tasks"][0]["description"] == "Formats the greeting string."
+        # ...and omitted when absent (t2 has no description).
+        assert "description" not in doc["tasks"][1]
+        # expected/exclusive files carried as declared (not resolved - file paths).
+        assert doc["tasks"][0]["expected_files"] == ["src/greet.py"]
+        assert doc["tasks"][0]["exclusive_files"] == ["src/greet.py"]
+
+    def test_derives_related_acceptance_criteria_via_req_ac_chain(
+        self, tmp_path: Path
+    ) -> None:
+        # TASK -> REQ -> AC: a task's related_acceptance_criteria are the ACs
+        # whose `requirement` traces to one of the task's related_requirements.
+        # Richer reqs: r1 has a1+a2, r2 has a3.
+        req_proposal = {
+            "requirements": [
+                {"key": "r1", "statement": "shall foo."},
+                {"key": "r2", "statement": "shall bar."},
+            ],
+            "acceptance_criteria": [
+                {"key": "a1", "requirement": "r1", "criterion": "foo1"},
+                {"key": "a2", "requirement": "r1", "criterion": "foo2"},
+                {"key": "a3", "requirement": "r2", "criterion": "bar1"},
+            ],
+        }
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(
+            tmp_path, req_proposal
+        )
+        doc, _, rows = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        # t1 -> REQ-001 -> [AC-001, AC-002]; t2 -> REQ-002 -> [AC-003].
+        acs_of = {t["key"]: t.get("related_acceptance_criteria") for t in doc["tasks"]}
+        # related_acceptance_criteria is NOT stored on the task doc (it lives in
+        # the runtime task-status rows); the doc task carries REQ/DES refs only.
+        assert "related_acceptance_criteria" not in doc["tasks"][0]
+        # The derived ACs land on the runtime status rows promote seeds.
+        assert rows["TASK-001"]["related_acceptance_criteria"] == ["AC-001", "AC-002"]
+        assert rows["TASK-002"]["related_acceptance_criteria"] == ["AC-003"]
+
+    def test_status_rows_all_pending_with_refs(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        _, _, rows = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        # Every task seeds a pending runtime row (§8.1) carrying its stitched
+        # REQ refs + derived AC refs + the assigned lane.
+        assert set(rows) == {"TASK-001", "TASK-002"}
+        for row in rows.values():
+            assert row["status"] == "pending"
+            assert row["lane"] == "LANE-001"
+            assert row["owner_run"] is None
+            assert row["proposed_done_by"] is None
+            assert row["accepted_done"] is False
+        assert rows["TASK-001"]["related_requirements"] == ["REQ-001"]
+        assert rows["TASK-002"]["related_requirements"] == ["REQ-002"]
+
+    def test_unresolvable_req_ref_fails_loud(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["tasks"][0]["related_requirements"] = ["REQ-099"]  # no such REQ
+        with pytest.raises(UnresolvedRefError, match="REQ-099"):
+            build_canonical_tasks(root, FEATURE_ID, proposal, origin=None)
+
+    def test_unresolvable_des_ref_fails_loud(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["tasks"][0]["related_design"] = ["DES-099"]  # no such DES
+        with pytest.raises(UnresolvedRefError, match="DES-099"):
+            build_canonical_tasks(root, FEATURE_ID, proposal, origin=None)
+
+    def test_fails_loud_when_design_not_frozen(self, tmp_path: Path) -> None:
+        # Requirements frozen, design promoted but NOT frozen.
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(
+            root, FEATURE_ID, _design_proposal(req_ids), origin="test"
+        )
+        with pytest.raises(ValueError, match="not frozen"):
+            build_canonical_tasks(
+                root, FEATURE_ID, _tasks_proposal(req_ids, ["DES-001", "DES-002"]),
+                origin=None,
+            )
+
+    def test_fails_loud_when_requirements_not_frozen(self, tmp_path: Path) -> None:
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        with pytest.raises(ValueError, match="not frozen"):
+            build_canonical_tasks(
+                root,
+                FEATURE_ID,
+                _tasks_proposal(["REQ-001", "REQ-002"], ["DES-001", "DES-002"]),
+                origin=None,
+            )
+
+
+class TestRenderTasksMd:
+    def test_renders_task_ids_and_stitched_refs(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        md = render_tasks_md(FEATURE_ID, doc)
+        # TASK ids appear.
+        assert "TASK-001" in md and "TASK-002" in md
+        # Stitched canonical REQ/DES refs (not local keys) render.
+        assert "related_requirements: REQ-001" in md
+        assert "related_requirements: REQ-002" in md
+        assert "related_design: DES-001" in md
+        assert "related_design: DES-002, DES-001" in md
+        # The assigned lane + summaries render; frozen state mirrored.
+        assert "lane: LANE-001" in md
+        assert "Implement greeting formatter" in md
+        assert "Frozen: false" in md
+
+    def test_lane_purpose_section_precedes_tasks_section(self, tmp_path: Path) -> None:
+        # The Implementer reads everything after `## Tasks` verbatim, so that
+        # section must be LAST; the lane purpose renders in its own section above.
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        md = render_tasks_md(FEATURE_ID, doc)
+        assert md.index("## Lane purpose") < md.index("## Tasks (TASK-NNN)")
+        # Nothing follows the tasks section - `## Tasks` is the last level-2
+        # header (the `### TASK-NNN` task headings nest under it, not after it).
+        h2 = [ln for ln in md.splitlines() if ln.startswith("## ")]
+        assert h2[-1] == "## Tasks (TASK-NNN)"
+
+    def test_renders_empty_artifact_without_ids(self) -> None:
+        doc = {
+            "feature": FEATURE_ID,
+            "frozen": False,
+            "lane_purpose": None,
+            "tasks": [],
+        }
+        md = render_tasks_md(FEATURE_ID, doc)
+        assert "_None yet._" in md
+        assert "### TASK-" not in md
+
+    def test_render_is_deterministic(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        doc, _, _ = build_canonical_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin=None
+        )
+        assert render_tasks_md(FEATURE_ID, doc) == render_tasks_md(FEATURE_ID, doc)
+
+
+class TestPromoteTasks:
+    def test_writes_canonical_json_and_md_mirror(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        result = promote_tasks(
+            root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli"
+        )
+
+        assert isinstance(result, PromoteResult)
+        assert result.stage == "tasks"
+        assert result.artifact == "tasks"
+        assert result.json_path == root / TASKS_JSON
+        assert result.md_path == root / TASKS_MD
+        assert result.json_path.is_file()
+        assert result.md_path.is_file()
+
+        doc = json.loads(result.json_path.read_text())
+        assert doc["frozen"] is False
+        assert [t["id"] for t in doc["tasks"]] == ["TASK-001", "TASK-002"]
+        assert doc["lane_purpose"] == "Implement the greet CLI end to end."
+
+    def test_seeds_task_status_yml_all_pending(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        status = yaml.safe_load((root / "status" / "task-status.yml").read_text())
+        assert set(status["tasks"]) == {"TASK-001", "TASK-002"}
+        for row in status["tasks"].values():
+            assert row["status"] == "pending"
+            assert row["accepted_done"] is False
+        # Derived ACs (default frozen reqs: AC-001 traces to REQ-001).
+        assert status["tasks"]["TASK-001"]["related_acceptance_criteria"] == ["AC-001"]
+        assert status["tasks"]["TASK-002"]["related_acceptance_criteria"] == []
+
+    def test_populates_single_lane_in_lane_graph(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        graph = yaml.safe_load((root / LANE_GRAPH_YML).read_text())
+        lane = graph["lanes"][0]
+        # purpose + tasks (in allocation order) + union of files (sorted).
+        assert lane["purpose"] == "Implement the greet CLI end to end."
+        assert lane["tasks"] == ["TASK-001", "TASK-002"]
+        assert lane["expected_files"] == ["src/cli.py", "src/greet.py"]
+        assert lane["exclusive_files"] == ["src/cli.py", "src/greet.py"]
+        # The lane's structural fields are preserved (id never re-allocated).
+        assert lane["id"] == "LANE-001"
+        assert "merge_policy" in lane
+        assert lane["depends_on"] == []
+
+    def test_allocates_from_counter_and_persists_it(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        counters = yaml.safe_load((root / "id-counters.yml").read_text())
+        assert counters["TASK"] == 2
+
+    def test_appends_promote_audit_event(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        records = json.loads((root / "audit.log.json").read_text())
+        promote_records = [
+            r
+            for r in records
+            if r["event"] == "promote" and r["payload"]["stage"] == "tasks"
+        ]
+        assert len(promote_records) == 1
+        payload = promote_records[0]["payload"]
+        assert payload["artifact"] == "tasks"
+        assert payload["allocated"] == {"TASK": ["TASK-001", "TASK-002"]}
+        assert promote_records[0]["origin"] == "cli"
+
+    def test_unresolvable_ref_writes_nothing(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        seed_json = (root / TASKS_JSON).read_text()
+        seed_status = (root / "status" / "task-status.yml").read_text()
+        seed_graph = (root / LANE_GRAPH_YML).read_text()
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["tasks"][0]["related_requirements"] = ["REQ-099"]
+        with pytest.raises(UnresolvedRefError, match="REQ-099"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+        # All four write targets are unchanged - fail loud, no partial promote.
+        assert (root / TASKS_JSON).read_text() == seed_json
+        assert (root / "status" / "task-status.yml").read_text() == seed_status
+        assert (root / LANE_GRAPH_YML).read_text() == seed_graph
+        records = json.loads((root / "audit.log.json").read_text())
+        assert not any(
+            r["event"] == "promote" and r["payload"].get("stage") == "tasks"
+            for r in records
+        )
+
+    def test_refuses_to_overwrite_a_frozen_tasks(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        freeze_artifact(root, "tasks", origin="cli")
+        with pytest.raises(FrozenArtifactWriteError):
+            promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+
+    def test_refuses_to_overwrite_a_frozen_lane_graph(self, tmp_path: Path) -> None:
+        # tasks and lane_graph freeze TOGETHER at the task gate (§18.3); a frozen
+        # lane_graph must also block tasks promote (both written in one step).
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        freeze_artifact(root, "lane_graph", origin="cli")
+        with pytest.raises(FrozenArtifactWriteError):
+            promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+
+    def test_re_promote_overwrites_and_reallocates_ids(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        first = promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        assert list(first.allocated["TASK"]) == ["TASK-001", "TASK-002"]
+        second = promote_tasks(root, FEATURE_ID, _tasks_proposal(req_ids, des_ids), origin="cli")
+        # New ids from the bumped counter; canonical file overwritten.
+        assert list(second.allocated["TASK"]) == ["TASK-003", "TASK-004"]
+        doc = json.loads((root / TASKS_JSON).read_text())
+        assert [t["id"] for t in doc["tasks"]] == ["TASK-003", "TASK-004"]
+        # The lane graph's tasks list reflects the re-allocated ids.
+        graph = yaml.safe_load((root / LANE_GRAPH_YML).read_text())
+        assert graph["lanes"][0]["tasks"] == ["TASK-003", "TASK-004"]
+
+    def test_rejects_empty_feature_id(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        with pytest.raises(ValueError, match="feature_id"):
+            promote_tasks(root, "", _tasks_proposal(req_ids, des_ids), origin="cli")
+
+    def test_refuses_if_design_not_frozen(self, tmp_path: Path) -> None:
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(root, FEATURE_ID, _design_proposal(req_ids), origin="test")
+        with pytest.raises(ValueError, match="not frozen"):
+            promote_tasks(
+                root,
+                FEATURE_ID,
+                _tasks_proposal(req_ids, ["DES-001", "DES-002"]),
+                origin="cli",
+            )
+
+    def test_refuses_if_requirements_not_frozen(self, tmp_path: Path) -> None:
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        with pytest.raises(ValueError, match="not frozen"):
+            promote_tasks(
+                root,
+                FEATURE_ID,
+                _tasks_proposal(["REQ-001", "REQ-002"], ["DES-001", "DES-002"]),
+                origin="cli",
+            )
+
+
+class TestPromoteTasksMalformedProposal:
+    """§24.2: a malformed tasks proposal fails loud rather than being silently coerced."""
+
+    def test_tasks_not_a_list(self, tmp_path: Path) -> None:
+        root, _, _ = _feature_with_frozen_requirements_and_design(tmp_path)
+        with pytest.raises(ValueError, match="'tasks' must be a list"):
+            promote_tasks(
+                root,
+                FEATURE_ID,
+                {"lane_purpose": "p", "tasks": {}},
+                origin="cli",
+            )
+
+    def test_missing_lane_purpose(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["lane_purpose"]
+        with pytest.raises(ValueError, match="non-empty string 'lane_purpose'"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_missing_key(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["tasks"][0]["key"]
+        with pytest.raises(ValueError, match="non-empty string 'key'"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_missing_summary(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["tasks"][0]["summary"]
+        with pytest.raises(ValueError, match="non-empty string 'summary'"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_missing_related_requirements(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["tasks"][0]["related_requirements"]
+        with pytest.raises(UnresolvedRefError, match="expected a list"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_missing_related_design(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["tasks"][0]["related_design"]
+        with pytest.raises(UnresolvedRefError, match="expected a list"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_missing_expected_files(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        del proposal["tasks"][0]["expected_files"]
+        with pytest.raises(ValueError, match="must be a list"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+    def test_task_expected_files_not_all_strings(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["tasks"][0]["expected_files"] = ["src/greet.py", 42]
+        with pytest.raises(ValueError, match="non-empty string"):
+            promote_tasks(root, FEATURE_ID, proposal, origin="cli")

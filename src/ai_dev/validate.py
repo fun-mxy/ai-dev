@@ -54,6 +54,7 @@ from ai_dev.templates import (
     LANE_GRAPH_YML,
     REQUIREMENTS_JSON,
     REQUIREMENTS_MD,
+    TASKS_JSON,
     TASKS_MD,
 )
 
@@ -92,7 +93,7 @@ RETRYABLE_CODES: frozenset[str] = frozenset(
 _FROZEN_ARTIFACT_FILES: Mapping[str, tuple[str, ...]] = {
     "requirements": (REQUIREMENTS_MD, REQUIREMENTS_JSON),
     "design": (DESIGN_MD, DESIGN_JSON),
-    "tasks": (TASKS_MD,),
+    "tasks": (TASKS_MD, TASKS_JSON),
     "lane_graph": (LANE_GRAPH_YML,),
 }
 

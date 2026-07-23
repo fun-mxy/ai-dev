@@ -46,15 +46,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+import yaml
+
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
 from ai_dev.json_artifact import read_json_object, write_json
-from ai_dev.status import frozen_artifacts_status
+from ai_dev.status import TASK_STATUS_FILE, frozen_artifacts_status
 from ai_dev.templates import (
     DESIGN_JSON,
     DESIGN_MD,
+    LANE_GRAPH_YML,
     REQUIREMENTS_JSON,
     REQUIREMENTS_MD,
+    TASKS_JSON,
+    TASKS_MD,
 )
 
 # The audit event for a promote (the planning-leg analogue of ``implement-result``
@@ -69,6 +74,14 @@ REQUIREMENTS_ARTIFACT = "requirements"
 # The §4.2 artifact name the design stage writes (ticket 03). Public so the
 # design leg / coverage precheck reference it from one source.
 DESIGN_ARTIFACT = "design"
+
+# The §4.2 artifact names the tasks stage writes (ticket 04). ``tasks`` is the
+# canonical task content (03-tasks.{json,md}); ``lane_graph`` is the single lane
+# the same promote populates (04-lane-graph.yml) - the two freeze together at the
+# task gate (§18.3), so promote writes both in one step and refuses if either is
+# frozen. Public so the coverage precheck / freeze dispatch reference them.
+TASKS_ARTIFACT = "tasks"
+LANE_GRAPH_ARTIFACT = "lane_graph"
 
 
 class UnresolvedRefError(ValueError):
@@ -881,6 +894,473 @@ def promote_design(
     return PromoteResult(
         stage="design",
         artifact=DESIGN_ARTIFACT,
+        json_path=json_path,
+        md_path=md_path,
+        allocated={k: tuple(v) for k, v in allocated.items()},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tasks stage (ticket 04): stitch each task's REQ+DES refs against the FROZEN
+# requirements AND design upstreams + allocate TASK ids + render 03-tasks.{json,md}
+# + seed status/task-status.yml (all pending) + populate the single lane in
+# 04-lane-graph.yml (purpose/tasks/files). The first stage with TWO frozen
+# upstreams and the first that writes four files in one promote.
+# ---------------------------------------------------------------------------
+
+
+def read_frozen_design_doc(feature_root: Path) -> Mapping[str, Any]:
+    """Read the frozen ``02-design.json`` (the tasks upstream, ADR-0008 D2).
+
+    Tasks may only stitch cross-references against a *frozen* design artifact -
+    the upstream DES ids a tasks proposal's ``related_design`` refs resolve
+    against (REQs resolve against the frozen requirements, also read here via
+    :func:`read_frozen_requirements_doc`). The authoritative frozen state is
+    ``status.frozen_artifacts_status`` (not the design doc's ``frozen`` field,
+    which promote always writes ``False``). Fails loud (§24.2) if design is not
+    frozen (freeze design first) or the canonical doc is missing/unreadable.
+    """
+    frozen = frozen_artifacts_status(feature_root)
+    if not frozen.get(DESIGN_ARTIFACT):
+        raise ValueError(
+            f"artifact {DESIGN_ARTIFACT!r} is not frozen; tasks may only stitch "
+            f"against a frozen upstream (ADR-0008 D2). Freeze design first (§4.2)."
+        )
+    doc = read_json_object(feature_root / DESIGN_JSON)
+    if doc is None:
+        raise ValueError(
+            f"{DESIGN_JSON} missing or unreadable at {feature_root} (§24.2)"
+        )
+    return doc
+
+
+def frozen_des_ids(des_doc: Mapping[str, Any]) -> list[str]:
+    """The frozen DES ids a tasks proposal's ``related_design`` refs resolve against.
+
+    Shared by :func:`build_canonical_tasks` (registers them via ``add_upstream``)
+    and :mod:`coverage` (the set every task's ``related_design`` must cover at
+    the freeze gate). Returns the ids in doc order; callers needing set semantics
+    wrap in ``set(...)``. Defensive against a hand-edited doc.
+    """
+    return [
+        e["id"]
+        for e in des_doc.get("design_elements", [])
+        if isinstance(e, Mapping) and isinstance(e.get("id"), str) and e["id"]
+    ]
+
+
+def _str_list(
+    raw: Any, field: str, index: int, *, what: str
+) -> list[str]:
+    """Coerce a proposal list-of-strings field (fail loud, §24.2).
+
+    Used for the non-ref list fields a task carries (``expected_files`` /
+    ``exclusive_files``): each must be a list of non-empty strings, but the
+    members are NOT resolved against an upstream (they are file paths the model
+    declares, not refs). A non-list field or a non-string/empty member is a
+    malformed proposal, not a silent skip. (Ref lists use
+    :meth:`RefResolver.resolve_list`, which resolves each member too.)
+    """
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"proposal {what}[{index}] {field!r} must be a list (§24.2); "
+            f"got {type(raw).__name__}"
+        )
+    out: list[str] = []
+    for j, item in enumerate(raw):
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"proposal {what}[{index}] {field}[{j}] must be a non-empty "
+                f"string (§24.2)"
+            )
+        out.append(item)
+    return out
+
+
+def _read_lane_graph(feature_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load ``04-lane-graph.yml`` + return ``(graph, first_lane)`` (MVP one lane).
+
+    The shared open/parse/validate cascade for the two lane-graph writers
+    (``_seeded_lane_id`` reads the id; ``_populate_lane_graph_from_doc`` writes
+    purpose/tasks/files onto the lane). The lane is structural: allocated at
+    feature-run creation and seeded into ``04-lane-graph.yml`` (ticket 03), never
+    by promote. Fails loud (§24.2) if the lane-graph is missing/mis-shaped or its
+    first lane has no string id - a feature run always has one seeded lane.
+    """
+    path = feature_root / LANE_GRAPH_YML
+    if not path.is_file():
+        raise ValueError(f"{LANE_GRAPH_YML} missing at {path} (§7.5)")
+    try:
+        graph = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"{LANE_GRAPH_YML} at {path} is not valid YAML: {exc} (§7.5)"
+        ) from exc
+    if not isinstance(graph, dict):
+        raise ValueError(f"{LANE_GRAPH_YML} at {path} is not a mapping (§7.5)")
+    lanes = graph.get("lanes")
+    if not isinstance(lanes, list) or not lanes:
+        raise ValueError(f"{LANE_GRAPH_YML} at {path} has no 'lanes' list (§7.5)")
+    first = lanes[0]
+    if not isinstance(first, dict) or not isinstance(first.get("id"), str) or not first["id"]:
+        raise ValueError(
+            f"{LANE_GRAPH_YML} at {path} first lane has no string id (§7.5)"
+        )
+    return graph, first
+
+
+def _seeded_lane_id(feature_root: Path) -> str:
+    """Read the single seeded lane id from ``04-lane-graph.yml`` (MVP one lane).
+
+    The lane is structural: allocated at feature-run creation and seeded into
+    ``04-lane-graph.yml`` (ticket 03), never by promote. The tasks proposal
+    supplies the lane's *purpose* but not its id; promote assigns every task to
+    this one seeded lane (single-lane assignment, §5.3).
+    """
+    _, first = _read_lane_graph(feature_root)
+    return first["id"]
+
+
+def build_canonical_tasks(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    origin: str | None,
+    timestamp: str | None = None,
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]]]:
+    """Allocate TASK ids + stitch REQ/DES refs -> canonical tasks doc + status rows.
+
+    The pure allocation/stitch core of ``promote_tasks`` (split out for the same
+    reason as the other build cores: a thin render/write/audit shell over a
+    unit-testable core). Returns ``(canonical_doc, allocated, task_status_rows)``
+    where ``allocated`` is ``{"TASK": [...]}`` in allocation order and
+    ``task_status_rows`` is ``{task_id: §8.1-row}`` (all ``pending``) for the
+    runtime ``task-status.yml`` promote seeds.
+
+    Three resolution paths exercise the generic :class:`RefResolver` - this is the
+    first stage with TWO frozen upstreams:
+
+    * **REQ upstream refs** - each task's ``related_requirements`` are canonical
+      ``REQ-NNN`` read from the frozen ``01-requirements.json``.
+      ``add_upstream("REQ", frozen_req_ids)`` registers the frozen set, then
+      ``resolve_list`` verifies each ref is a real frozen REQ (a ref to a
+      non-existent REQ raises :class:`UnresolvedRefError`, D3).
+    * **DES upstream refs** - each task's ``related_design`` are canonical
+      ``DES-NNN`` read from the frozen ``02-design.json``. Same upstream path
+      (``add_upstream("DES", frozen_des_ids)``); same reference-integrity.
+    * **TASK local refs** - none in v0.6 (tasks are leaves of the planning DAG;
+      nothing refs a task by local key). TASK ids are allocated + registered local
+      for forward use, but no proposal member resolves against them.
+
+    The lane id is read from the seeded ``04-lane-graph.yml`` (single MVP lane);
+    every task is assigned to it. ``related_acceptance_criteria`` is *derived*
+    (not authored): the ACs whose ``requirement`` traces to one of the task's
+    ``related_requirements`` (TASK -> REQ -> AC, the §8.1 traceability chain the
+    Implementer writeback later preserves). ``timestamp`` threads into every
+    ``allocate_id`` call so all id-allocation audit records share the promote's
+    timestamp.
+    """
+    resolver = RefResolver()
+    allocated: dict[str, list[str]] = {"TASK": []}
+
+    # Two frozen upstreams: REQ ids (from frozen requirements) + DES ids (from
+    # frozen design). tasks is the first stage stitching against two upstreams.
+    req_doc = read_frozen_requirements_doc(feature_root)
+    resolver.add_upstream("REQ", frozen_req_ids(req_doc))
+    des_doc = read_frozen_design_doc(feature_root)
+    resolver.add_upstream("DES", frozen_des_ids(des_doc))
+
+    # AC -> REQ index: derive each task's related_acceptance_criteria (the ACs
+    # tracing to the task's REQs) from the frozen requirements doc, read once.
+    acs_by_req: dict[str, list[str]] = {}
+    for ac in req_doc.get("acceptance_criteria", []) or []:
+        if not isinstance(ac, Mapping):
+            continue
+        ref = str(ac.get("requirement", ""))
+        aid = ac.get("id")
+        if ref and isinstance(aid, str) and aid:
+            acs_by_req.setdefault(ref, []).append(aid)
+
+    # Top-level lane_purpose (the single MVP lane's purpose, written into the
+    # lane-graph by promote). Required non-empty: a task gate with no lane
+    # purpose is a malformed proposal.
+    lane_purpose = proposal.get("lane_purpose")
+    if not isinstance(lane_purpose, str) or not lane_purpose:
+        raise ValueError(
+            "proposal needs a non-empty string 'lane_purpose' (§24.2)"
+        )
+    lane_id = _seeded_lane_id(feature_root)
+
+    tasks: list[dict[str, Any]] = []
+    task_status_rows: dict[str, dict[str, Any]] = {}
+    for i, entry in enumerate(_entries(proposal.get("tasks"), "tasks")):
+        key = _required_str(entry, "key", i, what="tasks")
+        summary = _required_str(entry, "summary", i, what="tasks")
+        # D3 reference-integrity: resolve_list raises UnresolvedRefError if a REQ
+        # or DES ref is not a real frozen upstream id - fail loud, write nothing.
+        req_refs = resolver.resolve_list("REQ", entry.get("related_requirements"))
+        des_refs = resolver.resolve_list("DES", entry.get("related_design"))
+        task_id = allocate_id(
+            feature_root, "TASK", origin=origin, timestamp=timestamp
+        )
+        resolver.register_local("TASK", key, task_id)
+        allocated["TASK"].append(task_id)
+        expected_files = _str_list(
+            entry.get("expected_files"), "expected_files", i, what="tasks"
+        )
+        exclusive_files = _str_list(
+            entry.get("exclusive_files"), "exclusive_files", i, what="tasks"
+        )
+        task: dict[str, Any] = {
+            "id": task_id,
+            "key": key,
+            "lane": lane_id,
+            "summary": summary,
+            "related_requirements": req_refs,
+            "related_design": des_refs,
+            "expected_files": expected_files,
+            "exclusive_files": exclusive_files,
+        }
+        if "description" in entry and entry.get("description") is not None:
+            task["description"] = entry["description"]
+        if "verification" in entry and entry.get("verification") is not None:
+            task["verification"] = entry["verification"]
+        tasks.append(task)
+
+        # Derive related_acceptance_criteria: ACs tracing to this task's REQs
+        # (TASK -> REQ -> AC, §8.1). Preserved verbatim by the Implementer
+        # writeback later (only status/proposed_done_by move).
+        related_acs: list[str] = []
+        seen_ac: set[str] = set()
+        for req in req_refs:
+            for aid in acs_by_req.get(req, []):
+                if aid not in seen_ac:
+                    seen_ac.add(aid)
+                    related_acs.append(aid)
+        task_status_rows[task_id] = {
+            "status": "pending",
+            "lane": lane_id,
+            "owner_run": None,
+            "proposed_done_by": None,
+            "accepted_done": False,
+            "related_requirements": req_refs,
+            "related_acceptance_criteria": related_acs,
+        }
+
+    doc: dict[str, Any] = {
+        "feature": feature_id,
+        # D1: promote writes the canonical-unfrozen artifact; the frozen flag is
+        # the human gate's to flip. The frozen guard in ``promote_tasks`` refuses
+        # a frozen tasks/lane_graph outright, so this is always false here.
+        "frozen": False,
+        "lane_purpose": lane_purpose,
+        "tasks": tasks,
+    }
+    return doc, allocated, task_status_rows
+
+
+def render_tasks_md(feature_id: str, doc: Mapping[str, Any]) -> str:
+    """Render the human ``03-tasks.md`` mirror from the canonical doc.
+
+    The sole md renderer for the tasks stage (ADR-0008 D2): markdown is always a
+    rendered mirror of canonical JSON, never authored independently. Deterministic
+    given the doc. The ``## Tasks`` section body is what the Implementer leg later
+    reads verbatim (``read_task_text``), so nothing follows it; the single lane's
+    purpose renders in its own section *above* ``## Tasks`` to keep the task list
+    clean for the implementer.
+    """
+    frozen = bool(doc.get("frozen", False))
+    lines: list[str] = [
+        f"# Tasks - {feature_id}",
+        "",
+        f"Frozen: {str(frozen).lower()}",
+        "",
+        "> Stable IDs (TASK-NNN) are allocated by `promote` from the per-type id",
+        "> counter and recorded in `03-tasks.json`. This markdown is a rendered",
+        "> mirror; the JSON is canonical (§4.3, ADR-0008 D2). Each task's",
+        "> `related_requirements` / `related_design` refs are stitched canonical",
+        "> REQ / DES ids, resolved against the frozen upstreams. Runtime state",
+        "> (pending -> proposed_done) lives in `status/task-status.yml` (§8.1).",
+        "",
+    ]
+
+    purpose = doc.get("lane_purpose")
+    if purpose is not None:
+        lines.append("## Lane purpose (single lane)")
+        lines.append("")
+        lines.append(str(purpose))
+        lines.append("")
+
+    # ``## Tasks`` is the LAST section: the Implementer reads its body verbatim,
+    # so nothing may follow it (no trailing sections).
+    lines.append("## Tasks (TASK-NNN)")
+    lines.append("")
+    tasks = doc.get("tasks") or []
+    if not tasks:
+        lines.append("_None yet._\n")
+    for t in tasks:
+        tid = t.get("id", "?")
+        summary = t.get("summary", "")
+        lines.append(f"### {tid} - {summary}")
+        lines.append(f"- lane: {t.get('lane', '?')}")
+        reqs = ", ".join(t.get("related_requirements", [])) or "-"
+        dess = ", ".join(t.get("related_design", [])) or "-"
+        lines.append(f"- related_requirements: {reqs}")
+        lines.append(f"- related_design: {dess}")
+        lines.append(
+            f"- expected_files: {', '.join(t.get('expected_files', []) or []) or '-'}"
+        )
+        lines.append(
+            f"- exclusive_files: {', '.join(t.get('exclusive_files', []) or []) or '-'}"
+        )
+        if t.get("description") is not None:
+            lines.append("")
+            lines.append(str(t["description"]))
+        if t.get("verification"):
+            lines.append(f"- verification: {', '.join(t['verification'])}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _seed_task_status(
+    feature_root: Path, task_status_rows: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Seed ``status/task-status.yml`` with one ``pending`` row per task (§8.1).
+
+    Runtime state, separate from the frozen content artifacts: promote seeds it
+    (every task ``pending``) but does NOT freeze it - the task/lane gate freezes
+    ``03-tasks`` + ``04-lane-graph`` together, not ``task-status.yml`` (§18.3).
+    Re-promote overwrites cleanly: the unfrozen tasks stage is being replaced, and
+    no Implementer has run yet (the implementer leg runs only after the task gate
+    freezes), so there is no runtime state to preserve. Matches the
+    ``write_initial_task_status`` / ``mark_task_proposed_done`` yaml style.
+    """
+    path = feature_root / "status" / TASK_STATUS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"tasks": dict(task_status_rows)}
+    with path.open("w") as f:
+        yaml.safe_dump(
+            doc, f, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+
+
+def _populate_lane_graph_from_doc(
+    feature_root: Path, doc: Mapping[str, Any]
+) -> None:
+    """Populate the single lane's purpose/tasks/files in ``04-lane-graph.yml``.
+
+    Reads the seeded lane-graph (one MVP lane), writes the lane's ``purpose``
+    (from the proposal), its ``tasks`` (the allocated TASK ids, in order), and the
+    union of all tasks' ``expected_files`` / ``exclusive_files`` (deduped + sorted
+    for determinism). The lane's other §7.5 fields (``id`` / ``depends_on`` /
+    ``provides`` / ``consumes`` / ``verification_scope`` / ``merge_policy``) are
+    preserved - promote fills only what the tasks proposal carries. The lane's
+    files are the union of task files so the Implementer's ``lane_allowed_files``
+    (which reads the lane entry) sees every file any task touches.
+    """
+    graph, lane = _read_lane_graph(feature_root)
+
+    tasks = doc.get("tasks") or []
+    expected: set[str] = set()
+    exclusive: set[str] = set()
+    task_ids: list[str] = []
+    for t in tasks:
+        if not isinstance(t, Mapping):
+            continue
+        tid = t.get("id")
+        if isinstance(tid, str) and tid:
+            task_ids.append(tid)
+        for f in t.get("expected_files", []) or []:
+            if isinstance(f, str) and f:
+                expected.add(f)
+        for f in t.get("exclusive_files", []) or []:
+            if isinstance(f, str) and f:
+                exclusive.add(f)
+
+    lane["purpose"] = doc.get("lane_purpose")
+    lane["tasks"] = task_ids
+    lane["expected_files"] = sorted(expected)
+    lane["exclusive_files"] = sorted(exclusive)
+    with (feature_root / LANE_GRAPH_YML).open("w") as f:
+        yaml.safe_dump(
+            graph, f, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+
+
+def promote_tasks(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> PromoteResult:
+    """Promote an id-free tasks proposal to the canonical artifacts (ticket 04).
+
+    The deterministic stitcher/renderer (ADR-0008 D2) for the tasks stage, and the
+    first promote that writes **four** files in one step (ADR-0008 D2 /
+    CONTEXT.md "Artifact model"): allocates TASK ids from the counter, stitches
+    each task's ``related_requirements`` / ``related_design`` refs against the
+    frozen REQ / DES upstreams (reference-integrity, D3 - fails loud on an
+    unresolvable ref), then writes (1) ``03-tasks.json`` (**new in v0.6** - the
+    canonical task content) + (2) renders ``03-tasks.md`` (the sole md renderer) +
+    (3) seeds ``status/task-status.yml`` (every task ``pending`` - runtime state,
+    not frozen here) + (4) populates ``04-lane-graph.yml`` (the single lane's
+    ``purpose`` / ``tasks`` / expected/exclusive files). Refuses to overwrite a
+    frozen ``tasks`` or ``lane_graph`` (the two freeze together at the task gate,
+    §18.3) and refuses if the requirements or design upstream is not yet frozen
+    (D2). Appends one ``promote`` audit record carrying the allocated TASK ids.
+
+    ``proposal`` is the parsed Planner output (the run's ``result.json``);
+    ticket 04's ``generate-tasks`` reads that file and calls here. Pure at the
+    seam apart from the deterministic writes (id counter, canonical json/md,
+    task-status, lane-graph, audit) - no subprocess, no model.
+    """
+    if not feature_id:
+        raise ValueError("feature_id must be a non-empty string")
+
+    # §4.2 guard: promote writes 03-tasks AND 04-lane-graph together (the §18.3
+    # task-gate freezes both), so refuse if EITHER is already frozen. A frozen
+    # artifact is immutable; only a Change Proposal may change it.
+    frozen = frozen_artifacts_status(feature_root)
+    if frozen.get(TASKS_ARTIFACT) or frozen.get(LANE_GRAPH_ARTIFACT):
+        raise FrozenArtifactWriteError(
+            f"artifact {TASKS_ARTIFACT!r}/{LANE_GRAPH_ARTIFACT!r} is frozen; "
+            f"promote may only overwrite unfrozen artifacts (use a Change "
+            f"Proposal to change a frozen one, §4.2/§17)"
+        )
+
+    doc, allocated, task_status_rows = build_canonical_tasks(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+
+    json_path = feature_root / TASKS_JSON
+    md_path = feature_root / TASKS_MD
+    write_json(json_path, doc)
+    md_path.write_text(render_tasks_md(feature_id, doc))
+    # Seed task-status.yml (runtime state, all pending) + populate the single
+    # lane in 04-lane-graph.yml. Both are deterministic writes, no model.
+    _seed_task_status(feature_root, task_status_rows)
+    _populate_lane_graph_from_doc(feature_root, doc)
+
+    append_audit_event(
+        feature_root,
+        event=_PROMOTE_EVENT,
+        payload={
+            "stage": "tasks",
+            "artifact": TASKS_ARTIFACT,
+            "feature": feature_id,
+            "allocated": allocated,
+        },
+        timestamp=timestamp,
+        origin=origin,
+    )
+
+    return PromoteResult(
+        stage="tasks",
+        artifact=TASKS_ARTIFACT,
         json_path=json_path,
         md_path=md_path,
         allocated={k: tuple(v) for k, v in allocated.items()},

@@ -17,9 +17,10 @@ from ai_dev.coverage import (
     CoverageResult,
     design_coverage,
     freeze_gate_coverage,
+    tasks_coverage,
 )
 from ai_dev.feature_run import create_feature_run
-from ai_dev.promote import promote_design, promote_requirements
+from ai_dev.promote import promote_design, promote_requirements, promote_tasks
 from ai_dev.status import freeze_artifact
 
 FEATURE_ID = "FEATURE-001"
@@ -137,12 +138,156 @@ class TestFreezeGateCoverageDispatch:
         root, _ = _feature_with_frozen_requirements(tmp_path)
         assert freeze_gate_coverage("requirements", root) is None
 
-    def test_tasks_returns_none_until_ticket_04(self, tmp_path: Path) -> None:
+    def test_tasks_dispatches_to_tasks_coverage(self, tmp_path: Path) -> None:
         # The tasks coverage precheck (every REQ+DES in some task) lands in 04.
-        root, _ = _feature_with_frozen_requirements(tmp_path)
-        assert freeze_gate_coverage("tasks", root) is None
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(
+            root, FEATURE_ID, _tasks_proposal_covering(req_ids, des_ids), origin="test"
+        )
+        result = freeze_gate_coverage("tasks", root)
+        assert isinstance(result, CoverageResult)
+        assert result.artifact == "tasks"
+        assert result.upstream_type == "REQ/DES"
+        assert result.where == "task"
 
     def test_lane_graph_returns_none(self, tmp_path: Path) -> None:
         # lane_graph shares the task gate's freeze window - no separate precheck.
-        root, _ = _feature_with_frozen_requirements(tmp_path)
+        root, _, _ = _feature_with_frozen_requirements_and_design(tmp_path)
         assert freeze_gate_coverage("lane_graph", root) is None
+
+
+
+def _feature_with_frozen_requirements_and_design(
+    tmp_path: Path, n_reqs: int = 2
+) -> tuple[Path, list[str], list[str]]:
+    """Create a feature run, promote+freeze requirements AND design; return ids.
+
+    Tasks coverage spans two upstreams (REQ + DES), so its tests need both frozen.
+    The design has one element per REQ (so there are ``n_reqs`` DES ids to cover,
+    each mapped to its own REQ - satisfying the design gate too). Returns
+    ``(root, req_ids, des_ids)``.
+    """
+    root, req_ids = _feature_with_frozen_requirements(tmp_path, n_reqs)
+    design_elements = [
+        {"key": f"d{i}", "name": f"element {i}"} for i in range(1, n_reqs + 1)
+    ]
+    requirement_mapping = [
+        {
+            "key": f"m{i}",
+            "requirement": req_ids[i - 1],
+            "design_elements": [f"d{i}"],
+        }
+        for i in range(1, n_reqs + 1)
+    ]
+    promote_design(
+        root,
+        FEATURE_ID,
+        {
+            "design_elements": design_elements,
+            "requirement_mapping": requirement_mapping,
+        },
+        origin="test",
+    )
+    freeze_artifact(root, "design", origin="test")
+    des_doc = json.loads((root / "02-design.json").read_text())
+    des_ids = [el["id"] for el in des_doc["design_elements"]]
+    return root, req_ids, des_ids
+
+
+def _tasks_proposal_covering(req_ids: list[str], des_ids: list[str]) -> dict:
+    """A tasks proposal whose tasks cover every REQ and DES exactly once."""
+    return {
+        "lane_purpose": "cover everything end to end",
+        "tasks": [
+            {
+                "key": f"t{i}",
+                "summary": f"task {i}",
+                "related_requirements": [req_ids[i - 1]],
+                "related_design": [des_ids[i - 1]],
+                "expected_files": [f"src/t{i}.py"],
+                "exclusive_files": [f"src/t{i}.py"],
+            }
+            for i in range(1, len(req_ids) + 1)
+        ],
+    }
+
+
+class TestTasksCoverage:
+    def test_passes_when_all_reqs_and_des_covered(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(
+            root, FEATURE_ID, _tasks_proposal_covering(req_ids, des_ids), origin="test"
+        )
+        result = tasks_coverage(root)
+        assert result.ok
+        assert result.uncovered == ()
+        assert result.covered == frozenset(req_ids) | frozenset(des_ids)
+
+    def test_detects_uncovered_req_and_des(self, tmp_path: Path) -> None:
+        # Drop the task covering REQ-002/DES-002: both are uncovered -> refuse.
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal_covering(req_ids, des_ids)
+        proposal["tasks"] = proposal["tasks"][:1]  # only t1 (REQ-001, DES-001)
+        promote_tasks(root, FEATURE_ID, proposal, origin="test")
+        result = tasks_coverage(root)
+        assert not result.ok
+        assert set(result.uncovered) == {req_ids[1], des_ids[1]}
+
+    def test_detects_uncovered_des_with_req_covered(self, tmp_path: Path) -> None:
+        # REQ-002 covered (via t2) but its DES-002 not referenced -> DES-002 gap
+        # only (REQ-002 is covered, DES-001 is covered by t1).
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal_covering(req_ids, des_ids)
+        proposal["tasks"][1]["related_design"] = [des_ids[0]]  # t2 -> DES-001 not DES-002
+        promote_tasks(root, FEATURE_ID, proposal, origin="test")
+        result = tasks_coverage(root)
+        assert not result.ok
+        assert result.uncovered == (des_ids[1],)
+
+    def test_empty_tasks_covers_nothing(self, tmp_path: Path) -> None:
+        # Seeded 03-tasks.json has empty tasks -> every REQ+DES uncovered.
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        result = tasks_coverage(root)
+        assert not result.ok
+        assert set(result.uncovered) == set(req_ids) | set(des_ids)
+
+    def test_fails_loud_when_requirements_not_frozen(self, tmp_path: Path) -> None:
+        create_feature_run(tmp_path, "build the foo")
+        root = tmp_path / ".ai-dev" / "features" / FEATURE_ID
+        with pytest.raises(ValueError, match="not frozen"):
+            tasks_coverage(root)
+
+    def test_fails_loud_when_design_not_frozen(self, tmp_path: Path) -> None:
+        # Requirements frozen, design promoted but NOT frozen.
+        root, req_ids = _feature_with_frozen_requirements(tmp_path)
+        promote_design(root, FEATURE_ID, _design_proposal_covering(req_ids), origin="test")
+        with pytest.raises(ValueError, match="not frozen"):
+            tasks_coverage(root)
+
+    def test_coverage_counts_only_real_refs(self, tmp_path: Path) -> None:
+        # A hand-edited task referencing a non-existent REQ/DES must not count as
+        # coverage (defensive: promote's reference-integrity already prevents this
+        # for a real promote, but the precheck does not trust the file blindly).
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        promote_tasks(
+            root, FEATURE_ID, _tasks_proposal_covering(req_ids, des_ids), origin="test"
+        )
+        doc = json.loads((root / "03-tasks.json").read_text())
+        doc["tasks"][0]["related_requirements"] = ["REQ-999"]
+        doc["tasks"][0]["related_design"] = ["DES-999"]
+        (root / "03-tasks.json").write_text(json.dumps(doc))
+        result = tasks_coverage(root)
+        # REQ-001 + DES-001 no longer covered (their task now points at phantoms).
+        assert req_ids[0] in result.uncovered
+        assert des_ids[0] in result.uncovered
+
+    def test_refusal_message_mentions_task_and_req_des(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal_covering(req_ids, des_ids)
+        proposal["tasks"] = proposal["tasks"][:1]
+        promote_tasks(root, FEATURE_ID, proposal, origin="test")
+        result = tasks_coverage(root)
+        msg = result.refusal_message("tasks")
+        assert "REQ/DES" in msg
+        assert "in any task" in msg
+        assert "generate-tasks --feedback" in msg

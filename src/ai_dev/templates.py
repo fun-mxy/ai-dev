@@ -6,7 +6,7 @@ rather than a blank directory:
 
 * ``01-requirements.md`` / ``.json``  (§7.2)
 * ``02-design.md``       / ``.json``  (§7.3)
-* ``03-tasks.md``                      (§7.4 — markdown only, no machine mirror)
+* ``03-tasks.md`` / ``.json``          (§7.4 — .json added v0.6; md is the rendered mirror)
 * ``04-lane-graph.yml``                (§7.5)
 
 Two cross-cutting requirements shape every template:
@@ -41,6 +41,7 @@ REQUIREMENTS_JSON = "01-requirements.json"
 DESIGN_MD = "02-design.md"
 DESIGN_JSON = "02-design.json"
 TASKS_MD = "03-tasks.md"
+TASKS_JSON = "03-tasks.json"
 LANE_GRAPH_YML = "04-lane-graph.yml"
 
 # §7.5 merge_policy default for a freshly seeded lane. The §7.5 *example* shows
@@ -178,6 +179,25 @@ def _design_md(feature_id: str) -> str:
     )
 
 
+def _tasks_payload(feature_id: str) -> dict[str, Any]:
+    """§7.4 tasks document, in spec field order, seeded unfrozen (v0.6 ticket 04).
+
+    The `.json` is **new in v0.6** (tasks were previously md-only): it holds the
+    canonical task *content* (the TASK-NNN slots the Planner fills at the task
+    gate), and `03-tasks.md` is its rendered mirror (ADR-0008 D2 /
+    CONTEXT.md "Artifact model"). `lane_purpose` is the single MVP lane's
+    purpose slot (filled by `promote_tasks` from the proposal); `tasks` is
+    the empty TASK-NNN placeholder. Runtime state (pending -> proposed_done ->
+    ...) stays separate in `status/task-status.yml` (§8.1).
+    """
+    return {
+        "feature": feature_id,
+        "frozen": False,
+        "lane_purpose": None,
+        "tasks": [],
+    }
+
+
 def _tasks_md(feature_id: str) -> str:
     # §7.4: markdown is the human task list; checkboxes are NOT canonical state.
     return (
@@ -185,9 +205,11 @@ def _tasks_md(feature_id: str) -> str:
         f"\n"
         f"Frozen: false\n"
         f"\n"
-        f"> Canonical task state lives in `status/task-status.yml`, written by\n"
-        f"> the orchestrator only (§4.3). Checkboxes below are for human\n"
-        f"> convenience and are **not** canonical state. Task IDs (TASK-NNN)\n"
+        f"> Canonical task *content* lives in `03-tasks.json` (added v0.6); this\n"
+        f"> markdown is its rendered mirror (ADR-0008 D2). Canonical task *state*\n"
+        f"> (pending -> proposed_done -> ...) lives only in `status/task-status.yml`,\n"
+        f"> written by the orchestrator (§4.3/§8.1). Checkboxes below are for\n"
+        f"> human convenience and are **not** canonical state. Task IDs (TASK-NNN)\n"
         f"> are allocated by the Planner via the stable-id allocator.\n"
         f"\n"
         f"## Tasks (TASK-NNN)\n"
@@ -239,9 +261,10 @@ def seed_artifact_templates(
     """Seed the four §7 artifact templates under ``feature_root``.
 
     Writes ``01-requirements`` (md+json), ``02-design`` (md+json),
-    ``03-tasks.md`` and ``04-lane-graph.yml``, all unfrozen with empty stable-id
-    placeholders, and ``04-lane-graph.yml`` referencing the supplied (allocated)
-    ``lane_id``. Returns the paths written, in spec order.
+    ``03-tasks`` (md+json, the json added v0.6) and ``04-lane-graph.yml``, all
+    unfrozen with empty stable-id placeholders, and ``04-lane-graph.yml``
+    referencing the supplied (allocated) ``lane_id``. Returns the paths written,
+    in spec order.
     """
     paths: list[Path] = []
 
@@ -257,6 +280,8 @@ def seed_artifact_templates(
 
     (feature_root / TASKS_MD).write_text(_tasks_md(feature_id))
     paths.append(feature_root / TASKS_MD)
+    write_json(feature_root / TASKS_JSON, _tasks_payload(feature_id))
+    paths.append(feature_root / TASKS_JSON)
 
     lane_graph_path = feature_root / LANE_GRAPH_YML
     with lane_graph_path.open("w") as f:

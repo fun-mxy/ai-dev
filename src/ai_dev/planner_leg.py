@@ -56,6 +56,8 @@ from ai_dev.promote import (
     PromoteResult,
     promote_design,
     promote_requirements,
+    promote_tasks,
+    read_frozen_design_doc,
     read_frozen_requirements_doc,
 )
 from ai_dev.profiles import AgentProfile
@@ -93,6 +95,10 @@ _STAGE_REQUIREMENTS = "requirements"
 # The design stage (ticket 03). Carried on the design leg's result and threaded
 # into the proposal-schema lookup (``output_schema_for_role(..., stage="design")``).
 _STAGE_DESIGN = "design"
+
+# The tasks stage (ticket 04). Carried on the tasks leg's result and threaded
+# into the proposal-schema lookup (``output_schema_for_role(..., stage="tasks")``).
+_STAGE_TASKS = "tasks"
 
 
 def read_intent(feature_root: Path) -> str:
@@ -572,6 +578,268 @@ def run_generate_design(
         feature_id=feature_id,
         profile=profile.name,
         stage=_STAGE_DESIGN,
+        exit_code=run_result.exit_code,
+        validation=validation,
+        promote=promote_result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tasks stage (ticket 04): generate-tasks. The Planner authors the tasks
+# *against* the frozen requirements AND design (TWO upstreams - the first stage
+# with two), so the leg reads + freeze-checks both before the run and
+# promote_tasks stitches each task's related_requirements / related_design
+# against them.
+# ---------------------------------------------------------------------------
+
+
+def _render_frozen_design_summary(des_doc: Mapping[str, Any]) -> str:
+    """Render the frozen design as a compact block for the tasks task text.
+
+    The Planner authors tasks *against* the frozen design, so it must see the
+    canonical DES-NNN ids to reference in each task's ``related_design``. Renders
+    the design elements (id + name), annotated with which frozen REQs each DES
+    realizes (from ``requirement_mapping``) so the Planner can pick each task's
+    ``related_design`` to match its ``related_requirements``. Returns ``"- (none)"``
+    for an empty (but frozen) design artifact.
+    """
+    elements = des_doc.get("design_elements", []) or []
+    mapping = des_doc.get("requirement_mapping", []) or []
+    # Which frozen REQs each DES realizes (the mapping's design_elements are the
+    # stitched canonical DES ids promote wrote).
+    reqs_by_des: dict[str, list[str]] = {}
+    for m in mapping:
+        if not isinstance(m, Mapping):
+            continue
+        req = str(m.get("requirement", ""))
+        for d in m.get("design_elements", []) or []:
+            if isinstance(d, str):
+                reqs_by_des.setdefault(d, []).append(req)
+    lines: list[str] = []
+    for el in elements:
+        if not isinstance(el, Mapping):
+            continue
+        did = str(el.get("id", "?"))
+        name = el.get("name", "")
+        reqs = reqs_by_des.get(did, [])
+        if reqs:
+            lines.append(f"- {did}: {name} (realizes {', '.join(reqs)})")
+        else:
+            lines.append(f"- {did}: {name}")
+    return "\n".join(lines) if lines else "- (none)"
+
+
+def _tasks_task_text(
+    feature_id: str,
+    intent: str,
+    req_summary: str,
+    des_summary: str,
+    feedback: str | None,
+) -> str:
+    """The Planner tasks task: author an id-free tasks proposal from the intent +
+    frozen requirements + frozen design.
+
+    Carries the feature intent (the original goal) + the frozen requirements (the
+    upstream REQ-NNN ids) + the frozen design (the upstream DES-NNN ids) + the
+    optional human feedback (ADR-0008 D4 refinement channel), then instructs the
+    Planner to emit a tasks proposal conforming to ``input/output-schema.json`` -
+    **id-free** content: a top-level ``lane_purpose`` (the single MVP lane's
+    purpose) + local ``key`` handles per task, canonical ``REQ-NNN`` / ``DES-NNN``
+    refs (from the frozen upstreams) in each task's ``related_requirements`` /
+    ``related_design``. The schema (``TASKS_PROPOSAL_SCHEMA``, ticket 04) is the
+    contract; this text makes the model's job and the ref rules explicit so the
+    proposal is promote-able on the first pass (mirrors the ticket-02/03 de-risk).
+    """
+    blocks = [
+        f"Author the tasks proposal for feature {feature_id} (§9.1, Planner).",
+        "",
+        "## Feature intent (原始需求, from 00-intent.md)",
+        "",
+        intent,
+        "",
+        "## Frozen requirements (upstream 1 - 01-requirements.json)",
+        "",
+        "The requirements below are FROZEN. Reference each requirement in a task's",
+        "`related_requirements` by its canonical REQ-NNN id (e.g. `REQ-001`).",
+        "",
+        req_summary,
+        "",
+        "## Frozen design (upstream 2 - 02-design.json)",
+        "",
+        "The design elements below are FROZEN. Reference each design element in a",
+        "task's `related_design` by its canonical DES-NNN id (e.g. `DES-001`).",
+        "",
+        des_summary,
+    ]
+    if feedback is not None and feedback.strip():
+        blocks += [
+            "",
+            "## Human feedback (refinement - revise the proposal accordingly)",
+            "",
+            feedback.strip(),
+        ]
+    blocks += [
+        "",
+        "## Your role: Planner (§9.1)",
+        "",
+        "You author the **tasks** proposal as structured JSON in "
+        "`output/result.json` conforming to `input/output-schema.json`. This is "
+        "the mandatory final step.",
+        "",
+        "Rules (ADR-0008 D2 - promote allocates the ids; you do NOT):",
+        "- Do NOT assign canonical stable ids (no TASK-NNN). Each task carries a "
+        "*local* `key` (a short stable handle you invent, e.g. `\"t1\"`), a "
+        "`summary`, and its REQ/DES refs.",
+        "- Each task's `related_requirements` is a list of the **canonical "
+        "REQ-NNN** ids of the frozen requirements it realizes (read from the list "
+        "above) - NOT local keys. promote resolves them against the frozen "
+        "upstream.",
+        "- Each task's `related_design` is a list of the **canonical DES-NNN** ids "
+        "of the frozen design elements it implements (read from the list above).",
+        "- The top-level `lane_purpose` is a single sentence: the purpose of the "
+        "one MVP lane all tasks run on (the lane itself is structural; you do NOT "
+        "assign lanes).",
+        "- Each task also declares `expected_files` and `exclusive_files` - the "
+        "file paths it will touch (the lane's file boundary the Implementer later "
+        "enforces).",
+        "- `tasks[]` needs a non-empty `key`, `summary`, `related_requirements` "
+        "(real frozen REQ-NNN ids), `related_design` (real frozen DES-NNN ids), "
+        "`expected_files`, and `exclusive_files`.",
+        "- A proposal is expected to be *incomplete while being refined* - emit "
+        "your current best proposal; coverage-completeness (every REQ+DES covered "
+        "by some task) is checked later at the freeze gate, not here. But every "
+        "`related_requirements` / `related_design` ref you DO write must point at "
+        "a real frozen REQ-NNN / DES-NNN (reference-integrity, checked at promote).",
+        "- Optional prose facets (`description` / `verification`) may be omitted "
+        "per task.",
+        "",
+        "Write `output/result.md` (a short human-readable summary) and "
+        "`output/result.json` (the proposal). Stop once result.json is written.",
+    ]
+    return "\n".join(blocks)
+
+
+def build_tasks_input_package(
+    repo_root: Path,
+    feature_id: str,
+    *,
+    feedback: str | None = None,
+    origin: str | None = None,
+) -> str:
+    """Build the Planner tasks input package (§9.1, ADR-0008 D2/D4).
+
+    Reads the feature intent from ``00-intent.md`` and the **frozen** requirements
+    AND design (fail-loud if either is not frozen - tasks may only stitch against
+    frozen upstreams, ADR-0008 D2), renders the Planner tasks task text (intent +
+    frozen-requirements summary + frozen-design summary + optional feedback), and
+    delegates to ``prepare_run`` with the role pinned to ``Planner`` and the
+    output-schema pinned to the tasks *proposal* schema
+    (``output_schema_for_role("Planner", stage="tasks")``). The Planner authors
+    only ``output/result.{json,md}`` (no workspace files), so no task-specific
+    allowed-files are declared. Returns the allocated ``RUN-NNN`` id.
+
+    The intent + frozen-upstream reads happen before any allocation so a
+    missing-intent or not-frozen-upstream rejection leaves no partial run behind
+    (mirrors ``build_design_input_package``).
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    intent = read_intent(feature_root)
+    req_doc = read_frozen_requirements_doc(feature_root)
+    des_doc = read_frozen_design_doc(feature_root)
+    req_summary = _render_frozen_requirements_summary(req_doc)
+    des_summary = _render_frozen_design_summary(des_doc)
+    task_text = _tasks_task_text(
+        feature_id, intent, req_summary, des_summary, feedback
+    )
+    return prepare_run(
+        repo_root,
+        feature_id,
+        PLANNER_ROLE,
+        task_text,
+        # No task-specific allowed files: the Planner writes only the mandatory
+        # result.{json,md} (the prepare_run seed). The tasks proposal schema is
+        # the role-aware §14.1 contract (ticket 04).
+        output_schema=output_schema_for_role(PLANNER_ROLE, stage=_STAGE_TASKS),
+        origin=origin,
+    )
+
+
+def run_generate_tasks(
+    repo_root: Path,
+    feature_id: str,
+    profile: AgentProfile,
+    *,
+    feedback: str | None = None,
+    claude_path: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    origin: str | None = None,
+) -> PlannerLegResult:
+    """Run the full Planner tasks leg: prepare -> run -> validate -> promote.
+
+    Composes the v0.1/v0.2 seams unchanged: ``build_tasks_input_package`` (which
+    reuses ``prepare_run`` with the tasks proposal schema + reads the frozen
+    requirements AND design upstreams), ``run_headless``, and ``validate_run``
+    (the §14 three-check). ``promote_tasks`` (ticket 04) then fires
+    **automatically** - gated on a passing validation, exactly as the
+    requirements/design legs gate their promote. promote allocates TASK ids,
+    stitches each task's ``related_requirements`` / ``related_design`` refs
+    against the frozen REQ / DES upstreams (reference-integrity, D3), and writes
+    ``03-tasks.json`` + renders ``03-tasks.md`` + seeds ``status/task-status.yml``
+    + populates ``04-lane-graph.yml`` - the canonical-unfrozen state. ``feedback``
+    threads the human's refinement note (ADR-0008 D4); re-running overwrites the
+    unfrozen artifact.
+
+    Returns a ``PlannerLegResult`` whether the run passed or failed validation
+    (mirrors ``run_generate_design``). promote errors
+    (``UnresolvedRefError`` / ``FrozenArtifactWriteError`` / the not-frozen-
+    upstreams precondition) propagate - a validation-passing run whose proposal
+    promote cannot stitch is a malformed proposal (§24.2), reported loud rather
+    than silently dropped.
+    """
+    run_id = build_tasks_input_package(
+        repo_root, feature_id, feedback=feedback, origin=origin
+    )
+    run_result = run_headless(
+        repo_root,
+        feature_id,
+        run_id,
+        profile,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        claude_path=claude_path,
+        started_at=started_at,
+        ended_at=ended_at,
+        origin=origin,
+    )
+    validation = validate_run(repo_root, feature_id, run_id, origin=origin)
+
+    feature_root = feature_dir(repo_root, feature_id)
+    run_root = run_dir(repo_root, feature_id, run_id)
+
+    promote_result: PromoteResult | None = None
+    # promote fires only on a passing validation - a schema-invalid or
+    # boundary-breaching proposal has no canonical form. The proposal IS the
+    # run's result.json (validated above against the tasks proposal schema).
+    if validation.passed:
+        proposal = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
+        if proposal is not None:
+            promote_result = promote_tasks(
+                feature_root,
+                feature_id,
+                proposal,
+                origin=origin,
+            )
+
+    return PlannerLegResult(
+        run_id=run_id,
+        feature_id=feature_id,
+        profile=profile.name,
+        stage=_STAGE_TASKS,
         exit_code=run_result.exit_code,
         validation=validation,
         promote=promote_result,

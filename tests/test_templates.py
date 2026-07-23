@@ -5,7 +5,7 @@ templates for the v0.2 Planner to fill:
 
 * ``01-requirements.md`` / ``.json``  (§7.2)
 * ``02-design.md``       / ``.json``  (§7.3)
-* ``03-tasks.md``                      (§7.4 — markdown only)
+* ``03-tasks.md``        / ``.json``  (§7.4 — .json added v0.6; md is the rendered mirror)
 * ``04-lane-graph.yml``                (§7.5)
 
 Every template carries a ``frozen: false`` marker (§4.2); stable-id slots
@@ -35,7 +35,7 @@ def _seed(tmp_path: Path) -> Path:
 
 
 class TestSeedArtifactTemplates:
-    def test_writes_all_six_template_files(self, tmp_path: Path) -> None:
+    def test_writes_all_seven_template_files(self, tmp_path: Path) -> None:
         root = _seed(tmp_path)
 
         for name in (
@@ -44,6 +44,7 @@ class TestSeedArtifactTemplates:
             "02-design.md",
             "02-design.json",
             "03-tasks.md",
+            "03-tasks.json",
             "04-lane-graph.yml",
         ):
             assert (root / name).is_file(), name
@@ -60,6 +61,7 @@ class TestSeedArtifactTemplates:
             "02-design.md",
             "02-design.json",
             "03-tasks.md",
+            "03-tasks.json",
             "04-lane-graph.yml",
         }
 
@@ -143,8 +145,9 @@ class TestDesignTemplate:
 
 
 class TestTasksTemplate:
-    """§7.4 — markdown-only human task list. Checkboxes are not canonical state;
-    canonical task state lives in status/task-status.yml."""
+    """§7.4 — human task list (md) + its canonical content mirror (json,
+    added v0.6). Checkboxes are not canonical state; canonical task state lives
+    in status/task-status.yml."""
 
     def test_markdown_carries_feature_id_and_frozen(self, tmp_path: Path) -> None:
         root = _seed(tmp_path)
@@ -158,10 +161,20 @@ class TestTasksTemplate:
         text = (root / "03-tasks.md").read_text()
         assert "task-status.yml" in text
 
-    def test_no_machine_mirror_is_written(self, tmp_path: Path) -> None:
-        # §6 lists only 03-tasks.md — there is no 03-tasks.json counterpart.
+    def test_machine_mirror_is_written_empty(self, tmp_path: Path) -> None:
+        # v0.6 ticket 04: 03-tasks.json is the canonical task *content* mirror
+        # (added so tasks conform to the JSON-canonical/md-mirror rule,
+        # ADR-0008 D2). Seeded empty with the TASK-NNN placeholder slot.
+        import json
         root = _seed(tmp_path)
-        assert not (root / "03-tasks.json").exists()
+        assert (root / "03-tasks.json").is_file()
+        doc = json.loads((root / "03-tasks.json").read_text())
+        assert doc == {
+            "feature": FEATURE_ID,
+            "frozen": False,
+            "lane_purpose": None,
+            "tasks": [],
+        }
 
 
 class TestLaneGraphTemplate:

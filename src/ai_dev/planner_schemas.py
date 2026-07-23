@@ -21,10 +21,9 @@ role-aware lookup that picks one. Two consumers:
   ``input/output-schema.json`` was written, so it needs no change — the
   role-awareness lives entirely in *which* schema gets written at prepare time.
 
-Only the **requirements** and **design** proposal schemas are concretely defined here
-(requirements in ticket 01, design in ticket 03). The tasks (ticket 04) proposal schema
-is added to ``_PLANNER_PROPOSAL_SCHEMAS`` as a one-line data entry when that ticket
-lands; the lookup mechanism and the promote seam (``promote``) need no rework then.
+Only the **requirements**, **design**, and **tasks** proposal schemas are concretely
+defined here (requirements in ticket 01, design in ticket 03, tasks in ticket 04). The
+lookup mechanism and the promote seam (``promote``) need no rework when a stage lands.
 
 The schemas use only the JSON Schema subset ``validate.validate_against_schema``
 hand-rolls (``type`` / ``required`` / ``enum`` / ``minLength`` / ``minItems`` /
@@ -194,11 +193,97 @@ DESIGN_PROPOSAL_SCHEMA: dict[str, Any] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Tasks proposal (ticket 04). The Planner authors the tasks *against* the frozen
+# requirements AND the frozen design (two upstreams), so each task traces to
+# REQs and DESs by their canonical ids. MVP v0 has exactly one lane (LANE-001,
+# allocated at feature-run creation and seeded into 04-lane-graph.yml), so the
+# proposal does not re-author the lane - it supplies the single lane's
+# ``purpose`` (written into 04-lane-graph.yml by promote) and every task is
+# assigned to that one lane (single-lane assignment, §5.3).
+# ---------------------------------------------------------------------------
+
+# Each task entry. ``key`` is the proposal's *local* handle (the model never
+# assigns the canonical TASK-NNN; promote allocates it, ADR-0008 D2).
+# ``summary`` is the one field a task cannot lack (the rendered-md heading, the
+# analogue of a requirement's ``statement``). ``related_requirements`` and
+# ``related_design`` are refs to *frozen* upstream REQ-NNN / DES-NNN ids (the
+# model reads the frozen 01/02 artifacts in its input package and references
+# them by canonical id; promote resolves them against the frozen upstream sets
+# via ``RefResolver.add_upstream`` - reference-integrity, ADR-0008 D3). Both ref
+# lists are required (an entry that traces to no REQ and no DES is a coverage
+# hole, ADR-0007) but carry no ``minItems``: a draft may trace to one REQ and
+# refine later (coverage-completeness is a freeze-gate concern, D3).
+# ``expected_files`` / ``exclusive_files`` are the lane's file boundary the task
+# contributes (promote unions them into the single lane's entry); required for
+# the same structural reason, no ``minItems``. ``description`` / ``verification``
+# are optional prose a refinement draft may omit.
+_TASK_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "key",
+        "summary",
+        "related_requirements",
+        "related_design",
+        "expected_files",
+        "exclusive_files",
+    ],
+    "additionalProperties": True,
+    "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
+        "related_requirements": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "related_design": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "expected_files": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "exclusive_files": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "description": {"type": "string"},
+        "verification": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    },
+}
+
+# ADR-0008 D2: the tasks proposal - id-free structured JSON. ``lane_purpose`` is
+# the purpose the model assigns to the single MVP lane (promote writes it into
+# 04-lane-graph.yml); ``tasks`` is the required array of TASK slots (the
+# structure must be present, but it carries no ``minItems``: a proposal is
+# *expected to be incomplete* while being refined, D3, and coverage-completeness
+# - every REQ+DES referenced by >=1 task - is a freeze-gate concern, not a
+# §14.1 schema concern). The lane is structural (already allocated as LANE-001),
+# so the model does not re-author it; each task is assigned to that one lane by
+# promote (single-lane assignment, §5.3).
+TASKS_PROPOSAL_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "PlannerTasksProposal",
+    "type": "object",
+    "required": ["lane_purpose", "tasks"],
+    "additionalProperties": True,
+    "properties": {
+        "lane_purpose": {"type": "string", "minLength": 1},
+        "tasks": {
+            "type": "array",
+            "items": _TASK_ITEM_SCHEMA,
+        },
+    },
+}
+
 # Stage -> proposal schema. ``requirements`` wired in ticket 01; ``design`` wired
-# here (ticket 03); ``tasks`` (ticket 04) adds its entry with no other change.
+# here (ticket 03); ``tasks`` wired here (ticket 04) with no other change to the
+# lookup mechanism.
 _PLANNER_PROPOSAL_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "requirements": REQUIREMENTS_PROPOSAL_SCHEMA,
     "design": DESIGN_PROPOSAL_SCHEMA,
+    "tasks": TASKS_PROPOSAL_SCHEMA,
 }
 
 
@@ -209,8 +294,7 @@ def planner_output_schema(stage: str) -> Mapping[str, Any]:
     ``planner_output_schema("requirements")`` / ``planner_output_schema("design")``
     are the schemas written to a run's ``input/output-schema.json`` and thus the
     ones ``validate-run`` checks (§14.1). Fails loud (§24.2) for an unknown stage —
-    a stage not yet wired (e.g. ``"tasks"`` before ticket 04) is a config error
-    the caller must surface, not a silent fallback to the implementer schema
+    a stage not yet wired is a config error the caller must surface, not a silent fallback to the implementer schema
     (which would validate the wrong contract and let a malformed proposal pass).
     """
     try:
