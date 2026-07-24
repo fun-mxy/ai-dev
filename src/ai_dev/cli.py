@@ -126,6 +126,7 @@ import argparse
 import difflib
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -2072,6 +2073,405 @@ def _run_log(repo_root: Path, feature_id: str, as_json: bool) -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class Command:
+    """One row in the cli command registry - the single source of truth for the
+    command surface. ``_dispatch`` routes to ``run`` (or ``plan`` under
+    ``--dry-run``); ``_build_parser`` declares the command's args from the same
+    row (wired in the next step). ``plan is None`` marks a command with no
+    ``--dry-run`` (read-only / pure passthrough) - that is what the parser tests
+    to decide whether to attach the flag.
+    """
+
+    name: str
+    run: "Callable[[argparse.Namespace], int]"
+    plan: "Callable[[argparse.Namespace], DryRunPlan] | None"
+
+
+def _agent_command(
+    name: str,
+    role: str,
+    origin: str,
+    real: "Callable[[Path, str, str, argparse.Namespace], int]",
+    plan: "Callable[[Path, str, AgentProfile, argparse.Namespace], DryRunPlan]",
+) -> Command:
+    """Build an agent Command: resolve profile, then (dry) plan with a loaded
+    ``AgentProfile`` or (real) record + run with the name.
+
+    The resolve/record preamble - previously copy-pasted for the six agent
+    commands in ``_dispatch`` - lives once here. ``real`` takes the profile
+    *name* (records it; the leg loads internally); ``plan`` takes the *loaded*
+    Profile (dry-run never records). The dry-vs-real branch is the dispatch
+    loop's job, not the closure's: this factory builds two clean callables and
+    the loop picks. ``ProfileError`` from resolve renders on the real path
+    (``_render_error``) and propagates to ``_run_dry_plan``'s catch on the dry
+    path - identical ``error:`` shape either way.
+    """
+
+    def run(args: argparse.Namespace) -> int:
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(repo_root, role, args.profile)
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id), role, profile_name, origin=origin
+        )
+        return real(repo_root, args.feature_id, profile_name, args)
+
+    def dry(args: argparse.Namespace) -> DryRunPlan:
+        repo_root = Path(args.repo_root)
+        profile_name = resolve_profile_name(repo_root, role, args.profile)
+        return plan(
+            repo_root, args.feature_id, load_profile(repo_root, profile_name), args
+        )
+
+    return Command(name=name, run=run, plan=dry)
+
+
+def _run_create_feature_run_cmd(args: argparse.Namespace) -> int:
+    """``create-feature-run`` - prints the minted id and exits 0 (no ``_run_*``)."""
+    feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
+    print(feature_id)
+    return 0
+
+
+def _profile_names(args: argparse.Namespace) -> list[str]:
+    """Parse ``compare-profiles``' comma-separated ``--profiles`` into a list."""
+    return [p.strip() for p in args.profiles.split(",") if p.strip()]
+
+
+def _resolve_fix_profiles(
+    repo_root: Path, profile_override: str | None
+) -> tuple[str, str, str]:
+    """Resolve fix-run's three role profiles from one ``--profile`` override.
+
+    Raises ``ProfileError`` on a bad name - the caller decides whether to render
+    (real path) or let it propagate to ``_run_dry_plan``'s catch (dry path).
+    """
+    return (
+        resolve_profile_name(repo_root, ROLE_IMPLEMENTER, profile_override),
+        resolve_profile_name(repo_root, ROLE_REVIEWER, profile_override),
+        resolve_profile_name(repo_root, ROLE_SPEC_GAP_ANALYST, profile_override),
+    )
+
+
+def _run_fix_run_cmd(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo_root)
+    try:
+        implement_name, reviewer_name, spec_gap_name = _resolve_fix_profiles(
+            repo_root, args.profile
+        )
+    except ProfileError as exc:
+        _render_error(exc)
+        return 1
+    fix_feature_root = feature_dir(repo_root, args.feature_id)
+    record_agent_profile(
+        fix_feature_root, ROLE_IMPLEMENTER, implement_name, origin=ORIGIN_FIX_RUN_DRIVER
+    )
+    record_agent_profile(
+        fix_feature_root, ROLE_REVIEWER, reviewer_name, origin=ORIGIN_FIX_RUN_DRIVER
+    )
+    record_agent_profile(
+        fix_feature_root,
+        ROLE_SPEC_GAP_ANALYST,
+        spec_gap_name,
+        origin=ORIGIN_FIX_RUN_DRIVER,
+    )
+    return _run_fix_run(
+        repo_root,
+        args.feature_id,
+        args.lane_id,
+        implement_name,
+        reviewer_name,
+        spec_gap_name,
+        args.max_turns,
+        args.permission_mode,
+        args.verify_timeout,
+    )
+
+
+def _plan_fix_run_cmd(args: argparse.Namespace) -> DryRunPlan:
+    repo_root = Path(args.repo_root)
+    implement_name, reviewer_name, spec_gap_name = _resolve_fix_profiles(
+        repo_root, args.profile
+    )
+    return plan_fix_run(
+        repo_root,
+        args.feature_id,
+        args.lane_id,
+        load_profile(repo_root, implement_name),
+        load_profile(repo_root, reviewer_name),
+        load_profile(repo_root, spec_gap_name),
+        max_turns=args.max_turns,
+        permission_mode=args.permission_mode,
+        verify_timeout=args.verify_timeout,
+    )
+
+
+# The command registry: one row per subcommand. ``_dispatch`` routes to ``run``
+# (or ``plan`` under --dry-run); ``_build_parser`` declares args from the same
+# row (next step). Adding a command is one entry here - not three hand-maintained
+# lists (parser + dispatch + dry_run planner).
+COMMANDS: list[Command] = [
+    Command(
+        "create-feature-run",
+        run=_run_create_feature_run_cmd,
+        plan=None,
+    ),
+    Command(
+        "freeze",
+        run=lambda a: _run_freeze(Path(a.repo_root), a.feature_id, a.artifact),
+        plan=lambda a: plan_freeze(Path(a.repo_root), a.feature_id, a.artifact),
+    ),
+    Command(
+        "render",
+        run=lambda a: _run_render(Path(a.repo_root), a.feature_id, a.artifact),
+        plan=lambda a: plan_render(Path(a.repo_root), a.feature_id, a.artifact),
+    ),
+    Command(
+        "allocate-id",
+        run=lambda a: _run_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
+        plan=lambda a: plan_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
+    ),
+    Command(
+        "show-profile",
+        run=lambda a: _run_show_profile(Path(a.repo_root), a.name),
+        plan=None,
+    ),
+    Command(
+        "list-features",
+        run=lambda a: _run_list_features(Path(a.repo_root), a.json),
+        plan=None,
+    ),
+    Command(
+        "show-status",
+        run=lambda a: _run_show_status(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+    ),
+    Command(
+        "log",
+        run=lambda a: _run_log(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+    ),
+    Command(
+        "prepare-run",
+        run=lambda a: _run_prepare_run(
+            Path(a.repo_root),
+            a.feature_id,
+            a.role,
+            a.task,
+            a.allowed_file,
+        ),
+        plan=None,
+    ),
+    Command(
+        "run-headless",
+        run=lambda a: _run_run_headless(
+            Path(a.repo_root),
+            a.feature_id,
+            a.run_id,
+            a.profile,
+            a.max_turns,
+            a.permission_mode,
+        ),
+        plan=lambda a: plan_run_headless(
+            Path(a.repo_root),
+            a.feature_id,
+            a.run_id,
+            load_profile(Path(a.repo_root), a.profile),
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    Command(
+        "validate-run",
+        run=lambda a: _run_validate_run(Path(a.repo_root), a.feature_id, a.run_id),
+        plan=None,
+    ),
+    _agent_command(
+        "generate-requirements",
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_requirements(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_requirements(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "generate-design",
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_design(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_design(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "generate-tasks",
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_tasks(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_tasks(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "implement",
+        ROLE_IMPLEMENTER,
+        ORIGIN_IMPLEMENT_LEG,
+        real=lambda repo, fid, name, a: _run_implement(
+            repo, fid, a.lane_id, name, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_implement(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "review",
+        ROLE_REVIEWER,
+        ORIGIN_REVIEW_LEG,
+        real=lambda repo, fid, name, a: _run_checking(
+            repo,
+            fid,
+            a.lane_id,
+            name,
+            a.max_turns,
+            a.permission_mode,
+            leg=run_reviewer_leg,
+            label="REVIEW",
+            origin=ORIGIN_REVIEW_LEG,
+        ),
+        plan=lambda repo, fid, prof, a: plan_review(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "spec-gap",
+        ROLE_SPEC_GAP_ANALYST,
+        ORIGIN_SPEC_GAP_LEG,
+        real=lambda repo, fid, name, a: _run_checking(
+            repo,
+            fid,
+            a.lane_id,
+            name,
+            a.max_turns,
+            a.permission_mode,
+            leg=run_spec_gap_leg,
+            label="SPEC-GAP",
+            origin=ORIGIN_SPEC_GAP_LEG,
+        ),
+        plan=lambda repo, fid, prof, a: plan_spec_gap(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    Command(
+        "verify",
+        run=lambda a: _run_verify(
+            Path(a.repo_root), a.feature_id, a.lane_id, a.timeout
+        ),
+        plan=None,
+    ),
+    Command(
+        "collect-issues",
+        run=lambda a: _run_collect_issues(Path(a.repo_root), a.feature_id, a.lane_id),
+        plan=None,
+    ),
+    Command(
+        "lane-gate",
+        run=lambda a: _run_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
+        plan=lambda a: plan_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
+    ),
+    Command(
+        "coherence-gate",
+        run=lambda a: _run_coherence_gate(Path(a.repo_root), a.feature_id),
+        plan=lambda a: plan_coherence_gate(Path(a.repo_root), a.feature_id),
+    ),
+    Command(
+        "final-report",
+        run=lambda a: _run_final_report(Path(a.repo_root), a.feature_id),
+        plan=lambda a: plan_final_report(Path(a.repo_root), a.feature_id),
+    ),
+    Command(
+        "compare-profiles",
+        run=lambda a: _run_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a), a.json
+        ),
+        plan=lambda a: plan_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a)
+        ),
+    ),
+    Command(
+        "project-github",
+        run=lambda a: _run_project_github(Path(a.repo_root), a.feature_id, a.pr),
+        plan=lambda a: plan_project_github(Path(a.repo_root), a.feature_id, a.pr),
+    ),
+    Command(
+        "fix-run",
+        run=_run_fix_run_cmd,
+        plan=_plan_fix_run_cmd,
+    ),
+    Command(
+        "triage",
+        run=lambda a: _run_triage(
+            Path(a.repo_root),
+            a.feature_id,
+            a.issue,
+            a.disposition,
+            a.reason,
+            a.by,
+        ),
+        plan=lambda a: plan_triage(
+            Path(a.repo_root),
+            a.feature_id,
+            a.issue,
+            a.disposition,
+            a.reason,
+            a.by,
+        ),
+    ),
+]
+
+_COMMAND_BY_NAME: dict[str, Command] = {c.name: c for c in COMMANDS}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a CLI invocation. Returns a process exit code.
 
@@ -2097,467 +2497,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run the parsed subcommand and return its exit code (no catch-all here).
 
-    Expected failures (missing feature/run, refused triage, bad input) are
-    surfaced by each ``_run_*`` through ``_render_error`` + ``return 1``; this
-    function lets anything else propagate to ``main``'s top-level handler.
+    The command surface is the ``COMMANDS`` registry - one row per subcommand,
+    each carrying its real ``run`` and (for dry-capable commands) a ``plan``.
+    The dry-vs-real branch lives here once, not in a per-command if/elif: a
+    dry run defers ``cmd.plan(args)`` into ``_run_dry_plan`` so its
+    precondition ``ValueError``/``ProfileError`` surface as one ``error:``
+    line. Expected precondition failures exit 1; anything else propagates
+    to ``main``'s top-level handler.
     """
-    if args.command == "create-feature-run":
-        feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
-        print(feature_id)
-        return 0
-
-    if args.command == "freeze":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_freeze(
-                    Path(args.repo_root), args.feature_id, args.artifact
-                )
-            )
-        return _run_freeze(Path(args.repo_root), args.feature_id, args.artifact)
-
-    if args.command == "render":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_render(
-                    Path(args.repo_root), args.feature_id, args.artifact
-                )
-            )
-        return _run_render(Path(args.repo_root), args.feature_id, args.artifact)
-
-    if args.command == "allocate-id":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_allocate_id(
-                    Path(args.repo_root), args.feature_id, args.id_type
-                )
-            )
-        return _run_allocate_id(
-            Path(args.repo_root), args.feature_id, args.id_type
-        )
-
-    if args.command == "show-profile":
-        return _run_show_profile(Path(args.repo_root), args.name)
-
-    if args.command == "list-features":
-        return _run_list_features(Path(args.repo_root), args.json)
-
-    if args.command == "show-status":
-        return _run_show_status(Path(args.repo_root), args.feature_id, args.json)
-
-    if args.command == "log":
-        return _run_log(Path(args.repo_root), args.feature_id, args.json)
-
-    if args.command == "prepare-run":
-        return _run_prepare_run(
-            Path(args.repo_root),
-            args.feature_id,
-            args.role,
-            args.task,
-            args.allowed_file,
-        )
-
-    if args.command == "run-headless":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_run_headless(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.run_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        return _run_run_headless(
-            Path(args.repo_root),
-            args.feature_id,
-            args.run_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "validate-run":
-        return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
-
-    if args.command == "generate-requirements":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_PLANNER, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_generate_requirements(
-                    repo_root,
-                    args.feature_id,
-                    load_profile(repo_root, profile_name),
-                    feedback=args.feedback,
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        # Record the resolved Planner profile on the feature's agent_profiles
-        # config (the record compare-profiles reads). Dry-run skips it —
-        # recording is a canonical status write.
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_PLANNER,
-            profile_name,
-            origin=ORIGIN_PLANNER_LEG,
-        )
-        return _run_generate_requirements(
-            repo_root,
-            args.feature_id,
-            profile_name,
-            args.feedback,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "generate-design":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_PLANNER, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_generate_design(
-                    repo_root,
-                    args.feature_id,
-                    load_profile(repo_root, profile_name),
-                    feedback=args.feedback,
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        # Record the resolved Planner profile on the feature's agent_profiles
-        # config (the record compare-profiles reads). Dry-run skips it -
-        # recording is a canonical status write. Same Planner role as the
-        # requirements leg (the design leg is the Planner's second stage).
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_PLANNER,
-            profile_name,
-            origin=ORIGIN_PLANNER_LEG,
-        )
-        return _run_generate_design(
-            repo_root,
-            args.feature_id,
-            profile_name,
-            args.feedback,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "generate-tasks":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_PLANNER, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_generate_tasks(
-                    repo_root,
-                    args.feature_id,
-                    load_profile(repo_root, profile_name),
-                    feedback=args.feedback,
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        # Record the resolved Planner profile on the feature's agent_profiles
-        # config (the record compare-profiles reads). Dry-run skips it -
-        # recording is a canonical status write. Same Planner role as the
-        # requirements/design legs (the tasks leg is the Planner's third stage).
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_PLANNER,
-            profile_name,
-            origin=ORIGIN_PLANNER_LEG,
-        )
-        return _run_generate_tasks(
-            repo_root,
-            args.feature_id,
-            profile_name,
-            args.feedback,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "implement":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_IMPLEMENTER, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_implement(
-                    repo_root,
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(repo_root, profile_name),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        # v0.5 ticket 06: record the resolved implementer profile on the feature's
-        # agent_profiles config (the record compare-profiles reads). Dry-run skips
-        # it — recording is a canonical status write.
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_IMPLEMENTER,
-            profile_name,
-            origin=ORIGIN_IMPLEMENT_LEG,
-        )
-        return _run_implement(
-            repo_root,
-            args.feature_id,
-            args.lane_id,
-            profile_name,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "review":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_REVIEWER, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_review(
-                    repo_root,
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(repo_root, profile_name),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_REVIEWER,
-            profile_name,
-            origin=ORIGIN_REVIEW_LEG,
-        )
-        return _run_checking(
-            repo_root,
-            args.feature_id,
-            args.lane_id,
-            profile_name,
-            args.max_turns,
-            args.permission_mode,
-            leg=run_reviewer_leg,
-            label="REVIEW",
-            origin=ORIGIN_REVIEW_LEG,
-        )
-
-    if args.command == "spec-gap":
-        repo_root = Path(args.repo_root)
-        try:
-            profile_name = resolve_profile_name(
-                repo_root, ROLE_SPEC_GAP_ANALYST, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_spec_gap(
-                    repo_root,
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(repo_root, profile_name),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        record_agent_profile(
-            feature_dir(repo_root, args.feature_id),
-            ROLE_SPEC_GAP_ANALYST,
-            profile_name,
-            origin=ORIGIN_SPEC_GAP_LEG,
-        )
-        return _run_checking(
-            repo_root,
-            args.feature_id,
-            args.lane_id,
-            profile_name,
-            args.max_turns,
-            args.permission_mode,
-            leg=run_spec_gap_leg,
-            label="SPEC-GAP",
-            origin=ORIGIN_SPEC_GAP_LEG,
-        )
-
-    if args.command == "verify":
-        return _run_verify(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.timeout,
-        )
-
-    if args.command == "collect-issues":
-        return _run_collect_issues(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-        )
-
-    if args.command == "lane-gate":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_lane_gate(
-                    Path(args.repo_root), args.feature_id, args.lane_id
-                )
-            )
-        return _run_lane_gate(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-        )
-
-    if args.command == "coherence-gate":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_coherence_gate(Path(args.repo_root), args.feature_id)
-            )
-        return _run_coherence_gate(Path(args.repo_root), args.feature_id)
-
-    if args.command == "final-report":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_final_report(Path(args.repo_root), args.feature_id)
-            )
-        return _run_final_report(Path(args.repo_root), args.feature_id)
-
-    if args.command == "compare-profiles":
-        profile_names = [p.strip() for p in args.profiles.split(",") if p.strip()]
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_compare_profiles(
-                    Path(args.repo_root), args.feature_id, profile_names
-                )
-            )
-        return _run_compare_profiles(
-            Path(args.repo_root), args.feature_id, profile_names, args.json
-        )
-
-    if args.command == "project-github":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_project_github(
-                    Path(args.repo_root), args.feature_id, args.pr
-                )
-            )
-        return _run_project_github(
-            Path(args.repo_root), args.feature_id, args.pr
-        )
-
-    if args.command == "fix-run":
-        repo_root = Path(args.repo_root)
-        # --profile (override) applies to all three legs; when absent each leg
-        # resolves its own role default (ticket 03: fix-run uses per-leg role
-        # defaults). No allowed-set, no refusal - a bad name surfaces at load.
-        try:
-            implement_name = resolve_profile_name(
-                repo_root, ROLE_IMPLEMENTER, args.profile
-            )
-            reviewer_name = resolve_profile_name(
-                repo_root, ROLE_REVIEWER, args.profile
-            )
-            spec_gap_name = resolve_profile_name(
-                repo_root, ROLE_SPEC_GAP_ANALYST, args.profile
-            )
-        except ProfileError as exc:
-            _render_error(exc)
-            return 1
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_fix_run(
-                    repo_root,
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(repo_root, implement_name),
-                    load_profile(repo_root, reviewer_name),
-                    load_profile(repo_root, spec_gap_name),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                    verify_timeout=args.verify_timeout,
-                )
-            )
-        # v0.5 ticket 06: fix-run drives all three legs — record each resolved
-        # profile onto the feature's agent_profiles config (compare-profiles record).
-        fix_feature_root = feature_dir(repo_root, args.feature_id)
-        record_agent_profile(
-            fix_feature_root, ROLE_IMPLEMENTER, implement_name, origin=ORIGIN_FIX_RUN_DRIVER
-        )
-        record_agent_profile(
-            fix_feature_root, ROLE_REVIEWER, reviewer_name, origin=ORIGIN_FIX_RUN_DRIVER
-        )
-        record_agent_profile(
-            fix_feature_root,
-            ROLE_SPEC_GAP_ANALYST,
-            spec_gap_name,
-            origin=ORIGIN_FIX_RUN_DRIVER,
-        )
-        return _run_fix_run(
-            repo_root,
-            args.feature_id,
-            args.lane_id,
-            implement_name,
-            reviewer_name,
-            spec_gap_name,
-            args.max_turns,
-            args.permission_mode,
-            args.verify_timeout,
-        )
-
-    if args.command == "triage":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_triage(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.issue,
-                    args.disposition,
-                    args.reason,
-                    args.by,
-                )
-            )
-        return _run_triage(
-            Path(args.repo_root),
-            args.feature_id,
-            args.issue,
-            args.disposition,
-            args.reason,
-            args.by,
-        )
-
-    # Unreachable: argparse rejects unknown/missing subcommands before we get
-    # here (required=True). error() is NoReturn, so this ends the function.
-    parser.error(f"unknown command: {args.command!r}")
+    cmd = _COMMAND_BY_NAME[args.command]
+    if getattr(args, "dry_run", False) and cmd.plan is not None:
+        planner = cmd.plan
+        return _run_dry_plan(lambda: planner(args))
+    return cmd.run(args)
 
 
 if __name__ == "__main__":  # pragma: no cover
