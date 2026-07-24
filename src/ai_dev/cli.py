@@ -402,7 +402,418 @@ def _triage_hint(
     return _lookup_hint(repo_root, feature_id)
 
 
+# --- per-command argument declarations -------------------------------------
+# Each ``_args_*`` adds one subcommand's positional/optional args to the parser
+# built from its ``Command`` row. ``_build_parser`` loops over ``COMMANDS`` and
+# calls the row's ``add_args`` - so the arg surface lives next to the run/plan
+# handlers, not in a separate hand-maintained block. Help strings are the
+# user-facing contract; keep them verbatim when editing.
+
+
+def _add_run_flags(
+    sub: argparse.ArgumentParser,
+    *,
+    profile_default: str | None,
+    profile_help: str,
+    per_call: bool = False,
+) -> None:
+    """Add the ``--profile``/``--max-turns``/``--permission-mode`` trio shared by
+    ``run-headless`` and the agent/``fix-run`` commands. ``per_call`` switches the
+    max-turns/permission-mode help to ``fix-run``'s "each headless agent call"
+    wording (it spawns three legs, not one)."""
+    sub.add_argument("--profile", default=profile_default, help=profile_help)
+    if per_call:
+        sub.add_argument(
+            "--max-turns",
+            type=int,
+            default=DEFAULT_MAX_TURNS,
+            help="Bounded --max-turns for each headless agent call (default: 12).",
+        )
+        sub.add_argument(
+            "--permission-mode",
+            default=DEFAULT_PERMISSION_MODE,
+            help="claude --permission-mode for each headless agent call "
+            "(default: bypassPermissions).",
+        )
+    else:
+        sub.add_argument(
+            "--max-turns",
+            type=int,
+            default=DEFAULT_MAX_TURNS,
+            help="Bounded --max-turns for the headless call (default: 12).",
+        )
+        sub.add_argument(
+            "--permission-mode",
+            default=DEFAULT_PERMISSION_MODE,
+            help="claude --permission-mode (default: bypassPermissions; the wrapper "
+            "enforces the file boundary post-hoc, §14.2).",
+        )
+
+
+def _args_create_feature_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("intent", help="The original user intent text to record.")
+
+
+def _args_freeze(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id of the run to update.")
+    sub.add_argument(
+        "artifact",
+        choices=FROZEN_ARTIFACTS,
+        help="Which frozen artifact to flip (one of the §4.2 four).",
+    )
+
+
+def _args_render(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical .json a human directly edited.",
+    )
+    sub.add_argument(
+        "artifact",
+        choices=RENDERABLE_ARTIFACTS,
+        help="Which artifact's mirror to re-render (requirements / design / "
+        "tasks; lane_graph has no md mirror).",
+    )
+
+
+def _args_allocate_id(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN whose per-type id counter to bump."
+    )
+    sub.add_argument(
+        "id_type",
+        choices=ID_TYPES,
+        help="Which §5.2 stable-id type to allocate (REQ / AC / DES / TASK / …).",
+    )
+
+
+def _args_show_profile(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
+
+
+def _args_list_features(sub: argparse.ArgumentParser) -> None:
+    # No command-specific args; the shared --repo-root/--json parents suffice.
+    pass
+
+
+def _args_show_status(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id to inspect.")
+
+
+def _args_log(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
+    )
+
+
+def _args_prepare_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id to prepare the run under.")
+    sub.add_argument(
+        "--role",
+        required=True,
+        help="The role for this run (e.g. Implementer, Reviewer, Spec-Gap).",
+    )
+    sub.add_argument(
+        "--task",
+        required=True,
+        help="The task text for this run (written verbatim into task-package.md).",
+    )
+    sub.add_argument(
+        "--allowed-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="A RUN-relative path the run may create or modify (§14.2), in "
+        "addition to output/result.json and output/result.md. Repeatable: "
+        "--allowed-file workspace/hello.py --allowed-file workspace/util.py. "
+        "Declare every task-specific workspace file so validate-run's boundary "
+        "check passes (ticket 05 integration seam).",
+    )
+
+
+def _args_run_headless(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    sub.add_argument("run_id", help="The RUN-NNN id to invoke.")
+    _add_run_flags(
+        sub,
+        profile_default="cc-glm52",
+        profile_help="Agent profile to invoke (default: cc-glm52, the v0 "
+        "recommended profile, §23.4).",
+    )
+
+
+def _args_validate_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    sub.add_argument("run_id", help="The RUN-NNN id to validate.")
+
+
+def _args_generate_requirements(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose intent (00-intent.md) the Planner elaborates "
+        "into a requirements proposal.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 01-requirements until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_generate_design(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "the Planner designs against. Requirements must be frozen first.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 02-design until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_generate_tasks(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "AND design (02-design.json) the Planner tasks against. Both must be "
+        "frozen first.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 03-tasks until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_implement(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml)."
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[implementer] "
+        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_review(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id to review (must have an implement-result)."
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[reviewer] in "
+        "agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_spec_gap(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to gap-analyse (must have an implement-result).",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[spec_gap_analyst] "
+        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_verify(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has an implement-result to verify.",
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to verify (must declare verification_commands).",
+    )
+    sub.add_argument(
+        "--timeout",
+        type=float,
+        default=300,
+        help="Per-command timeout in seconds (default: 300; a hung command is "
+        "recorded as a verification failure, not raised, §24.1).",
+    )
+
+
+def _args_collect_issues(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has checking reports."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id whose checking reports should be collected."
+    )
+
+
+def _args_lane_gate(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has implement/verify/bundle artifacts.",
+    )
+    sub.add_argument("lane_id", help="The LANE-NNN id whose gate should be evaluated.")
+
+
+def _args_coherence_gate(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane gate has passed and is ready for "
+        "the final coherence verdict.",
+    )
+
+
+def _args_final_report(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose coherence verdict should be projected "
+        "into the final report.",
+    )
+
+
+def _args_triage(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose issues/ holds the issue to triage.",
+    )
+    sub.add_argument(
+        "--issue",
+        required=True,
+        metavar="ISSUE-NNN",
+        help="The issue id whose disposition is being written (e.g. ISSUE-001).",
+    )
+    sub.add_argument(
+        "--disposition",
+        required=True,
+        choices=DISPOSITIONS,
+        help="The Human-Triage disposition (§16): accept | reject | defer | "
+        "override | request_fix | request_change_proposal.",
+    )
+    sub.add_argument(
+        "--reason",
+        default=None,
+        help="Recorded rationale. Required for override (P1) and reject on "
+        "P0/P1 (ADR-0001 #6); optional otherwise.",
+    )
+    sub.add_argument(
+        "--by",
+        default="human",
+        help="Who applied the triage (default: human; models may only propose).",
+    )
+
+
+def _args_fix_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose request_fix issues should be targeted.",
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to run through implement/review/spec-gap/verify/collect.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke for implement/review/spec-gap "
+        "(default: each leg's role_defaults entry, ticket 03; --profile, if "
+        "given, overrides all three legs - no allowed-set, no refusal).",
+        per_call=True,
+    )
+    sub.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=300,
+        help="Per-command verifier timeout in seconds (default: 300).",
+    )
+
+
+def _args_compare_profiles(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The anchor FEATURE-NNN (one of the two compared runs; the "
+        "projection lands in its projections/ dir).",
+    )
+    sub.add_argument(
+        "--profiles",
+        required=True,
+        help="Exactly two comma-separated profile names to compare, e.g. "
+        "cc-glm52,codex-default. Each is matched to the intent-sibling "
+        "feature-run whose implementer used it.",
+    )
+
+
+def _args_project_github(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical issues/ + final-report to project.",
+    )
+    sub.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="A PR number to comment the final-report on (ADR-0006 D3). Stored "
+        "as feature -> PR on first projection; without it projection is "
+        "issues-only. The orchestrator never creates the PR - a human does.",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argparse parser from the ``COMMANDS`` registry.
+
+    The command surface is ``COMMANDS`` (one row per subcommand). Each row
+    carries its ``help_text``, ``add_args`` callback, and ``json`` flag, so
+    adding a command is one registry entry - not a separate ``add_parser`` block
+    plus a ``_dispatch`` branch plus a ``_DRY_RUN_COMMANDS`` entry. The
+    ``--dry-run`` flag attaches automatically when ``plan is not None``
+    (side-effect command); read-only commands (``plan is None``) skip it
+    (ADR-0004 - a dry-run flag on a no-side-effect command is noise). The table
+    is ordered to match the historical ``--help`` listing so the refactor is
+    output-neutral.
+    """
     parser = argparse.ArgumentParser(
         prog="ai-dev",
         description="Multi-Agent Profile orchestrator (v0 walking skeleton).",
@@ -416,12 +827,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # v0.4 ticket 03: ``--repo-root`` is declared once on this parent parser and
-    # attached to every subparser via ``parents=[...]``. The declaration is
-    # deduplicated (one source of truth) without changing the invocation syntax
-    # — every command still accepts ``<command> ... --repo-root X`` exactly as
-    # before, so existing calls and scripts are unaffected. A second parent
-    # carries the read-only commands' shared ``--json`` flag.
+    # ``--repo-root`` is declared once on this parent and attached to every
+    # subparser via ``parents=[...]``: one source of truth, unchanged invocation
+    # syntax (every command still takes ``<command> ... --repo-root X``). A
+    # second parent carries the read-only commands' shared ``--json`` flag.
     repo_root_parent = argparse.ArgumentParser(add_help=False)
     repo_root_parent.add_argument(
         "--repo-root",
@@ -436,634 +845,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "(read-only commands only; default: human-readable).",
     )
 
-    create = subparsers.add_parser(
-        "create-feature-run",
-        help="Create a new feature run from an intent string (ticket 01).",
-        parents=[repo_root_parent],
-    )
-    create.add_argument("intent", help="The original user intent text to record.")
-
-    freeze = subparsers.add_parser(
-        "freeze",
-        help="Freeze a canonical artifact after its human gate passes (§4.2, ticket 04).",
-        parents=[repo_root_parent],
-    )
-    freeze.add_argument("feature_id", help="The FEATURE-NNN id of the run to update.")
-    freeze.add_argument(
-        "artifact",
-        choices=FROZEN_ARTIFACTS,
-        help="Which frozen artifact to flip (one of the §4.2 four).",
-    )
-
-    # v0.6 ticket 06 (optional, ADR-0008 D4): the direct-edit refinement
-    # channel's two deterministic helpers. ``render`` re-renders an unfrozen
-    # artifact's ``.md`` mirror from its hand-edited ``.json``; ``allocate-id``
-    # mints the next counter id for a human-added item. Both are model-free;
-    # both refuse a frozen artifact (frozen => Change Proposal, out of scope).
-    render = subparsers.add_parser(
-        "render",
-        help="Re-render an unfrozen artifact's .md mirror from its (hand-edited) "
-        ".json (v0.6 ticket 06, ADR-0008 D4). Deterministic - no model.",
-        parents=[repo_root_parent],
-    )
-    render.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose canonical .json a human directly edited.",
-    )
-    render.add_argument(
-        "artifact",
-        choices=RENDERABLE_ARTIFACTS,
-        help="Which artifact's mirror to re-render (requirements / design / "
-        "tasks; lane_graph has no md mirror).",
-    )
-
-    allocate = subparsers.add_parser(
-        "allocate-id",
-        help="Allocate the next stable id of a type from the counter "
-        "(v0.6 ticket 06, ADR-0008 D4). Deterministic - no model. For human-"
-        "added items in a direct-edited unfrozen artifact, so ids stay in the "
-        "counter and out of human hands (§4.3).",
-        parents=[repo_root_parent],
-    )
-    allocate.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose per-type id counter to bump.",
-    )
-    allocate.add_argument(
-        "id_type",
-        choices=ID_TYPES,
-        help="Which §5.2 stable-id type to allocate (REQ / AC / DES / TASK / …).",
-    )
-
-    show = subparsers.add_parser(
-        "show-profile",
-        help="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
-        parents=[repo_root_parent],
-    )
-    show.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
-
-    prepare = subparsers.add_parser(
-        "prepare-run",
-        help="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
-        parents=[repo_root_parent],
-    )
-    prepare.add_argument(
-        "feature_id", help="The FEATURE-NNN id to prepare the run under."
-    )
-    prepare.add_argument(
-        "--role",
-        required=True,
-        help="The role for this run (e.g. Implementer, Reviewer, Spec-Gap).",
-    )
-    prepare.add_argument(
-        "--task",
-        required=True,
-        help="The task text for this run (written verbatim into task-package.md).",
-    )
-    prepare.add_argument(
-        "--allowed-file",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help="A RUN-relative path the run may create or modify (§14.2), in "
-        "addition to output/result.json and output/result.md. Repeatable: "
-        "--allowed-file workspace/hello.py --allowed-file workspace/util.py. "
-        "Declare every task-specific workspace file so validate-run's boundary "
-        "check passes (ticket 05 integration seam).",
-    )
-
-    run = subparsers.add_parser(
-        "run-headless",
-        help="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
-        parents=[repo_root_parent],
-    )
-    run.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
-    run.add_argument("run_id", help="The RUN-NNN id to invoke.")
-    run.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
-    )
-    run.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    run.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    validate = subparsers.add_parser(
-        "validate-run",
-        help="Run the §14 deterministic validation (schema + boundary + frozen) "
-        "on a captured run (ticket 04).",
-        parents=[repo_root_parent],
-    )
-    validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
-    validate.add_argument("run_id", help="The RUN-NNN id to validate.")
-
-    # v0.6 ticket 02: the first live planning gate — a complete
-    # generate -> promote -> review -> freeze vertical slice for requirements
-    # (ADR-0008). The Planner role (cc-glm52 via role_defaults) runs through the
-    # existing run_wrapper; promote fires automatically after the run, writing
-    # the canonical-unfrozen 01-requirements.{json,md}; --feedback carries the
-    # human's refinement note; freeze (the existing command) is the human gate.
-    gen_req = subparsers.add_parser(
-        "generate-requirements",
-        help="Run the Planner requirements leg: generate -> validate -> auto "
-        "promote the canonical-unfrozen 01-requirements (v0.6 ticket 02, "
-        "ADR-0008).",
-        parents=[repo_root_parent],
-    )
-    gen_req.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose intent (00-intent.md) the Planner elaborates "
-        "into a requirements proposal.",
-    )
-    gen_req.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
-        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
-        "unfrozen 01-requirements until you freeze it.",
-    )
-    gen_req.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[planner] in "
-        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
-        "refusal).",
-    )
-    gen_req.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    gen_req.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    # v0.6 ticket 03: the second planning gate - generate-design. The Planner
-    # runs against the frozen requirements (the upstream); promote fires
-    # automatically, writing the canonical-unfrozen 02-design.{json,md} with a
-    # stitched requirement_mapping; --feedback refines; freeze design (the
-    # existing command, now running the coverage precheck) is the human gate.
-    gen_design = subparsers.add_parser(
-        "generate-design",
-        help="Run the Planner design leg: generate -> validate -> auto promote "
-        "the canonical-unfrozen 02-design against the frozen requirements "
-        "(v0.6 ticket 03, ADR-0008).",
-        parents=[repo_root_parent],
-    )
-    gen_design.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
-        "the Planner designs against. Requirements must be frozen first.",
-    )
-    gen_design.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
-        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
-        "unfrozen 02-design until you freeze it.",
-    )
-    gen_design.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[planner] in "
-        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
-        "refusal).",
-    )
-    gen_design.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    gen_design.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    # v0.6 ticket 04: the third planning gate - generate-tasks. The Planner runs
-    # against the frozen requirements AND design (two upstreams); promote fires
-    # automatically, writing four files (03-tasks.{json,md} + seeded
-    # task-status.yml + populated 04-lane-graph.yml) with stitched REQ+DES refs;
-    # --feedback refines; freeze tasks (running the REQ+DES coverage precheck) is
-    # the human gate that advances to lane_gate.
-    gen_tasks = subparsers.add_parser(
-        "generate-tasks",
-        help="Run the Planner tasks leg: generate -> validate -> auto promote "
-        "the canonical-unfrozen 03-tasks (+ task-status.yml + 04-lane-graph.yml) "
-        "against the frozen requirements and design (v0.6 ticket 04, ADR-0008).",
-        parents=[repo_root_parent],
-    )
-    gen_tasks.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
-        "AND design (02-design.json) the Planner tasks against. Both must be "
-        "frozen first.",
-    )
-    gen_tasks.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
-        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
-        "unfrozen 03-tasks until you freeze it.",
-    )
-    gen_tasks.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[planner] in "
-        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
-        "refusal).",
-    )
-    gen_tasks.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    gen_tasks.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    implement = subparsers.add_parser(
-        "implement",
-        help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
-        "rollup (v0.2 ticket 01, §9.2).",
-        parents=[repo_root_parent],
-    )
-    implement.add_argument("feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen.")
-    implement.add_argument("lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml).")
-    implement.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[implementer] in "
-        "agent-profiles.yml, ticket 03; --profile always overrides, no "
-        "allowed-set, no refusal).",
-    )
-    implement.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    implement.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    review = subparsers.add_parser(
-        "review",
-        help="Run the Code Reviewer leg: build -> run -> validate -> "
-        "review-report (v0.2 ticket 02, §9.3).",
-        parents=[repo_root_parent],
-    )
-    review.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
-    )
-    review.add_argument(
-        "lane_id", help="The LANE-NNN id to review (must have an implement-result)."
-    )
-    review.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[reviewer] in "
-        "agent-profiles.yml, ticket 03; --profile always overrides, no "
-        "allowed-set, no refusal).",
-    )
-    review.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    review.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    spec_gap = subparsers.add_parser(
-        "spec-gap",
-        help="Run the Spec Gap Analyst leg: build -> run -> validate -> "
-        "spec-gap-report (v0.2 ticket 02, §9.4).",
-        parents=[repo_root_parent],
-    )
-    spec_gap.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
-    )
-    spec_gap.add_argument(
-        "lane_id", help="The LANE-NNN id to gap-analyse (must have an implement-result)."
-    )
-    spec_gap.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke (default: role_defaults[spec_gap_analyst] "
-        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
-        "allowed-set, no refusal).",
-    )
-    spec_gap.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    spec_gap.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    verify = subparsers.add_parser(
-        "verify",
-        help="Run the shell Verifier leg: execute the lane's declared verify "
-        "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
-        parents=[repo_root_parent],
-    )
-    verify.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has an implement-result to verify.",
-    )
-    verify.add_argument(
-        "lane_id",
-        help="The LANE-NNN id to verify (must declare verification_commands).",
-    )
-    verify.add_argument(
-        "--timeout",
-        type=float,
-        default=300,
-        help="Per-command timeout in seconds (default: 300; a hung command is "
-        "recorded as a verification failure, not raised, §24.1).",
-    )
-
-    collect = subparsers.add_parser(
-        "collect-issues",
-        help="Collect reviewer + spec-gap issues into feature issues and the "
-        "lane issue-bundle (v0.2 ticket 04, §15).",
-        parents=[repo_root_parent],
-    )
-    collect.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has checking reports.",
-    )
-    collect.add_argument(
-        "lane_id",
-        help="The LANE-NNN id whose checking reports should be collected.",
-    )
-
-    lane_gate = subparsers.add_parser(
-        "lane-gate",
-        help="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
-        "(v0.2 ticket 05).",
-        parents=[repo_root_parent],
-    )
-    lane_gate.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has implement/verify/bundle artifacts.",
-    )
-    lane_gate.add_argument(
-        "lane_id",
-        help="The LANE-NNN id whose gate should be evaluated.",
-    )
-
-    coherence_gate = subparsers.add_parser(
-        "coherence-gate",
-        help="Evaluate the §18.5 feature coherence gate and write the terminal "
-        "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
-        parents=[repo_root_parent],
-    )
-    coherence_gate.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane gate has passed and is ready for "
-        "the final coherence verdict.",
-    )
-
-    final_report = subparsers.add_parser(
-        "final-report",
-        help="Generate final-report.{json,md} from the coherence verdict "
-        "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
-        parents=[repo_root_parent],
-    )
-    final_report.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose coherence verdict should be projected "
-        "into the final report.",
-    )
-
-    triage = subparsers.add_parser(
-        "triage",
-        help="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
-        "ticket 05). Deterministic - no model.",
-        parents=[repo_root_parent],
-    )
-    triage.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose issues/ holds the issue to triage.",
-    )
-    triage.add_argument(
-        "--issue",
-        required=True,
-        metavar="ISSUE-NNN",
-        help="The issue id whose disposition is being written (e.g. ISSUE-001).",
-    )
-    triage.add_argument(
-        "--disposition",
-        required=True,
-        choices=DISPOSITIONS,
-        help="The Human-Triage disposition (§16): accept | reject | defer | "
-        "override | request_fix | request_change_proposal.",
-    )
-    triage.add_argument(
-        "--reason",
-        default=None,
-        help="Recorded rationale. Required for override (P1) and reject on "
-        "P0/P1 (ADR-0001 #6); optional otherwise.",
-    )
-    triage.add_argument(
-        "--by",
-        default="human",
-        help="Who applied the triage (default: human; models may only propose).",
-    )
-
-    fix_run = subparsers.add_parser(
-        "fix-run",
-        help="Run one bounded fix-loop bookend for active request_fix issues "
-        "(ADR-0002, v0.3 ticket 07).",
-        parents=[repo_root_parent],
-    )
-    fix_run.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose request_fix issues should be targeted.",
-    )
-    fix_run.add_argument(
-        "lane_id",
-        help="The LANE-NNN id to run through implement/review/spec-gap/verify/collect.",
-    )
-    fix_run.add_argument(
-        "--profile",
-        default=None,
-        help="Agent profile to invoke for implement/review/spec-gap (default: "
-        "each leg's role_defaults entry, ticket 03; --profile, if given, "
-        "overrides all three legs - no allowed-set, no refusal).",
-    )
-    fix_run.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for each headless agent call (default: 12).",
-    )
-    fix_run.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode for each headless agent call (default: bypassPermissions).",
-    )
-    fix_run.add_argument(
-        "--verify-timeout",
-        type=float,
-        default=300,
-        help="Per-command verifier timeout in seconds (default: 300).",
-    )
-
-    # v0.4 ticket 03: the three read-only observability commands (§26.5 CLI UX).
-    # They carry the shared ``--json`` flag (human-readable by default, JSON
-    # opt-in) on top of the shared ``--repo-root`` parent. They are deliberately
-    # absent from ``_DRY_RUN_COMMANDS`` below — a dry-run flag on a command with
-    # no side effects is noise.
-    subparsers.add_parser(
-        "list-features",
-        help="List every FEATURE-NNN with its derived status + current gate "
-        "(v0.4 ticket 03). Read-only.",
-        parents=[repo_root_parent, json_parent],
-    )
-
-    show_status = subparsers.add_parser(
-        "show-status",
-        help="Show a feature's gate/verdict/derived status + each lane's "
-        "lane-decision (v0.4 ticket 03). Read-only.",
-        parents=[repo_root_parent, json_parent],
-    )
-    show_status.add_argument(
-        "feature_id", help="The FEATURE-NNN id to inspect."
-    )
-
-    log_cmd = subparsers.add_parser(
-        "log",
-        help="Pretty-print a feature's audit timeline (v0.4 ticket 03). "
-        "Read-only; renders audit.log.json (consumes ticket 02's "
-        "origin/elapsed_ms).",
-        parents=[repo_root_parent, json_parent],
-    )
-    log_cmd.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
-    )
-
-    # v0.5 ticket 06: non-canonical side-by-side projection of two parallel
-    # feature-runs (same intent, one profile each). Read-only over canonical
-    # state; writes only the non-canonical projection. Supports the global
-    # ``--json`` flag (stdout form) and ``--dry-run`` (plan only).
-    compare_profiles = subparsers.add_parser(
-        "compare-profiles",
-        help="Project a side-by-side comparison of two parallel feature-runs "
-             "(same intent, one profile each) into "
-             "projections/profile-comparison.{json,md} (v0.5 ticket 06, "
-             "ADR-0003-style non-canonical projection). Read-only.",
-        parents=[repo_root_parent, json_parent],
-    )
-    compare_profiles.add_argument(
-        "feature_id",
-        help="The anchor FEATURE-NNN (one of the two compared runs; the "
-             "projection lands in its projections/ dir).",
-    )
-    compare_profiles.add_argument(
-        "--profiles",
-        required=True,
-        help="Exactly two comma-separated profile names to compare, e.g. "
-             "cc-glm52,codex-default. Each is matched to the intent-sibling "
-             "feature-run whose implementer used it.",
-    )
-
-    # v0.5 ticket 07 / ADR-0006: the basic GitHub projection — push canonical
-    # ISSUE-NNN -> GitHub issues (gh create/edit) + post/update final-report as a
-    # PR comment. Network-bound + writes projections/github/mapping.json (the
-    # first non-deterministic canonical write). One-way (invariant #10); token by
-    # env-var name (invariant #11).
-    project_github_cmd = subparsers.add_parser(
-        "project-github",
-        help="Push canonical issues to GitHub issues + post the final-report as "
-        "a PR comment (v0.5 ticket 07, ADR-0006). Network-bound; idempotent via "
-        "projections/github/mapping.json.",
-        parents=[repo_root_parent],
-    )
-    project_github_cmd.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose canonical issues/ + final-report to project.",
-    )
-    project_github_cmd.add_argument(
-        "--pr",
-        type=int,
-        default=None,
-        metavar="N",
-        help="A PR number to comment the final-report on (ADR-0006 D3). Stored "
-        "as feature -> PR on first projection; without it projection is "
-        "issues-only. The orchestrator never creates the PR — a human does.",
-    )
-
-    # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
-    # rather than repeating the add_argument per command. Read-only commands are
-    # excluded (a dry-run flag on a command with no side effects is noise).
-    for name, sub in subparsers.choices.items():
-        if name in _DRY_RUN_COMMANDS:
+    for cmd in COMMANDS:
+        parents = [repo_root_parent]
+        if cmd.json:
+            parents.append(json_parent)
+        sub = subparsers.add_parser(cmd.name, help=cmd.help_text, parents=parents)
+        cmd.add_args(sub)
+        if cmd.plan is not None:
             _add_dry_run(sub)
 
     return parser
 
-
-# The side-effect commands that accept ``--dry-run`` (ADR-0004). Agent commands
-# spawn a claude subprocess; deterministic commands write canonical state.
-# Already-pure/read-only commands (show-profile, validate-run, the v0.4
-# read-only commands) are deliberately excluded - a dry-run flag on a command
-# with no side effects is noise.
-_DRY_RUN_COMMANDS: frozenset[str] = frozenset(
-    {
-        "run-headless",
-        "implement",
-        "review",
-        "spec-gap",
-        "generate-requirements",
-        "generate-design",
-        "generate-tasks",
-        "fix-run",
-        "freeze",
-        "triage",
-        "coherence-gate",
-        "final-report",
-        "lane-gate",
-        "compare-profiles",
-        "project-github",
-        "render",
-        "allocate-id",
-    }
-)
 
 
 def _add_dry_run(subparser: argparse.ArgumentParser) -> None:
@@ -2076,24 +1868,30 @@ def _run_log(repo_root: Path, feature_id: str, as_json: bool) -> int:
 @dataclass(frozen=True)
 class Command:
     """One row in the cli command registry - the single source of truth for the
-    command surface. ``_dispatch`` routes to ``run`` (or ``plan`` under
-    ``--dry-run``); ``_build_parser`` declares the command's args from the same
-    row (wired in the next step). ``plan is None`` marks a command with no
-    ``--dry-run`` (read-only / pure passthrough) - that is what the parser tests
-    to decide whether to attach the flag.
+    command surface. ``_build_parser`` declares the subcommand from this row
+    (``help_text`` + ``add_args`` + ``json`` + the ``--dry-run`` flag when
+    ``plan is not None``); ``_dispatch`` routes to ``run`` (or ``plan`` under
+    ``--dry-run``). Adding a command is one entry here - not three hand-maintained
+    lists (parser block + dispatch branch + dry-run set).
     """
 
     name: str
+    help_text: str
+    add_args: "Callable[[argparse.ArgumentParser], None]"
     run: "Callable[[argparse.Namespace], int]"
     plan: "Callable[[argparse.Namespace], DryRunPlan] | None"
+    json: bool = False
 
 
 def _agent_command(
     name: str,
+    help_text: str,
+    add_args: "Callable[[argparse.ArgumentParser], None]",
     role: str,
     origin: str,
     real: "Callable[[Path, str, str, argparse.Namespace], int]",
     plan: "Callable[[Path, str, AgentProfile, argparse.Namespace], DryRunPlan]",
+    json: bool = False,
 ) -> Command:
     """Build an agent Command: resolve profile, then (dry) plan with a loaded
     ``AgentProfile`` or (real) record + run with the name.
@@ -2127,7 +1925,14 @@ def _agent_command(
             repo_root, args.feature_id, load_profile(repo_root, profile_name), args
         )
 
-    return Command(name=name, run=run, plan=dry)
+    return Command(
+        name=name,
+        help_text=help_text,
+        add_args=add_args,
+        run=run,
+        plan=dry,
+        json=json,
+    )
 
 
 def _run_create_feature_run_cmd(args: argparse.Namespace) -> int:
@@ -2210,53 +2015,55 @@ def _plan_fix_run_cmd(args: argparse.Namespace) -> DryRunPlan:
     )
 
 
-# The command registry: one row per subcommand. ``_dispatch`` routes to ``run``
-# (or ``plan`` under --dry-run); ``_build_parser`` declares args from the same
-# row (next step). Adding a command is one entry here - not three hand-maintained
-# lists (parser + dispatch + dry_run planner).
+# The command registry: one row per subcommand - the single source of
+# truth for the command surface. ``_build_parser`` declares the subcommand
+# (help + args + --dry-run when plan is not None); ``_dispatch`` routes to
+# run (or plan under --dry-run). Adding a command is one entry here - not
+# three hand-maintained lists (parser block + dispatch branch + dry-run set).
 COMMANDS: list[Command] = [
     Command(
         "create-feature-run",
+        help_text="Create a new feature run from an intent string (ticket 01).",
+        add_args=_args_create_feature_run,
         run=_run_create_feature_run_cmd,
         plan=None,
     ),
     Command(
         "freeze",
+        help_text="Freeze a canonical artifact after its human gate passes (§4.2, ticket 04).",
+        add_args=_args_freeze,
         run=lambda a: _run_freeze(Path(a.repo_root), a.feature_id, a.artifact),
         plan=lambda a: plan_freeze(Path(a.repo_root), a.feature_id, a.artifact),
     ),
     Command(
         "render",
+        help_text="Re-render an unfrozen artifact's .md mirror from its (hand-edited) "
+        ".json (v0.6 ticket 06, ADR-0008 D4). Deterministic - no model.",
+        add_args=_args_render,
         run=lambda a: _run_render(Path(a.repo_root), a.feature_id, a.artifact),
         plan=lambda a: plan_render(Path(a.repo_root), a.feature_id, a.artifact),
     ),
     Command(
         "allocate-id",
+        help_text="Allocate the next stable id of a type from the counter "
+        "(v0.6 ticket 06, ADR-0008 D4). Deterministic - no model. For human-"
+        "added items in a direct-edited unfrozen artifact, so ids stay in the "
+        "counter and out of human hands (§4.3).",
+        add_args=_args_allocate_id,
         run=lambda a: _run_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
         plan=lambda a: plan_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
     ),
     Command(
         "show-profile",
+        help_text="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
+        add_args=_args_show_profile,
         run=lambda a: _run_show_profile(Path(a.repo_root), a.name),
         plan=None,
     ),
     Command(
-        "list-features",
-        run=lambda a: _run_list_features(Path(a.repo_root), a.json),
-        plan=None,
-    ),
-    Command(
-        "show-status",
-        run=lambda a: _run_show_status(Path(a.repo_root), a.feature_id, a.json),
-        plan=None,
-    ),
-    Command(
-        "log",
-        run=lambda a: _run_log(Path(a.repo_root), a.feature_id, a.json),
-        plan=None,
-    ),
-    Command(
         "prepare-run",
+        help_text="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
+        add_args=_args_prepare_run,
         run=lambda a: _run_prepare_run(
             Path(a.repo_root),
             a.feature_id,
@@ -2268,6 +2075,8 @@ COMMANDS: list[Command] = [
     ),
     Command(
         "run-headless",
+        help_text="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
+        add_args=_args_run_headless,
         run=lambda a: _run_run_headless(
             Path(a.repo_root),
             a.feature_id,
@@ -2287,11 +2096,17 @@ COMMANDS: list[Command] = [
     ),
     Command(
         "validate-run",
+        help_text="Run the §14 deterministic validation (schema + boundary + frozen) "
+        "on a captured run (ticket 04).",
+        add_args=_args_validate_run,
         run=lambda a: _run_validate_run(Path(a.repo_root), a.feature_id, a.run_id),
         plan=None,
     ),
     _agent_command(
         "generate-requirements",
+        "Run the Planner requirements leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 01-requirements (v0.6 ticket 02, ADR-0008).",
+        _args_generate_requirements,
         ROLE_PLANNER,
         ORIGIN_PLANNER_LEG,
         real=lambda repo, fid, name, a: _run_generate_requirements(
@@ -2308,6 +2123,10 @@ COMMANDS: list[Command] = [
     ),
     _agent_command(
         "generate-design",
+        "Run the Planner design leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 02-design against the frozen requirements "
+        "(v0.6 ticket 03, ADR-0008).",
+        _args_generate_design,
         ROLE_PLANNER,
         ORIGIN_PLANNER_LEG,
         real=lambda repo, fid, name, a: _run_generate_design(
@@ -2324,6 +2143,10 @@ COMMANDS: list[Command] = [
     ),
     _agent_command(
         "generate-tasks",
+        "Run the Planner tasks leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 03-tasks (+ task-status.yml + 04-lane-graph.yml) "
+        "against the frozen requirements and design (v0.6 ticket 04, ADR-0008).",
+        _args_generate_tasks,
         ROLE_PLANNER,
         ORIGIN_PLANNER_LEG,
         real=lambda repo, fid, name, a: _run_generate_tasks(
@@ -2340,6 +2163,9 @@ COMMANDS: list[Command] = [
     ),
     _agent_command(
         "implement",
+        "Run the Implementer leg: prepare -> run -> validate -> writeback -> "
+        "rollup (v0.2 ticket 01, §9.2).",
+        _args_implement,
         ROLE_IMPLEMENTER,
         ORIGIN_IMPLEMENT_LEG,
         real=lambda repo, fid, name, a: _run_implement(
@@ -2356,6 +2182,9 @@ COMMANDS: list[Command] = [
     ),
     _agent_command(
         "review",
+        "Run the Code Reviewer leg: build -> run -> validate -> "
+        "review-report (v0.2 ticket 02, §9.3).",
+        _args_review,
         ROLE_REVIEWER,
         ORIGIN_REVIEW_LEG,
         real=lambda repo, fid, name, a: _run_checking(
@@ -2380,6 +2209,9 @@ COMMANDS: list[Command] = [
     ),
     _agent_command(
         "spec-gap",
+        "Run the Spec Gap Analyst leg: build -> run -> validate -> "
+        "spec-gap-report (v0.2 ticket 02, §9.4).",
+        _args_spec_gap,
         ROLE_SPEC_GAP_ANALYST,
         ORIGIN_SPEC_GAP_LEG,
         real=lambda repo, fid, name, a: _run_checking(
@@ -2404,6 +2236,9 @@ COMMANDS: list[Command] = [
     ),
     Command(
         "verify",
+        help_text="Run the shell Verifier leg: execute the lane's declared verify "
+        "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
+        add_args=_args_verify,
         run=lambda a: _run_verify(
             Path(a.repo_root), a.feature_id, a.lane_id, a.timeout
         ),
@@ -2411,45 +2246,41 @@ COMMANDS: list[Command] = [
     ),
     Command(
         "collect-issues",
+        help_text="Collect reviewer + spec-gap issues into feature issues and the "
+        "lane issue-bundle (v0.2 ticket 04, §15).",
+        add_args=_args_collect_issues,
         run=lambda a: _run_collect_issues(Path(a.repo_root), a.feature_id, a.lane_id),
         plan=None,
     ),
     Command(
         "lane-gate",
+        help_text="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
+        "(v0.2 ticket 05).",
+        add_args=_args_lane_gate,
         run=lambda a: _run_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
         plan=lambda a: plan_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
     ),
     Command(
         "coherence-gate",
+        help_text="Evaluate the §18.5 feature coherence gate and write the terminal "
+        "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
+        add_args=_args_coherence_gate,
         run=lambda a: _run_coherence_gate(Path(a.repo_root), a.feature_id),
         plan=lambda a: plan_coherence_gate(Path(a.repo_root), a.feature_id),
     ),
     Command(
         "final-report",
+        help_text="Generate final-report.{json,md} from the coherence verdict "
+        "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
+        add_args=_args_final_report,
         run=lambda a: _run_final_report(Path(a.repo_root), a.feature_id),
         plan=lambda a: plan_final_report(Path(a.repo_root), a.feature_id),
     ),
     Command(
-        "compare-profiles",
-        run=lambda a: _run_compare_profiles(
-            Path(a.repo_root), a.feature_id, _profile_names(a), a.json
-        ),
-        plan=lambda a: plan_compare_profiles(
-            Path(a.repo_root), a.feature_id, _profile_names(a)
-        ),
-    ),
-    Command(
-        "project-github",
-        run=lambda a: _run_project_github(Path(a.repo_root), a.feature_id, a.pr),
-        plan=lambda a: plan_project_github(Path(a.repo_root), a.feature_id, a.pr),
-    ),
-    Command(
-        "fix-run",
-        run=_run_fix_run_cmd,
-        plan=_plan_fix_run_cmd,
-    ),
-    Command(
         "triage",
+        help_text="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
+        "ticket 05). Deterministic - no model.",
+        add_args=_args_triage,
         run=lambda a: _run_triage(
             Path(a.repo_root),
             a.feature_id,
@@ -2466,6 +2297,66 @@ COMMANDS: list[Command] = [
             a.reason,
             a.by,
         ),
+    ),
+    Command(
+        "fix-run",
+        help_text="Run one bounded fix-loop bookend for active request_fix issues "
+        "(ADR-0002, v0.3 ticket 07).",
+        add_args=_args_fix_run,
+        run=_run_fix_run_cmd,
+        plan=_plan_fix_run_cmd,
+    ),
+    Command(
+        "list-features",
+        help_text="List every FEATURE-NNN with its derived status + current gate "
+        "(v0.4 ticket 03). Read-only.",
+        add_args=_args_list_features,
+        run=lambda a: _run_list_features(Path(a.repo_root), a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "show-status",
+        help_text="Show a feature's gate/verdict/derived status + each lane's "
+        "lane-decision (v0.4 ticket 03). Read-only.",
+        add_args=_args_show_status,
+        run=lambda a: _run_show_status(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "log",
+        help_text="Pretty-print a feature's audit timeline (v0.4 ticket 03). "
+        "Read-only; renders audit.log.json (consumes ticket 02's "
+        "origin/elapsed_ms).",
+        add_args=_args_log,
+        run=lambda a: _run_log(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "compare-profiles",
+        help_text="Project a side-by-side comparison of two parallel feature-runs "
+        "(same intent, one profile each) into "
+        "projections/profile-comparison.{json,md} (v0.5 ticket 06, "
+        "ADR-0003-style non-canonical projection). Read-only.",
+        add_args=_args_compare_profiles,
+        run=lambda a: _run_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a), a.json
+        ),
+        plan=lambda a: plan_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a)
+        ),
+        json=True,
+    ),
+    Command(
+        "project-github",
+        help_text="Push canonical issues to GitHub issues + post the final-report as "
+        "a PR comment (v0.5 ticket 07, ADR-0006). Network-bound; idempotent via "
+        "projections/github/mapping.json.",
+        add_args=_args_project_github,
+        run=lambda a: _run_project_github(Path(a.repo_root), a.feature_id, a.pr),
+        plan=lambda a: plan_project_github(Path(a.repo_root), a.feature_id, a.pr),
     ),
 ]
 
