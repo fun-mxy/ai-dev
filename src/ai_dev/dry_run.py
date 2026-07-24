@@ -70,8 +70,8 @@ from ai_dev.lane_gate import (
 from ai_dev.paths import (
     INPUT_DIR,
     OUTPUT_DIR,
-    feature_dir,
     lane_dir,
+    require_feature_root,
     run_dir,
 )
 from ai_dev.planner_leg import (
@@ -362,9 +362,7 @@ def plan_implement(
     package into a temp dir instead of minting ``RUN-NNN``. Reports the would-be
     run + the lane rollup paths.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     frozen = frozen_artifacts_status(feature_root)
     if not (frozen.get("tasks") and frozen.get("lane_graph")):
         raise ValueError(
@@ -430,9 +428,7 @@ def plan_generate_requirements(
     promote slice before committing to a real run. ``feedback`` (when given) is
     surfaced in the plan so the refinement channel is visible.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     # Precondition: the intent must exist (the Planner elaborates from it). Reads
     # the same helper the real leg uses, so a missing/empty intent fails loud
     # here exactly as it would at run time.
@@ -502,9 +498,7 @@ def plan_generate_design(
     real run. ``feedback`` (when given) is surfaced in the plan so the refinement
     channel (ADR-0008 D4) is visible.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     # Preconditions mirror the real leg exactly (so a missing intent or an
     # unfrozen-requirements rejection fails loud here as it would at run time).
     # ``read_frozen_requirements_doc`` raises ValueError when requirements is not
@@ -579,9 +573,7 @@ def plan_generate_tasks(
     committing to a real run. ``feedback`` (when given) is surfaced so the
     refinement channel (ADR-0008 D4) is visible.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     # Preconditions mirror the real leg exactly: tasks stitches against TWO frozen
     # upstreams (REQ + DES), so both must be frozen (ADR-0008 D2). The
     # ``read_frozen_*_doc`` helpers raise ValueError when either is not frozen -
@@ -652,9 +644,7 @@ def _plan_checking(
     permission_mode: str,
 ) -> DryRunPlan:
     """Shared planner for the ``review`` / ``spec-gap`` checking legs (§9.3/§9.4)."""
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     _require_frozen(feature_root)
     facts = read_implement_run_facts(repo_root, feature_id, lane_id)
     # ``task_fn`` takes ``(feature_root, facts)`` so the spec-gap task gets the
@@ -770,9 +760,7 @@ def plan_fix_run(
     default), and the plan reports all three profile names so the operator can
     see the per-leg routing before committing to a real run.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     if fix_loop_budget_exhausted(feature_root):
         raise ValueError(
             "fix_loop_budget exhausted; cannot run another request_fix loop "
@@ -851,9 +839,7 @@ def plan_freeze(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
         raise ValueError(
             f"unknown frozen artifact {artifact!r}; expected one of {FROZEN_ARTIFACTS}"
         )
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     frozen = frozen_artifacts_status(feature_root)
     already = bool(frozen.get(artifact))
     advance = {"requirements": "design_gate", "design": "task_gate", "tasks": "lane_gate"}
@@ -921,9 +907,7 @@ def plan_render(repo_root: Path, feature_id: str, artifact: str) -> DryRunPlan:
             f"artifact {artifact!r} is not renderable; expected one of "
             f"{RENDERABLE_ARTIFACTS} (lane_graph has no md mirror)"
         )
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     frozen = frozen_artifacts_status(feature_root)
     details: dict[str, Any] = {"artifact": artifact}
     # Frozen -> would be refused (the direct-edit channel is closed past freeze).
@@ -975,9 +959,7 @@ def plan_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> DryRunPl
         raise ValueError(
             f"unknown stable-id type {id_type!r}; expected one of {ID_TYPES}"
         )
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     would_be = preview_next_id(feature_root, id_type)
     return DryRunPlan(
         command="allocate-id",
@@ -1011,9 +993,7 @@ def plan_triage(
         raise ValueError(
             f"unknown disposition {action!r}; expected one of {DISPOSITIONS}"
         )
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     issue_path = feature_root / ISSUES_DIR / f"{issue_id}.json"
     issue = read_json_object(issue_path)
     if issue is None:
@@ -1100,9 +1080,7 @@ def plan_triage(
 
 def plan_coherence_gate(repo_root: Path, feature_id: str) -> DryRunPlan:
     """Plan a ``coherence-gate``: compute the verdict, write nothing (ADR-0003 D1)."""
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     compute = compute_coherence(feature_root)
     failed = [str(c["name"]) for c in compute.conditions if not c.get("passed")]
     details = {
@@ -1133,9 +1111,7 @@ def plan_coherence_gate(repo_root: Path, feature_id: str) -> DryRunPlan:
 
 def plan_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> DryRunPlan:
     """Plan a ``lane-gate``: compute the decision, write nothing (§18.4)."""
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     if not lane_dir(repo_root, feature_id, lane_id).is_dir():
         raise ValueError(f"lane {lane_id} not found under feature {feature_id}")
     compute = compute_lane_decision(repo_root, feature_id, lane_id)
@@ -1166,9 +1142,7 @@ def plan_lane_gate(repo_root: Path, feature_id: str, lane_id: str) -> DryRunPlan
 
 def plan_final_report(repo_root: Path, feature_id: str) -> DryRunPlan:
     """Plan a ``final-report``: compute the projection, write nothing (§23.5)."""
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    feature_root = require_feature_root(repo_root, feature_id)
     compute = compute_final_report(feature_root)
     details = {
         "verdict": compute.verdict,

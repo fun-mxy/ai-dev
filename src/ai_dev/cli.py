@@ -164,7 +164,7 @@ from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
 from ai_dev.coverage import freeze_gate_coverage
-from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
+from ai_dev.paths import feature_dir, features_dir, require_feature_root, run_dir, runs_dir
 from ai_dev.promote import (
     FrozenArtifactWriteError,
     RENDERABLE_ARTIFACTS,
@@ -1078,12 +1078,10 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
     referenced, e.g. every REQ in some design ``requirement_mapping`` for the
     design gate, §18.2). Other failures propagate (§24.2 fail loud).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        _render_error(
-            ValueError(f"feature run {feature_id} not found under {repo_root}"),
-            hint=_lookup_hint(repo_root, feature_id),
-        )
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     # ADR-0008 D3: coverage-completeness is checked at the freeze action. Stages
     # with no upstream coverage invariant (requirements = root, lane_graph)
@@ -1124,12 +1122,10 @@ def _run_render(repo_root: Path, feature_id: str, artifact: str) -> int:
     precondition is missing (unknown/non-renderable artifact, no feature run,
     nothing promoted to render - §24.2 fail loud).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        _render_error(
-            ValueError(f"feature run {feature_id} not found under {repo_root}"),
-            hint=_lookup_hint(repo_root, feature_id),
-        )
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     try:
         result: RenderResult = render_artifact(
@@ -1159,12 +1155,10 @@ def _run_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> int:
     stay in the counter and out of human hands (§4.3). Returns ``0`` on a
     successful mint; ``1`` on an unknown id type or missing feature run (§24.2).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        _render_error(
-            ValueError(f"feature run {feature_id} not found under {repo_root}"),
-            hint=_lookup_hint(repo_root, feature_id),
-        )
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
         return 1
     try:
         allocated_id = allocate_id(feature_root, id_type, origin=ORIGIN_CLI)

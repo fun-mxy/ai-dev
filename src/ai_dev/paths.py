@@ -51,6 +51,24 @@ def feature_dir(repo_root: Path, feature_id: str) -> Path:
     return features_dir(repo_root) / feature_id
 
 
+def require_feature_root(repo_root: Path, feature_id: str) -> Path:
+    """Return ``feature_dir(repo_root, feature_id)``, raising if it is absent.
+
+    ``feature_dir`` is a pure path join - it never touches the filesystem - so
+    the "does this feature run exist?" precondition was hand-rolled at every
+    call site (the cli handlers and the dry-run planners). Centralising it here
+    lets cli and ``dry_run`` share one check without ``dry_run`` importing cli
+    (the import direction is one-way, cli -> dry_run). Raises ``ValueError``
+    with the canonical message so both caller shapes get identical text:
+    ``dry_run`` lets it propagate to ``_run_dry_plan``'s catch; cli catches it
+    and renders with a did-you-mean hint (``_lookup_hint``).
+    """
+    root = feature_dir(repo_root, feature_id)
+    if not root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    return root
+
+
 def runs_dir(repo_root: Path, feature_id: str) -> Path:
     """``<repo_root>/.ai-dev/features/<feature_id>/runs`` (§6 skeleton, §12.1).
 
