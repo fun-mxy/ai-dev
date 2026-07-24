@@ -184,6 +184,7 @@ from ai_dev.profile_comparison import (
     generate_profile_comparison,
 )
 from ai_dev.profiles import (
+    AgentProfile,
     ProfileError,
     ROLE_IMPLEMENTER,
     ROLE_PLANNER,
@@ -257,6 +258,39 @@ def _render_error(exc: BaseException, *, hint: str | None = None) -> None:
     print(f"error: {message}", file=sys.stderr)
     if hint:
         print(f"  hint: {hint}", file=sys.stderr)
+
+
+def _load_profile_or_render(repo_root: Path, name: str) -> AgentProfile | None:
+    """Load a profile by name; on ``ProfileError``, render it and return ``None``.
+
+    The cli's shared profile-load tail: handlers that need a loaded
+    ``AgentProfile`` wrap ``load_profile`` in the same try/except (no hint - a
+    missing profile file is not a did-you-mean situation). Returning ``None``
+    lets the caller exit 1 without re-spelling the except block. Callers that
+    load several profiles in one try (``fix-run``) keep their own block - this
+    helper is for the single-load case.
+    """
+    try:
+        return load_profile(repo_root, name)
+    except ProfileError as exc:
+        _render_error(exc)
+        return None
+
+
+def _exit_value_error(
+    repo_root: Path, feature_id: str, exc: BaseException, *, run_id: str | None = None
+) -> int:
+    """Render a precondition ``ValueError`` with a did-you-mean hint; return 1.
+
+    The cli's shared exit-1 tail: a §24.2 precondition failure (missing
+    feature/lane/run, unfrozen artifact, unknown id) surfaces as one
+    ``error:`` line plus a ``_lookup_hint`` did-you-mean, exit 1. Centralising
+    it keeps the hint's call shape in one place across the handler except
+    blocks. ``run_id`` is passed only by run-scoped commands (``validate-run``)
+    so their hint can point at a missing run rather than a missing feature.
+    """
+    _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
+    return 1
 
 
 def _existing_ids(parent: Path, prefix: str) -> list[str]:
@@ -1081,8 +1115,7 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
     try:
         feature_root = require_feature_root(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     # ADR-0008 D3: coverage-completeness is checked at the freeze action. Stages
     # with no upstream coverage invariant (requirements = root, lane_graph)
     # return None - no precheck. A gap refuses to freeze (no self-heal): the
@@ -1095,8 +1128,7 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
     except ValueError as exc:
         # A corrupt precondition (e.g. design freeze before requirements frozen)
         # surfaces as a clean error rather than a traceback.
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if coverage is not None and not coverage.ok:
         _render_error(ValueError(coverage.refusal_message(artifact)))
         return 1
@@ -1125,8 +1157,7 @@ def _run_render(repo_root: Path, feature_id: str, artifact: str) -> int:
     try:
         feature_root = require_feature_root(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     try:
         result: RenderResult = render_artifact(
             feature_root, feature_id, artifact, origin=ORIGIN_CLI
@@ -1135,8 +1166,7 @@ def _run_render(repo_root: Path, feature_id: str, artifact: str) -> int:
         _render_error(exc)
         return 1
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"{feature_id}: re-rendered {result.md_path.name} from "
         f"{result.json_path.name} ({artifact}, unfrozen)"
@@ -1158,13 +1188,11 @@ def _run_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> int:
     try:
         feature_root = require_feature_root(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     try:
         allocated_id = allocate_id(feature_root, id_type, origin=ORIGIN_CLI)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(allocated_id)
     return 0
 
@@ -1180,10 +1208,8 @@ def _run_show_profile(repo_root: Path, name: str) -> int:
     unset (the latter still prints the profile so the operator can see what is
     configured, then signals non-readiness via the exit code).
     """
-    try:
-        profile = load_profile(repo_root, name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, name)
+    if profile is None:
         return 1
 
     source = token_source_var(profile)
@@ -1228,8 +1254,7 @@ def _run_prepare_run(
             origin=ORIGIN_CLI,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(run_id)
     return 0
 
@@ -1252,10 +1277,8 @@ def _run_run_headless(
     ``1`` when the profile cannot load or the run cannot start (missing token /
     run directory), surfacing the message rather than a traceback.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = run_headless(
@@ -1268,8 +1291,7 @@ def _run_run_headless(
             origin=ORIGIN_CLI,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc, run_id=run_id)
     print(
         f"{result.run_id}: profile={result.profile} exit_code={result.exit_code} "
         f"changed_files={len(result.changed_files)}"
@@ -1291,8 +1313,7 @@ def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
     try:
         result = validate_run(repo_root, feature_id, run_id, origin=ORIGIN_CLI)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc, run_id=run_id)
     if result.passed:
         print(
             f"VALIDATE PASS - {run_id} (schema + boundary + frozen OK)"
@@ -1324,10 +1345,8 @@ def _run_implement(
     the writeback), so this command never writes canonical status for a failed
     run.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = run_implementer_leg(
@@ -1340,8 +1359,7 @@ def _run_implement(
             origin=ORIGIN_IMPLEMENT_LEG,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     status = (
         f"IMPLEMENT PASS - {result.run_id} lane={result.lane_id} "
         f"status={result.result_status} tasks_marked={result.task_ids_marked}"
@@ -1376,10 +1394,8 @@ def _run_generate_requirements(
     (malformed proposal / frozen artifact) propagate as a clean ``error:`` line
     via the top-level handler.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result: PlannerLegResult = run_generate_requirements(
@@ -1392,8 +1408,7 @@ def _run_generate_requirements(
             origin=ORIGIN_PLANNER_LEG,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
     # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
     promote = result.promote
@@ -1448,10 +1463,8 @@ def _run_generate_design(
     token). promote errors (malformed proposal / unresolved ref / frozen artifact)
     propagate as a clean ``error:`` line via the top-level handler.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result: PlannerLegResult = run_generate_design(
@@ -1464,8 +1477,7 @@ def _run_generate_design(
             origin=ORIGIN_PLANNER_LEG,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
     # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
     promote = result.promote
@@ -1517,10 +1529,8 @@ def _run_generate_tasks(
     unresolved ref / frozen artifact) propagate as a clean ``error:`` line via the
     top-level handler.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result: PlannerLegResult = run_generate_tasks(
@@ -1533,8 +1543,7 @@ def _run_generate_tasks(
             origin=ORIGIN_PLANNER_LEG,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     promote = result.promote
     if result.validation.passed and promote is not None:
         task_ids = list(promote.allocated.get("TASK", []))
@@ -1585,10 +1594,8 @@ def _run_checking(
     implement-result, missing token). The checking legs write no canonical
     status (§4.3), so this command never mutates ``task-status.yml``.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = leg(
@@ -1601,8 +1608,7 @@ def _run_checking(
             origin=origin,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     status = (
         f"{label} PASS - {result.run_id} lane={result.lane_id} "
         f"role={result.role} issues={result.issue_count}"
@@ -1648,8 +1654,7 @@ def _run_verify(
             repo_root, feature_id, lane_id, timeout=timeout, origin=ORIGIN_VERIFIER
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     passed = sum(1 for r in result.command_results if r.passed)
     total = len(result.command_results)
     if result.verdict == "pass":
@@ -1684,8 +1689,7 @@ def _run_collect_issues(
             repo_root, feature_id, lane_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"COLLECT-ISSUES PASS - lane={result.lane_id} "
         f"issues={result.issue_count} bundle={result.bundle_json_path}"
@@ -1708,8 +1712,7 @@ def _run_lane_gate(
             repo_root, feature_id, lane_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if result.passed:
         print(
             f"LANE-GATE PASS - lane={result.lane_id} "
@@ -1741,8 +1744,7 @@ def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
             repo_root, feature_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if result.passed:
         print(
             f"COHERENCE-GATE PASS - feature={result.feature_id} verdict=pass "
@@ -1772,8 +1774,7 @@ def _run_final_report(repo_root: Path, feature_id: str) -> int:
     try:
         result: FinalReportResult = generate_final_report(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"FINAL-REPORT - feature={result.feature_id} verdict={result.verdict} "
         f"failure_class={result.failure_class} report={result.report_json_path}"
@@ -1800,8 +1801,7 @@ def _run_compare_profiles(
             repo_root, feature_id, profile_names
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if as_json:
         _print_json(json.loads(result.projection_json_path.read_text()))
     else:
@@ -1830,8 +1830,7 @@ def _run_project_github(
             repo_root, feature_id, pr_number
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if result.failure_reason is not None:
         _render_error(
             ValueError(result.failure_reason),
@@ -1891,8 +1890,7 @@ def _run_fix_run(
             origin=ORIGIN_FIX_RUN_DRIVER,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"FIX-RUN PASS - lane={result.lane_id} implement_run={result.implement_run_id} "
         f"targets={result.target_issue_ids} budget={result.budget_used}/{result.budget_max} "
@@ -2023,8 +2021,7 @@ def _run_show_status(repo_root: Path, feature_id: str, as_json: bool) -> int:
     try:
         view = show_feature_status(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if as_json:
         _print_json(view.to_dict())
     else:
@@ -2067,8 +2064,7 @@ def _run_log(repo_root: Path, feature_id: str, as_json: bool) -> int:
     try:
         records = read_audit_timeline(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if as_json:
         _print_json([record.to_dict() for record in records])
     else:
