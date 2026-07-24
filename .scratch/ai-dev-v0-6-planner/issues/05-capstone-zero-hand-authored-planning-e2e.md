@@ -16,7 +16,7 @@ populates from the Planner-originated ids, not hand-written ones. Record evidenc
 
 **Blocked by:** 02, 03, 04 (all three planning gates must exist and chain into the existing implement→…→final-report flow).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] one feature driven intent → … → final-report with **zero hand-authored** planning content
 - [x] all four planning artifacts Planner-generated + promoted + human-frozen

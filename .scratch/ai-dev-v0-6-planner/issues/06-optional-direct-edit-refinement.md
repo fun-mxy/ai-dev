@@ -14,7 +14,7 @@ On accept→freeze, the existing reference-integrity + coverage checks still run
 
 **Blocked by:** 04 (the full planning flow should exist first; this is an add-on channel).
 
-**Status:** ready-for-agent (optional — may be deferred past the v0.6 capstone)
+**Status:** done
 
 - [x] human can edit an **unfrozen** canonical `.json`; `render` re-renders the `.md` mirror
 - [x] `allocate-id` helper assigns the next counter id for human-added items
