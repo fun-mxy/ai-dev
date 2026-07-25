@@ -163,6 +163,8 @@ class TestFixRunBudget:
             feature_id,
             lane_id,
             _FIXED_PROFILE,
+            _FIXED_PROFILE,
+            _FIXED_PROFILE,
             max_turns=12,
             permission_mode="bypassPermissions",
             verify_timeout=300,
@@ -188,6 +190,8 @@ class TestFixRunBudget:
                 repo_root,
                 feature_id,
                 lane_id,
+                _FIXED_PROFILE,
+                _FIXED_PROFILE,
                 _FIXED_PROFILE,
                 max_turns=12,
                 permission_mode="bypassPermissions",
@@ -218,6 +222,8 @@ class TestFixRunBudget:
                 feature_id,
                 lane_id,
                 _FIXED_PROFILE,
+                _FIXED_PROFILE,
+                _FIXED_PROFILE,
                 max_turns=12,
                 permission_mode="bypassPermissions",
                 verify_timeout=300,
@@ -238,6 +244,8 @@ class TestFixRunBudget:
             feature_id,
             lane_id,
             _FIXED_PROFILE,
+            _FIXED_PROFILE,
+            _FIXED_PROFILE,
             max_turns=12,
             permission_mode="bypassPermissions",
             verify_timeout=300,
@@ -251,6 +259,66 @@ class TestFixRunBudget:
         assert reappeared["status"] == "reappeared"
         assert reappeared["triage"] is None
         assert reappeared["triage_history"][-1]["action"] == "request_fix"
+
+
+# Three distinguishable profiles for the per-leg routing test (ticket 03:
+# fix-run uses each leg's role default -> each leg must receive its own profile).
+_IMPLEMENT_PROFILE = AgentProfile(
+    name="codex-default", cli="codex", backend="openai", auth_env="OPENAI_API_KEY",
+)
+_REVIEWER_PROFILE = AgentProfile(
+    name="cc-glm52", cli="claude", backend="glm", auth_env="CC_GLM52_TOKEN",
+)
+_SPEC_GAP_PROFILE = AgentProfile(
+    name="cc-minimaxm3", cli="claude", backend="minimax", auth_env="CC_MINIMAXM3_TOKEN",
+)
+
+
+class TestFixRunPerLegProfiles:
+    """ticket 03: fix-run routes a distinct profile to each leg (per-leg role
+    defaults), not one profile shared across the chain. The CLI resolves the
+    three role defaults; ``run_fix_run`` must hand each leg its own profile.
+    """
+
+    def test_each_leg_receives_its_own_profile(self, repo_root: Path) -> None:
+        feature_id, lane_id = _seed_frozen_feature(repo_root, tasks=["TASK-001"])
+        _stage_request_fix_issue(repo_root, feature_id)
+
+        received: dict[str, str] = {}
+
+        def _capture_implement(*args: Any, **kwargs: Any) -> ImplementerLegResult:
+            received["implement"] = args[3].name
+            return _implement_result(feature_id, lane_id, _passing_validation("RUN-001"))
+
+        def _capture_reviewer(*args: Any, **kwargs: Any) -> CheckingLegResult:
+            received["reviewer"] = args[3].name
+            return _checking_result(repo_root, feature_id, lane_id, "RUN-002", "code_review")
+
+        def _capture_spec_gap(*args: Any, **kwargs: Any) -> CheckingLegResult:
+            received["spec_gap"] = args[3].name
+            return _checking_result(repo_root, feature_id, lane_id, "RUN-003", "spec_gap")
+
+        run_fix_run(
+            repo_root,
+            feature_id,
+            lane_id,
+            _IMPLEMENT_PROFILE,
+            _REVIEWER_PROFILE,
+            _SPEC_GAP_PROFILE,
+            max_turns=12,
+            permission_mode="bypassPermissions",
+            verify_timeout=300,
+            implement_leg=_capture_implement,
+            reviewer_leg=_capture_reviewer,
+            spec_gap_leg=_capture_spec_gap,
+            verifier_leg=lambda *a, **kw: _verifier_result(repo_root, feature_id, lane_id),
+        )
+
+        assert received == {
+            "implement": "codex-default",
+            "reviewer": "cc-glm52",
+            "spec_gap": "cc-minimaxm3",
+        }
 
 
 def test_fix_run_cli_dispatches_and_prints_summary(

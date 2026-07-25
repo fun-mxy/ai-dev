@@ -1,12 +1,25 @@
-"""Claude Code headless wrapper - env isolation, invocation, capture (ticket 03).
+"""Agent-run wrapper - env isolation, invocation, capture (ticket 03 + ADR-0005).
 
-The wrapper is the v0.1 run-adapter's execution seam: given a prepared
-``RUN-NNN`` directory (ticket 02's ``prepare_run``) and a parsed ``AgentProfile``
-(ticket 01's ``load_profile``), it builds a self-contained prompt, isolates the
-child environment (§10.3), invokes ``claude -p`` headless with the §11.1 hard
-flags, captures stdout/stderr, computes ``changed_files`` (§13.2/§14.2), and
-writes ``metadata.json`` (§13.2). It is the deterministic Python runtime
-standing between ``prepare_run`` and ticket 04's ``validate-run``.
+The wrapper is the run-adapter's execution seam: given a prepared ``RUN-NNN``
+directory (``prepare_run``) and a parsed ``AgentProfile`` (``load_profile``), it
+builds a self-contained prompt, isolates the child environment (§10.3), invokes
+the profile's CLI headless, captures stdout/stderr, computes ``changed_files``
+(§13.2/§14.2), and writes ``metadata.json`` (§13.2). It is the deterministic
+Python runtime standing between ``prepare_run`` and ``validate-run``.
+
+ADR-0005 (v0.5 ticket 02) made the wrapper multi-CLI: ``run_headless`` is now a
+thin dispatcher that resolves an ``AgentRunner`` adapter from ``profile.cli``
+(D1/D2) and delegates the adapter-specific steps - child-env build (strip +
+inject), argv build, capture, and the ``changed_files`` wrapper-owned subtract
+set. ``ClaudeRunner`` is the v0.0-v0.4 behavior extracted (behavior-identical);
+``CodexRunner`` is the codex adapter (``codex exec -``, ``-s workspace-write``).
+The shared orchestration (run-dir precondition, token-source resolution,
+snapshot diff, metadata, audit) stays in ``run_headless``. The claude-specific
+helpers (``STRIP_VARS`` / ``inject_profile_env`` / ``build_cli_flags`` /
+``render_env_snapshot`` / ``WRAPPER_OWNED_RE``) remain at module scope - the
+``ClaudeRunner`` delegates to them, so the existing claude tests exercise the
+exact same code path.
+
 
 The prototype ``prototype/adapter/run.sh`` is the seed: this module ports its
 ``snapshot_tree`` / env-snapshot / changed-file-diff / metadata logic into the
@@ -29,6 +42,7 @@ kept out of this module so the two tickets do not entangle.
 
 from __future__ import annotations
 
+import abc
 import json
 import os
 import re
@@ -164,6 +178,44 @@ def build_child_env(
     return inject_profile_env(env, profile, token_value)
 
 
+# The var-name grep patterns for each adapter's env snapshot. The snapshot
+# proves the token was injected: it lists every CLI-relevant var present in the
+# child env, each value redacted to ``=<set>``. claude reads ``ANTHROPIC_*``;
+# codex reads ``OPENAI_API_KEY`` (OpenAI provider) plus any ``CODEX_*`` / ``AI_``
+# var. case-insensitive, like the prototype's ``env | grep -iE '...'``.
+_CLAUDE_SNAPSHOT_RE: re.Pattern[str] = re.compile(r"claude|anthropic|^AI_", re.IGNORECASE)
+_CODEX_SNAPSHOT_RE: re.Pattern[str] = re.compile(r"openai|codex|^AI_", re.IGNORECASE)
+
+
+def _render_snapshot(
+    child_env: Mapping[str, str],
+    profile: AgentProfile,
+    token_source: str | None,
+    timestamp: str | None,
+    label: str,
+    pattern: re.Pattern[str],
+) -> str:
+    """Render a redacted child-env snapshot for one adapter (names only).
+
+    Shared core behind ``render_env_snapshot`` (claude) and
+    ``render_codex_env_snapshot``: ``label`` names the engine in the header line,
+    ``pattern`` selects which var names survive the redaction grep. Every
+    captured value is replaced with ``<set>`` so the snapshot proves a var is
+    present without leaking its value (§10.2). The header records the profile
+    name, ``base_url``, ``model`` and the token *source* name (never the value),
+    matching the prototype's ``env-snapshot.txt`` shape.
+    """
+    stamp = timestamp if timestamp is not None else utc_now_iso()
+    header = (
+        f"# Child {label} env snapshot (names only; values redacted) - {stamp}\n"
+        f"# profile={profile.name} base_url={profile.base_url} "
+        f"model={profile.model} token_src={token_source}"
+    )
+    rows = sorted(k for k in child_env if pattern.search(k))
+    body = "\n".join(f"{k}={_REDACTED}" for k in rows)
+    return f"{header}\n{body}\n" if body else f"{header}\n"
+
+
 def render_env_snapshot(
     child_env: Mapping[str, str],
     profile: AgentProfile,
@@ -175,22 +227,32 @@ def render_env_snapshot(
     Captures every ``claude``/``anthropic``/``AI_`` var present in the child env
     (the set the Claude CLI actually reads), each value replaced with
     ``<set>``. After ``build_child_env`` this is exactly the three target vars;
-    any extra entry would betray a strip miss. The header records the profile
-    name, ``base_url``, ``model`` and the token *source* name (never the value),
-    matching the prototype's ``env-snapshot.txt`` shape.
+    any extra entry would betray a strip miss.
     """
-    stamp = timestamp if timestamp is not None else utc_now_iso()
-    header = (
-        f"# Child claude env snapshot (names only; values redacted) - {stamp}\n"
-        f"# profile={profile.name} base_url={profile.base_url} "
-        f"model={profile.model} token_src={token_source}"
+    return _render_snapshot(
+        child_env, profile, token_source, timestamp, "claude", _CLAUDE_SNAPSHOT_RE
     )
-    # case-insensitive match against claude|anthropic|^AI_, like the prototype's
-    # ``env | grep -iE 'claude|anthropic|^AI_'``.
-    pattern = re.compile(r"claude|anthropic|^AI_", re.IGNORECASE)
-    rows = sorted(k for k in child_env if pattern.search(k))
-    body = "\n".join(f"{k}={_REDACTED}" for k in rows)
-    return f"{header}\n{body}\n" if body else f"{header}\n"
+
+
+def render_codex_env_snapshot(
+    child_env: Mapping[str, str],
+    profile: AgentProfile,
+    token_source: str | None,
+    timestamp: str | None = None,
+) -> str:
+    """Render the codex child-env snapshot - NAMES ONLY, values redacted.
+
+    The codex analogue of ``render_env_snapshot``: greps ``openai``/``codex``/
+    ``AI_`` (the vars codex reads - ``OPENAI_API_KEY`` on the OpenAI-provider
+    path, any ``CODEX_*`` config) so the snapshot proves the token was injected
+    by name without leaking its value (§10.2, invariant #11). When the token
+    source is unset (custom-provider / stored-cred path, D3 amended) the header
+    still records ``token_src=None`` and the body is empty - honest about the
+    no-injection path.
+    """
+    return _render_snapshot(
+        child_env, profile, token_source, timestamp, "codex", _CODEX_SNAPSHOT_RE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +269,24 @@ WRAPPER_OWNED_RE: re.Pattern[str] = re.compile(
     r"^output/(stdout\.log|stderr\.log|metadata\.json|env-snapshot\.txt|"
     r"\.run-settings\.json)$"
 )
+
+# The codex adapter's wrapper-owned subtract set: codex writes no
+# ``.run-settings.json`` (no ``--settings`` analogue; ``--ephemeral`` is the
+# session-persistence hygiene flag, carried in argv). So it is the claude set
+# minus the settings file - stdout/stderr/metadata/env-snapshot only.
+CODEX_WRAPPER_OWNED_RE: re.Pattern[str] = re.compile(
+    r"^output/(stdout\.log|stderr\.log|metadata\.json|env-snapshot\.txt)$"
+)
+
+# Compiler-emitted Python bytecode cache - subtracted from the diff regardless of
+# adapter, alongside the adapter's wrapper-owned set. A ``.pyc`` under
+# ``__pycache__/`` is a non-deterministic build artifact (its name stamps the
+# Python/pytest version, e.g. ``test_x.cpython-312-pytest-9.1.1.pyc``), emitted
+# when the agent imports or runs the module during implementation - it is never
+# source the agent *authors*. Excluding it keeps ``changed_files`` (and thus the
+# §14.2 boundary check + the final-report Q1 traceability index) to authored
+# files only. Shared across adapters because any Python-touching run may emit it.
+_BUILD_ARTIFACT_RE: re.Pattern[str] = re.compile(r"(^|/)__pycache__/.*\.pyc$")
 
 
 def snapshot_tree(run_dir: Path) -> dict[str, tuple[int, int]]:
@@ -244,14 +324,21 @@ def compute_changed_files(
     ``(size, mtime_ns)`` tuple that differs from ``before`` (new or modified).
     Wrapper-owned artifacts (matched by ``wrapper_owned``) are subtracted even
     when new, so stdout/stderr/metadata/snapshots/settings never pollute the
-    list. Deletions (in ``before``, gone in ``after``) are not reported - the
-    list captures what the agent wrote, not what it removed. Sorted for
-    diff-stable output matching the prototype.
+    list. Compiler-emitted Python bytecode (``__pycache__/*.pyc``, matched by
+    ``_BUILD_ARTIFACT_RE``) is subtracted too, regardless of adapter: it is a
+    non-deterministic build artifact the toolchain emits when a module is
+    imported, never source the agent authors - so it stays out of both the
+    boundary check and the final-report traceability index. Deletions (in
+    ``before``, gone in ``after``) are not reported - the list captures what the
+    agent wrote, not what it removed. Sorted for diff-stable output matching the
+    prototype.
     """
     changed = [
         path
         for path, meta in after.items()
-        if not wrapper_owned.search(path) and before.get(path) != meta
+        if not wrapper_owned.search(path)
+        and not _BUILD_ARTIFACT_RE.search(path)
+        and before.get(path) != meta
     ]
     return sorted(changed)
 
@@ -453,6 +540,325 @@ def _resolve_claude(claude_path: str | None) -> str:
     return resolved
 
 
+# ---------------------------------------------------------------------------
+# ADR-0005: AgentRunner strategy per ``profile.cli`` (D1). Each adapter owns
+# child-env build (strip + inject), argv build, stdout/stderr/exit capture, and
+# the wrapper-owned subtract set for ``changed_files``. ``run_headless`` is the
+# thin dispatcher: it resolves the adapter from ``profile.cli`` (D2) and
+# delegates the adapter-specific steps, keeping the shared orchestration
+# (run-dir precondition, token-source resolution, snapshot diff, metadata,
+# audit) in one place.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Invocation:
+    """An adapter-built CLI invocation: argv + optional stdin prompt.
+
+    ``stdin`` is ``None`` when the prompt rides in argv (claude ``-p <prompt>``);
+    a string when the prompt is piped on stdin (codex ``exec -``). The
+    dispatcher passes ``input=stdin`` to ``subprocess.run`` only when stdin is
+    set, so the claude path (no stdin) inherits the parent stdin exactly as
+    before - only the codex path pipes the prompt.
+    """
+
+    argv: list[str]
+    stdin: str | None = None
+
+
+class AgentRunner(abc.ABC):
+    """Per-CLI invocation adapter (ADR-0005 D1).
+
+    Subclasses are registered under their ``cli`` key and resolved by
+    ``get_runner`` from ``profile.cli``. The adapter owns the invocation
+    contract (binary, flags, prompt mode, sandbox) and the env-injection shape;
+    ``backend`` / ``auth_env`` / ``model`` are profile fields the adapter maps
+    onto env/argv uniformly (D2 - dispatch is on ``cli``, not ``backend``).
+    """
+
+    # The registry key (``profile.cli``); subclasses set this to ``"claude"`` /
+    # ``"codex"``. The registry is keyed by it (D2).
+    cli: str
+    # Whether a resolved env token is mandatory before spawning. claude has no
+    # non-env auth path, so it fails loud (§24.2) when the token source is unset;
+    # codex may fall back to stored ``~/.codex/auth.json`` (D3 amended), so its
+    # token is optional.
+    token_required: bool
+    # Regex subtracting this adapter's wrapper-owned output artifacts from
+    # ``changed_files`` (stdout/stderr/metadata/env-snapshot, plus the claude
+    # settings file).
+    wrapper_owned_re: re.Pattern[str]
+
+    @abc.abstractmethod
+    def compose_child_env(
+        self,
+        profile: AgentProfile,
+        parent_env: Mapping[str, str],
+        token_source: str | None,
+        token_value: str,
+    ) -> dict[str, str]:
+        """Build the child env: strip parent identity, inject profile + token."""
+
+    @abc.abstractmethod
+    def prepare_prerun(
+        self,
+        *,
+        output_dir: Path,
+        child_env: Mapping[str, str],
+        profile: AgentProfile,
+        token_source: str | None,
+        started: str,
+    ) -> None:
+        """Write adapter-specific pre-run artifacts before the before-snapshot.
+
+        Both adapters write the redacted env snapshot; claude additionally
+        writes the §14.2 auto-memory-off ``.run-settings.json``. These land
+        before ``snapshot_tree`` so they are present (and unchanged) in the
+        before-snapshot and subtracted by ``wrapper_owned_re``.
+        """
+
+    @abc.abstractmethod
+    def resolve_binary(self, override: str | None) -> str:
+        """Resolve the CLI binary (override or ``PATH``); fail loud if missing."""
+
+    @abc.abstractmethod
+    def build_invocation(
+        self,
+        *,
+        profile: AgentProfile,
+        output_dir: Path,
+        binary: str,
+        max_turns: int,
+        permission_mode: str,
+        prompt: str,
+    ) -> Invocation:
+        """Build the argv (+ optional stdin prompt) for the CLI."""
+
+
+class ClaudeRunner(AgentRunner):
+    """The claude CLI adapter - the v0.0-v0.4 behavior, extracted (D1).
+
+    Behavior-identical to the pre-dispatch ``run_wrapper``: the same
+    ``ANTHROPIC_*`` env injection, the same §11.1 flag set (incl ``--verbose``
+    and ``--settings``), prompt as a ``-p`` arg. Delegates to the module-level
+    helpers (``build_child_env`` / ``render_env_snapshot`` /
+    ``auto_memory_settings`` / ``build_cli_flags`` / ``_resolve_claude``) so the
+    existing claude tests exercise the exact same code path.
+    """
+
+    cli = "claude"
+    token_required = True
+    wrapper_owned_re = WRAPPER_OWNED_RE
+
+    def compose_child_env(
+        self,
+        profile: AgentProfile,
+        parent_env: Mapping[str, str],
+        token_source: str | None,
+        token_value: str,
+    ) -> dict[str, str]:
+        # ``token_source`` is guaranteed non-None here (``token_required`` made
+        # the dispatcher fail loud before reaching this); the shared
+        # ``build_child_env`` only needs the value, so ``token_source`` is unused
+        # on this path - kept in the signature for interface uniformity.
+        return build_child_env(profile, parent_env, token_value)
+
+    def prepare_prerun(
+        self,
+        *,
+        output_dir: Path,
+        child_env: Mapping[str, str],
+        profile: AgentProfile,
+        token_source: str | None,
+        started: str,
+    ) -> None:
+        env_snapshot_path = output_dir / _ENV_SNAPSHOT
+        env_snapshot_path.write_text(
+            render_env_snapshot(child_env, profile, token_source, started)
+        )
+        settings_path = output_dir / _RUN_SETTINGS
+        settings_path.write_text(json.dumps(auto_memory_settings(), indent=2) + "\n")
+
+    def resolve_binary(self, override: str | None) -> str:
+        return _resolve_claude(override)
+
+    def build_invocation(
+        self,
+        *,
+        profile: AgentProfile,
+        output_dir: Path,
+        binary: str,
+        max_turns: int,
+        permission_mode: str,
+        prompt: str,
+    ) -> Invocation:
+        # claude flags are profile-agnostic (model via ANTHROPIC_MODEL env, not a
+        # flag - ticket 03 inline decision); the settings path is the only
+        # output-dir-derived arg. ``profile`` is unused on this path.
+        settings_path = output_dir / _RUN_SETTINGS
+        flags = build_cli_flags(settings_path, max_turns, permission_mode)
+        return Invocation(argv=[binary, "-p", prompt, *flags], stdin=None)
+
+
+# The codex CLI binary name resolved when the caller passes no override.
+_CODEX_BIN = "codex"
+
+# ADR-0005 D4 (spike-amended): the engine sandbox confines writes to cwd (the
+# run dir); ``workspace-write`` = ``[workdir, /tmp, $TMPDIR]``. §14.2 stays the
+# fine-grained allowlist on top - defense in depth.
+_CODEX_SANDBOX = "workspace-write"
+
+
+def _resolve_codex(codex_path: str | None) -> str:
+    """Return the ``codex`` binary path, resolving from ``PATH`` if absent.
+
+    Mirrors ``_resolve_claude``: an explicit override (tests pass a fake binary)
+    wins; otherwise the real CLI is located via ``shutil.which``. Fails loud
+    (§24.2) when the binary is not on ``PATH`` - a headless codex run cannot
+    proceed without it.
+    """
+    if codex_path is not None:
+        return codex_path
+    resolved = shutil.which(_CODEX_BIN)
+    if resolved is None:
+        raise ValueError(
+            f"codex CLI not found on PATH (pass a binary path override or "
+            f"install codex)"
+        )
+    return resolved
+
+
+class CodexRunner(AgentRunner):
+    """The codex CLI adapter (ADR-0005 D2/D3/D4/D5).
+
+    Thin adapter (D5): it only invokes + captures; it never translates codex's
+    native diff/patch into ``result.json``. The role prompts (reused verbatim
+    via ``build_prompt``) instruct codex to write the §13 contract at the
+    declared paths, exactly as claude does - the spike (ticket 01) verified
+    codex honors that prompt-written contract.
+
+    Auth (D3 amended): ``--remote-auth-token-env`` is rejected by ``codex exec``
+    (TUI-only), so it is NOT in the argv. For the OpenAI provider the token is
+    injected onto ``profile.auth_env`` (``OPENAI_API_KEY``) - the same
+    env-injection pattern claude uses for ``ANTHROPIC_AUTH_TOKEN``; for custom
+    providers codex uses stored ``~/.codex/auth.json`` (no env token, no
+    fail-loud - ``token_required`` is False). Either way invariant #11 holds: no
+    token value sits in profile config.
+
+    Sandbox (D4 amended): ``-s workspace-write`` with ``cwd`` = the run dir (set
+    by the dispatcher), so RUN-level ``output/result.json`` is writable and
+    writes are confined to the run dir. ``--ephemeral`` suppresses ``~/.codex/``
+    session persistence (the codex analogue of claude's
+    ``--settings autoMemoryEnabled=false``, §14.2).
+    """
+
+    cli = "codex"
+    token_required = False
+    wrapper_owned_re = CODEX_WRAPPER_OWNED_RE
+
+    def compose_child_env(
+        self,
+        profile: AgentProfile,
+        parent_env: Mapping[str, str],
+        token_source: str | None,
+        token_value: str,
+    ) -> dict[str, str]:
+        # Strip the shared §10.3 hygiene baseline (claude identity vars + the
+        # profile's env_strip_pattern); harmless for codex in a pure-codex env
+        # and correct hygiene when the orchestrator nests inside a claude
+        # session. ``extra_env`` is applied before the token so a resolved token
+        # always wins.
+        env = strip_parent_identity(parent_env, profile)
+        for key, value in profile.extra_env.items():
+            env[key] = value
+        # OpenAI-provider path: inject the token onto ``profile.auth_env``
+        # (e.g. OPENAI_API_KEY), mirroring claude's ANTHROPIC_AUTH_TOKEN
+        # injection. Custom-provider path: ``token_source`` is None -> no
+        # injection; codex resolves auth from ~/.codex/auth.json.
+        if token_source is not None and token_value:
+            env[profile.auth_env] = token_value
+        return env
+
+    def prepare_prerun(
+        self,
+        *,
+        output_dir: Path,
+        child_env: Mapping[str, str],
+        profile: AgentProfile,
+        token_source: str | None,
+        started: str,
+    ) -> None:
+        env_snapshot_path = output_dir / _ENV_SNAPSHOT
+        env_snapshot_path.write_text(
+            render_codex_env_snapshot(child_env, profile, token_source, started)
+        )
+        # No settings file: codex has no --settings analogue; --ephemeral (in
+        # argv) is the session-persistence hygiene flag.
+
+    def resolve_binary(self, override: str | None) -> str:
+        return _resolve_codex(override)
+
+    def build_invocation(
+        self,
+        *,
+        profile: AgentProfile,
+        output_dir: Path,
+        binary: str,
+        max_turns: int,
+        permission_mode: str,
+        prompt: str,
+    ) -> Invocation:
+        # ``max_turns`` / ``permission_mode`` are claude flags; codex has no argv
+        # equivalent in the MVP (the spike ran without them). ``output_dir`` is
+        # unused too - codex writes no settings file. All three are kept in the
+        # signature for interface uniformity.
+        # ADR-0005 D2/D4 + spike amendments: ``codex exec -`` (prompt on stdin),
+        # ``-s workspace-write`` (engine sandbox; cwd=run_dir confines writes),
+        # ``--skip-git-repo-check`` + ``--color never`` (clean capture),
+        # ``--ephemeral`` (no ~/.codex/ session persistence). ``-m`` only when
+        # the profile declares a model. cwd is set by the dispatcher to run_dir.
+        argv: list[str] = [
+            binary,
+            "exec",
+            "-",
+            "-s",
+            _CODEX_SANDBOX,
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--ephemeral",
+        ]
+        if profile.model is not None:
+            argv += ["-m", profile.model]
+        return Invocation(argv=argv, stdin=prompt)
+
+
+# The registry keyed by ``profile.cli`` (D1/D2). A 3rd+ profile (§27.3) becomes
+# one ``AgentRunner`` impl + one entry here - no ``run_headless`` surgery.
+_RUNNERS: dict[str, AgentRunner] = {
+    ClaudeRunner.cli: ClaudeRunner(),
+    CodexRunner.cli: CodexRunner(),
+}
+
+
+def get_runner(profile: AgentProfile) -> AgentRunner:
+    """Resolve the ``AgentRunner`` for ``profile.cli`` (ADR-0005 D1/D2).
+
+    Dispatch is on ``cli`` (the invocation contract), not ``backend``: a
+    ``cli: claude`` profile with any backend (glm / minimax / deepseek) resolves
+    ``ClaudeRunner``; a ``cli: codex`` profile resolves ``CodexRunner``. Fails
+    loud (§24.2) on an unknown ``cli`` so a misnamed profile surfaces at run
+    time, not as a silent claude fallback.
+    """
+    runner = _RUNNERS.get(profile.cli)
+    if runner is None:
+        raise ValueError(
+            f"no AgentRunner registered for cli={profile.cli!r} "
+            f"(profile {profile.name!r}); registered: {sorted(_RUNNERS)}"
+        )
+    return runner
+
+
 def run_headless(
     repo_root: Path,
     feature_id: str,
@@ -461,6 +867,7 @@ def run_headless(
     *,
     max_turns: int = DEFAULT_MAX_TURNS,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
+    cli_path: str | None = None,
     claude_path: str | None = None,
     started_at: str | None = None,
     ended_at: str | None = None,
@@ -468,14 +875,26 @@ def run_headless(
 ) -> RunResult:
     """Run a prepared ``RUN-NNN`` headless against ``profile`` and capture it.
 
-    Orchestrates the §10.3 -> §11.1 -> §13.2 flow: resolve the token source
-    (fail loud if unset, §24.2), build the isolated child env, persist the
-    redacted env snapshot + the §14.2 auto-memory-off settings, snapshot the
-    RUN tree, invoke ``claude -p`` with the §11.1 flags (cwd = run dir, env =
-    child env, stdout/stderr captured to files), snapshot again, compute
-    ``changed_files`` (subtracting wrapper-owned artifacts), write
-    ``metadata.json``, and append a ``run`` audit event. Returns the captured
-    facts as a ``RunResult``.
+    Thin dispatcher (ADR-0005 D1): resolves the ``AgentRunner`` for
+    ``profile.cli`` and delegates the adapter-specific steps (child-env build,
+    pre-run artifacts, argv, capture), keeping the shared orchestration - run-dir
+    precondition, token-source resolution, before/after snapshot diff,
+    ``metadata.json``, and the ``run`` audit event - in one place.
+
+    Orchestrates the §10.3 -> §11 -> §13.2 flow: resolve the token source (fail
+    loud if unset for a token-required adapter, §24.2), build the isolated child
+    env via the adapter, persist the redacted env snapshot (+, for claude, the
+    §14.2 auto-memory-off settings), snapshot the RUN tree, invoke the CLI (cwd =
+    run dir, env = child env, stdout/stderr captured to files; prompt in argv for
+    claude, on stdin for codex), snapshot again, compute ``changed_files``
+    (subtracting the adapter's wrapper-owned artifacts), write ``metadata.json``,
+    and append a ``run`` audit event. Returns the captured facts as a
+    ``RunResult``.
+
+    ``cli_path`` is the generic CLI binary override (preferred for new callers);
+    ``claude_path`` is kept as a backward-compatible alias (existing callers and
+    tests pass it). Whichever is set wins; the adapter resolves it onto its own
+    binary (``claude`` / ``codex``).
 
     The token *value* is read from ``os.environ`` by source name and lives only
     in the in-memory child env passed to the subprocess - it is on no returned
@@ -483,10 +902,12 @@ def run_headless(
     default to ``utc_now_iso()`` captured around the subprocess; both are
     injectable for deterministic tests.
     """
-    # Resolve to absolute up front: ``claude -p`` is spawned with ``cwd`` = this
-    # run dir and re-resolves its ``--settings`` argument relative to that cwd,
-    # so a relative ``repo_root`` (ticket-05's ``cd examples/string-utils`` +
-    # relative ``--repo-root``) makes the lookup fail with "Settings file not
+    runner = get_runner(profile)
+
+    # Resolve to absolute up front: the CLI is spawned with ``cwd`` = this run
+    # dir and (claude) re-resolves its ``--settings`` argument relative to that
+    # cwd, so a relative ``repo_root`` (ticket-05's ``cd examples/string-utils``
+    # + relative ``--repo-root``) makes the lookup fail with "Settings file not
     # found". Absolute here covers ``cwd`` + ``--settings`` + the prompt's
     # working-directory string at once; RUN-relative ``changed_files`` are
     # unaffected (``relpath`` over an absolute base yields the same keys).
@@ -502,60 +923,92 @@ def run_headless(
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     # §10.2/§10.3: resolve the token source NAME, then read the value from the
-    # live env. No source -> fail loud before any subprocess is spawned.
+    # live env. A token-required adapter (claude) fails loud before any subprocess
+    # is spawned; codex (token_required=False) may proceed without one (stored
+    # ~/.codex/auth.json, D3 amended).
     token_source = token_source_var(profile)
-    if token_source is None:
-        raise ValueError(
-            f"token source not set for profile {profile.name!r} "
-            f"({profile.token_source_description()} is unset); set it before "
-            f"running (§24.2)"
-        )
-    # ``.get`` + re-check closes the window between ``token_source_var`` and the
-    # read: a var deleted in the race surfaces as a clean ValueError (§24.2),
-    # not a KeyError traceback. An empty value is no credential (matches
-    # ``token_source_var``'s non-empty test).
-    token_value = os.environ.get(token_source, "")
-    if not token_value:
-        raise ValueError(
-            f"token source {token_source!r} for profile {profile.name!r} "
-            f"is not set; set it before running (§24.2)"
-        )
+    token_value = os.environ.get(token_source, "") if token_source is not None else ""
+    if runner.token_required:
+        if token_source is None:
+            raise ValueError(
+                f"token source not set for profile {profile.name!r} "
+                f"({profile.token_source_description()} is unset); set it before "
+                f"running (§24.2)"
+            )
+        # ``.get`` + re-check closes the window between ``token_source_var`` and
+        # the read: a var deleted in the race surfaces as a clean ValueError
+        # (§24.2), not a KeyError traceback. An empty value is no credential
+        # (matches ``token_source_var``'s non-empty test).
+        if not token_value:
+            raise ValueError(
+                f"token source {token_source!r} for profile {profile.name!r} "
+                f"is not set; set it before running (§24.2)"
+            )
 
-    child_env = build_child_env(profile, dict(os.environ), token_value)
+    child_env = runner.compose_child_env(
+        profile, dict(os.environ), token_source, token_value
+    )
 
     started = started_at if started_at is not None else utc_now_iso()
 
-    # Persist the §10.3 env snapshot (redacted) and the §14.2 settings file
-    # BEFORE the before-snapshot so both are present (unchanged) in it.
-    env_snapshot_path = output_dir / _ENV_SNAPSHOT
-    env_snapshot_path.write_text(
-        render_env_snapshot(child_env, profile, token_source, started)
+    # Adapter-specific pre-run artifacts (env snapshot +, for claude, the §14.2
+    # settings file) are written BEFORE the before-snapshot so they are present
+    # (unchanged) in it and subtracted from ``changed_files``.
+    runner.prepare_prerun(
+        output_dir=output_dir,
+        child_env=child_env,
+        profile=profile,
+        token_source=token_source,
+        started=started,
     )
-    settings_path = output_dir / _RUN_SETTINGS
-    settings_path.write_text(json.dumps(auto_memory_settings(), indent=2) + "\n")
 
     before = snapshot_tree(run_root)
 
     prompt = build_prompt(run_id, run_root)
-    flags = build_cli_flags(settings_path, max_turns, permission_mode)
-    argv = [_resolve_claude(claude_path), "-p", prompt, *flags]
+    binary = runner.resolve_binary(cli_path if cli_path is not None else claude_path)
+    invocation = runner.build_invocation(
+        profile=profile,
+        output_dir=output_dir,
+        binary=binary,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        prompt=prompt,
+    )
 
     stdout_path = output_dir / _STDOUT_LOG
     stderr_path = output_dir / _STDERR_LOG
+    # The two branches return ``CompletedProcess[str]`` (codex, ``text=True``)
+    # vs ``CompletedProcess[bytes]`` (claude, no ``text``); only ``.returncode``
+    # (non-generic) is read, so the union is precise without a cast.
+    completed: subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]
     with stdout_path.open("w") as out_f, stderr_path.open("w") as err_f:
-        completed = subprocess.run(
-            argv,
-            cwd=str(run_root),
-            env=child_env,
-            stdout=out_f,
-            stderr=err_f,
-        )
+        if invocation.stdin is not None:
+            # codex: prompt piped on stdin (``codex exec -``).
+            completed = subprocess.run(
+                invocation.argv,
+                cwd=str(run_root),
+                env=child_env,
+                stdout=out_f,
+                stderr=err_f,
+                input=invocation.stdin,
+                text=True,
+            )
+        else:
+            # claude: prompt rides in argv (``-p <prompt>``); stdin is inherited
+            # exactly as before the dispatch refactor.
+            completed = subprocess.run(
+                invocation.argv,
+                cwd=str(run_root),
+                env=child_env,
+                stdout=out_f,
+                stderr=err_f,
+            )
     exit_code = completed.returncode
 
     ended = ended_at if ended_at is not None else utc_now_iso()
 
     after = snapshot_tree(run_root)
-    changed_files = compute_changed_files(before, after, WRAPPER_OWNED_RE)
+    changed_files = compute_changed_files(before, after, runner.wrapper_owned_re)
 
     metadata_path = output_dir / METADATA_JSON
     write_metadata(

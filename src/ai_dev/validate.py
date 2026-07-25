@@ -1,13 +1,15 @@
-"""Deterministic three-check run validation (ticket 04, spec §14).
+"""Deterministic run validation (ticket 04, spec §14).
 
-After every run the wrapper must execute three deterministic checks - schema
-(§14.1), file boundary (§14.2), and frozen artifact (§14.3) - and decide
-PASS/FAIL. This module is that decision: a pure, model-free reader of the
-captured run artifacts (``output/result.json``, ``output/metadata.json``,
-``input/output-schema.json``, ``input/allowed-files.txt``) plus the feature
-run's frozen status. The prototype ``prototype/adapter/validate.py`` is the
-seed; this ports its schema + boundary checks into the typed data plane and
-adds the §14.3 frozen seam the prototype skipped.
+After every run the wrapper must execute the deterministic §14 checks - schema
+(§14.1), file boundary (§14.2), frozen artifact (§14.3), and traceability
+declaration (§14.4) - and decide PASS/FAIL. This module is that decision: a
+pure, model-free reader of the captured run artifacts (``output/result.json``,
+``output/metadata.json``, ``input/output-schema.json``,
+``input/allowed-files.txt``) plus the feature run's frozen status and
+requirements doc. The prototype ``prototype/adapter/validate.py`` is the seed;
+this ports its schema + boundary checks into the typed data plane and adds the
+§14.3 frozen seam the prototype skipped, plus the §14.4 traceability seam
+(ADR-0007 D2).
 
 Scope split with ``run_wrapper`` (ticket 03): the wrapper *captures* a run; it
 does not *judge* it. Judgement lives here. ``validate_run`` reads what the
@@ -35,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
 from ai_dev.audit import append_audit_event
+from ai_dev.json_artifact import read_json_object
 from ai_dev.paths import (
     INPUT_DIR,
     METADATA_JSON,
@@ -43,7 +46,7 @@ from ai_dev.paths import (
     feature_dir,
     run_dir,
 )
-from ai_dev.run_prepare import ALLOWED_FILES_FILE, OUTPUT_SCHEMA_FILE
+from ai_dev.run_prepare import ALLOWED_FILES_FILE, OUTPUT_SCHEMA_FILE, ROLE_FILE
 from ai_dev.status import frozen_artifacts_status
 from ai_dev.templates import (
     DESIGN_JSON,
@@ -51,19 +54,29 @@ from ai_dev.templates import (
     LANE_GRAPH_YML,
     REQUIREMENTS_JSON,
     REQUIREMENTS_MD,
+    TASKS_JSON,
     TASKS_MD,
 )
 
-# The three §14 checks, as a closed set for static typing and for the
+# The §14 checks, as a closed set for static typing and for the
 # ``failed_check`` priority ordering. A ``CheckName`` literal means mypy catches
 # a typo at the call site (§24.2 fail-loud at type-check time) rather than
-# silently constructing a bogus issue.
-CheckName = Literal["schema", "boundary", "frozen"]
+# silently constructing a bogus issue. The three classic checks (schema /
+# boundary / frozen) are joined by ``traceability`` (§14.4, ADR-0007 D2): an
+# implementer run must declare the REQs/ACs it addressed.
+CheckName = Literal["schema", "boundary", "frozen", "traceability"]
 Severity = Literal["P0", "P1", "P2", "P3"]
 
 # Severity-priority order for ``ValidationResult.failed_check`` (frozen outranks
-# boundary outranks schema, matching §15.1).
-_CHECKS_BY_PRIORITY: tuple[CheckName, ...] = ("frozen", "boundary", "schema")
+# boundary outranks schema outranks traceability, matching §15.1; a
+# traceability well-formedness finding is P1 like schema but ranked below it so
+# a broken result.json is blamed before its declaration is examined).
+_CHECKS_BY_PRIORITY: tuple[CheckName, ...] = (
+    "frozen",
+    "boundary",
+    "schema",
+    "traceability",
+)
 
 # §24.3: only schema / output-format failures may auto-retry once. These are the
 # agent-fixable schema failures (the agent can re-emit result.json correctly);
@@ -80,7 +93,7 @@ RETRYABLE_CODES: frozenset[str] = frozenset(
 _FROZEN_ARTIFACT_FILES: Mapping[str, tuple[str, ...]] = {
     "requirements": (REQUIREMENTS_MD, REQUIREMENTS_JSON),
     "design": (DESIGN_MD, DESIGN_JSON),
-    "tasks": (TASKS_MD,),
+    "tasks": (TASKS_MD, TASKS_JSON),
     "lane_graph": (LANE_GRAPH_YML,),
 }
 
@@ -101,7 +114,8 @@ class SchemaValidatorError(ValueError):
 class ValidationIssue:
     """One finding from one §14 check.
 
-    ``check`` is which of the three checks raised it (schema/boundary/frozen);
+    ``check`` is which of the §14 checks raised it
+    (schema/boundary/frozen/traceability);
     ``code`` is a stable machine-readable identifier (the retry decision keys
     off it via ``RETRYABLE_CODES``); ``severity`` follows §15.1 (schema findings
     are P1 - blocking by default, overridable; boundary and frozen findings are
@@ -574,7 +588,163 @@ def validate_frozen(
 
 
 # ---------------------------------------------------------------------------
-# validate_run: the pure three-check orchestrator.
+# §14.4 traceability-declaration validation (ADR-0007 D2).
+# ---------------------------------------------------------------------------
+
+# The only role required to declare coverage (§9.2 / ADR-0007 D2). The check
+# fires for this role alone; review / spec-gap / verifier runs carry a different
+# role.md and are skipped.
+_IMPLEMENTER_ROLE = "Implementer"
+
+# role.md is written by ``prepare_run`` as ``"You are the {role} for {run_id}."``
+# These delimiters pin the parse so a reworded role.md does not silently flip the
+# role (and thus silently drop the §14.4 check).
+_ROLE_MD_PREFIX = "You are the "
+_ROLE_MD_SUFFIX = " for "
+
+
+def read_run_role(run_root: Path) -> str | None:
+    """Read the run's role from ``input/role.md``; ``None`` if missing/unparseable.
+
+    role.md is the single canonical marker of which role a run executes (written
+    by ``prepare_run`` as ``"You are the {role} for {run_id}."``). The §14.4
+    traceability check applies to the Implementer role only, so the validator
+    reads it to decide whether to enforce the declaration. ``None`` (missing or
+    unrecognised role.md) means "cannot determine" - the traceability check is
+    skipped rather than failing loud, because role.md absence is not itself a
+    declaration breach (the schema check owns "result.json malformed").
+    """
+    path = run_root / INPUT_DIR / ROLE_FILE
+    if not path.is_file():
+        return None
+    text = path.read_text()
+    start = text.find(_ROLE_MD_PREFIX)
+    if start < 0:
+        return None
+    rest = text[start + len(_ROLE_MD_PREFIX):]
+    end = rest.find(_ROLE_MD_SUFFIX)
+    if end < 0:
+        return None
+    role = rest[:end].strip()
+    return role or None
+
+
+def _ids_from_requirements(req_doc: Mapping[str, Any] | None) -> tuple[list[str], list[str]]:
+    """Return ``(requirement_ids, acceptance_criterion_ids)`` from the req doc.
+
+    Mirrors ``final_report._requirement_ids`` / ``_acceptance_criterion_ids``:
+    the same id-extraction the Q2/Q3 projection uses, so §14.4 validates
+    declarations against exactly the id set the report would populate from. Kept
+    local (rather than imported) so the validator stays a lightweight pure reader
+    with no dependency on the final-report generator.
+    """
+    if not isinstance(req_doc, Mapping):
+        return [], []
+
+    def _ids(field: str) -> list[str]:
+        raw = req_doc.get(field)
+        if not isinstance(raw, list):
+            return []
+        ids: list[str] = []
+        for entry in raw:
+            if isinstance(entry, Mapping):
+                rid = entry.get("id")
+                if isinstance(rid, str) and rid:
+                    ids.append(rid)
+            elif isinstance(entry, str) and entry:
+                ids.append(entry)
+        return sorted(set(ids))
+
+    return _ids("requirements"), _ids("acceptance_criteria")
+
+
+def validate_traceability(
+    result: Mapping[str, Any] | None,
+    role: str | None,
+    req_ids: list[str],
+    ac_ids: list[str],
+) -> list[ValidationIssue]:
+    """§14.4 (ADR-0007 D2): an implementer run must declare its addressed REQs/ACs.
+
+    Fires **only for the Implementer role** and **only when the feature has
+    allocated requirements/ACs** - an empty spec (no REQ/AC allocated, e.g. a
+    freshly seeded or de-risking feature) has nothing to cover, so the check is
+    a no-op there (matching the "honestly empty when there is no spec" baseline).
+    When it fires, each declared field must be:
+
+    * **present** - a non-declaring run (the field absent) fails (the agent was
+      required to declare; ADR-0007 D2);
+    * **a list** - a non-list value is malformed (§24.2);
+    * **real** - every declared id must exist in ``01-requirements.json`` (a
+      reference to an id that was never allocated is a malformed declaration).
+
+    It does **not** require declaring *all* reqs - only the ones the lane
+    addressed (a partial-scope lane declares its own subset, possibly a single
+    REQ); an honest ``[]`` is well-formed (the Spec Gap Analyst, §9, is the
+    cross-check on whether the declaration is *complete*, ADR-0007 D3). A field
+    is required only when its id-set is non-empty (reqs-but-no-ACs does not
+    demand an AC declaration).
+    """
+    if role != _IMPLEMENTER_ROLE:
+        return []
+    if not req_ids and not ac_ids:
+        return []
+
+    issues: list[ValidationIssue] = []
+    fields = (
+        ("related_requirements", req_ids),
+        ("related_acceptance_criteria", ac_ids),
+    )
+    for field, real_ids in fields:
+        # Require the field only when the feature allocated ids of that kind.
+        if not real_ids:
+            continue
+        if result is None or field not in result:
+            issues.append(
+                ValidationIssue(
+                    check="traceability",
+                    code="traceability_missing",
+                    message=(
+                        f"implementer result.json did not declare {field!r}; "
+                        f"the implementer must declare the REQ/AC ids it "
+                        f"addressed (§14.4 / ADR-0007 D2)"
+                    ),
+                    severity="P1",
+                )
+            )
+            continue
+        value = result.get(field)
+        if not isinstance(value, list):
+            issues.append(
+                ValidationIssue(
+                    check="traceability",
+                    code="traceability_malformed",
+                    message=(
+                        f"{field!r} must be a list of ids, got "
+                        f"{type(value).__name__}"
+                    ),
+                    severity="P1",
+                )
+            )
+            continue
+        unknown = sorted({str(v) for v in value} - set(real_ids))
+        if unknown:
+            issues.append(
+                ValidationIssue(
+                    check="traceability",
+                    code="traceability_unknown_id",
+                    message=(
+                        f"{field!r} references id(s) {unknown} not present in "
+                        f"01-requirements.json (real ids: {real_ids})"
+                    ),
+                    severity="P1",
+                )
+            )
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# validate_run: the pure §14 orchestrator.
 # ---------------------------------------------------------------------------
 
 
@@ -586,18 +756,20 @@ def validate_run(
     attempt: int = 1,
     origin: str | None = None,
 ) -> ValidationResult:
-    """Run the §14 three deterministic checks against a captured run.
+    """Run the §14 deterministic checks against a captured run.
 
     Pure reader: loads ``output/result.json`` + ``output/metadata.json`` +
     ``input/output-schema.json`` + ``input/allowed-files.txt`` from the run
-    directory and the frozen status from the feature run's
-    ``status/feature-status.yml``, runs schema (§14.1) + boundary (§14.2) +
-    frozen (§14.3), and returns every issue found. No subprocess, no retry -
-    the §14.1 retry-once lives in ``validate_with_retry``, which drives this
-    function with ``attempt=1`` then ``attempt=2``. Appends one ``validate``
-    audit record (like every lifecycle op) carrying the verdict and the attempt
-    number, so a retry leaves two distinguishable records (attempt-1-failed,
-    attempt-2-passed/failed) rather than two identical-looking ones.
+    directory, the frozen status from the feature run's
+    ``status/feature-status.yml``, and the REQ/AC ids from
+    ``01-requirements.json``; runs schema (§14.1) + boundary (§14.2) + frozen
+    (§14.3) + traceability (§14.4), and returns every issue found. No subprocess,
+    no retry - the §14.1 retry-once lives in ``validate_with_retry``, which
+    drives this function with ``attempt=1`` then ``attempt=2``. Appends one
+    ``validate`` audit record (like every lifecycle op) carrying the verdict and
+    the attempt number, so a retry leaves two distinguishable records
+    (attempt-1-failed, attempt-2-passed/failed) rather than two identical-looking
+    ones.
 
     Raises ``ValueError`` (§24.2 fail loud) if the run directory or the feature
     run's status file is missing/malformed - ``validate-run`` needs a real run
@@ -626,7 +798,43 @@ def validate_run(
         changed_files or [], feature_root, run_root, frozen_status
     )
 
-    issues = schema_issues + boundary_issues + frozen_issues
+    # §14.4 (ADR-0007 D2): an implementer run over a feature with allocated
+    # requirements/ACs must declare the REQs/ACs it addressed. The parsed
+    # result is reused when schema-valid so a malformed result.json is not
+    # double-counted; a schema failure already fails the run louder.
+    role = read_run_role(run_root)
+    result_obj: Mapping[str, Any] | None = None
+    if not schema_issues:
+        try:
+            parsed = json.loads((output_dir / RESULT_JSON).read_text())
+            if isinstance(parsed, dict):
+                result_obj = parsed
+        except (json.JSONDecodeError, OSError):
+            result_obj = None
+    req_path = feature_root / REQUIREMENTS_JSON
+    req_doc = read_json_object(req_path)
+    req_ids, ac_ids = _ids_from_requirements(req_doc)
+    traceability_issues = validate_traceability(result_obj, role, req_ids, ac_ids)
+    # §24.2 fail-loud: a present-but-corrupt requirements doc is *not* a silent
+    # "empty spec" (which would legitimately no-op the check) - it hides whether
+    # the implementer's declarations are honest, so for an implementer run it
+    # fails loud rather than disabling §14.4. A genuinely missing doc (freshly
+    # seeded feature) stays a no-op.
+    if role == _IMPLEMENTER_ROLE and req_path.is_file() and req_doc is None:
+        traceability_issues.append(
+            ValidationIssue(
+                check="traceability",
+                code="traceability_requirements_corrupt",
+                message=(
+                    f"01-requirements.json at {req_path} is present but not a "
+                    f"valid JSON object; cannot validate traceability "
+                    f"declarations (§24.2)"
+                ),
+                severity="P1",
+            )
+        )
+
+    issues = schema_issues + boundary_issues + frozen_issues + traceability_issues
     result = ValidationResult(run_id=run_id, issues=issues, attempt=attempt)
 
     append_audit_event(

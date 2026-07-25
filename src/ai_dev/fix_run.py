@@ -170,7 +170,9 @@ def run_fix_run(
     repo_root: Path,
     feature_id: str,
     lane_id: str,
-    profile: AgentProfile,
+    implement_profile: AgentProfile,
+    reviewer_profile: AgentProfile,
+    spec_gap_profile: AgentProfile,
     *,
     max_turns: int,
     permission_mode: str,
@@ -188,6 +190,12 @@ def run_fix_run(
     ``fix_loop_budget`` is already exhausted. Budget/target writes happen only
     after the implement validation passes; checking/verification/collection are
     then run once as the ADR-0002 D8 bookend.
+
+    v0.5 ticket 03: each leg receives its own profile (per-leg role defaults),
+    not one shared profile - the implement leg runs on ``implement_profile``,
+    the two checking legs on ``reviewer_profile`` / ``spec_gap_profile``. The
+    CLI resolves the three from ``role_defaults`` (or one ``--profile`` override
+    applied to all three); this function just routes them.
     """
     feature_root = feature_dir(repo_root, feature_id)
     if not feature_root.is_dir():
@@ -213,7 +221,7 @@ def run_fix_run(
         repo_root,
         feature_id,
         lane_id,
-        profile,
+        implement_profile,
         max_turns=max_turns,
         permission_mode=permission_mode,
         task_context_append=_fix_task_context(targets),
@@ -227,7 +235,7 @@ def run_fix_run(
         repo_root,
         feature_id,
         lane_id,
-        profile,
+        reviewer_profile,
         max_turns=max_turns,
         permission_mode=permission_mode,
         origin=origin,
@@ -238,7 +246,7 @@ def run_fix_run(
         repo_root,
         feature_id,
         lane_id,
-        profile,
+        spec_gap_profile,
         max_turns=max_turns,
         permission_mode=permission_mode,
         origin=origin,

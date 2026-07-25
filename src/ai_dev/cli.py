@@ -126,6 +126,7 @@ import argparse
 import difflib
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -133,12 +134,19 @@ from ai_dev.checking_legs import CheckingLegResult, run_reviewer_leg, run_spec_g
 from ai_dev.coherence_gate import CoherenceResult, evaluate_coherence_gate
 from ai_dev.dry_run import (
     DryRunPlan,
+    plan_allocate_id,
     plan_coherence_gate,
+    plan_compare_profiles,
     plan_final_report,
     plan_fix_run,
     plan_freeze,
+    plan_project_github,
     plan_implement,
+    plan_generate_design,
+    plan_generate_requirements,
+    plan_generate_tasks,
     plan_lane_gate,
+    plan_render,
     plan_review,
     plan_run_headless,
     plan_spec_gap,
@@ -146,16 +154,46 @@ from ai_dev.dry_run import (
     render_plan,
 )
 from ai_dev.feature_run import create_feature_run
+from ai_dev.feature_ids import ID_TYPES, allocate_id
 from ai_dev.final_report import FinalReportResult, generate_final_report
 from ai_dev.fix_run import FixRunResult, run_fix_run
+from ai_dev.github_projection import (
+    GithubProjectionResult,
+    project_github,
+)
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
-from ai_dev.paths import feature_dir, features_dir, run_dir, runs_dir
+from ai_dev.coverage import freeze_gate_coverage
+from ai_dev.paths import feature_dir, features_dir, require_feature_root, run_dir, runs_dir
+from ai_dev.promote import (
+    FrozenArtifactWriteError,
+    RENDERABLE_ARTIFACTS,
+    RenderResult,
+    render_artifact,
+)
+from ai_dev.planner_leg import (
+    PlannerLegResult,
+    run_generate_design,
+    run_generate_requirements,
+    run_generate_tasks,
+)
+from ai_dev.profile_comparison import (
+    PROFILE_COMPARISON_JSON,
+    PROFILE_COMPARISON_MD,
+    ProfileComparisonResult,
+    generate_profile_comparison,
+)
 from ai_dev.profiles import (
+    AgentProfile,
     ProfileError,
+    ROLE_IMPLEMENTER,
+    ROLE_PLANNER,
+    ROLE_REVIEWER,
+    ROLE_SPEC_GAP_ANALYST,
     load_profile,
     render_profile,
+    resolve_profile_name,
     token_source_var,
 )
 from ai_dev.query import (
@@ -170,7 +208,12 @@ from ai_dev.query import (
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import DEFAULT_MAX_TURNS, DEFAULT_PERMISSION_MODE, run_headless
 from ai_dev.shell_verifier import CommandResult, run_verifier
-from ai_dev.status import FROZEN_ARTIFACTS, FrozenArtifactError, freeze_artifact
+from ai_dev.status import (
+    FROZEN_ARTIFACTS,
+    FrozenArtifactError,
+    freeze_artifact,
+    record_agent_profile,
+)
 from ai_dev.triage import DISPOSITIONS, TriageRefusedError, TriageResult, apply_triage
 from ai_dev.validate import ValidationIssue, validate_run
 
@@ -184,6 +227,7 @@ ORIGIN_REVIEW_LEG = "review-leg"
 ORIGIN_SPEC_GAP_LEG = "spec-gap-leg"
 ORIGIN_VERIFIER = "verifier"
 ORIGIN_FIX_RUN_DRIVER = "fix-run-driver"
+ORIGIN_PLANNER_LEG = "planner-leg"
 
 
 def _print_validation_issues(issues: Sequence[ValidationIssue]) -> None:
@@ -215,6 +259,39 @@ def _render_error(exc: BaseException, *, hint: str | None = None) -> None:
     print(f"error: {message}", file=sys.stderr)
     if hint:
         print(f"  hint: {hint}", file=sys.stderr)
+
+
+def _load_profile_or_render(repo_root: Path, name: str) -> AgentProfile | None:
+    """Load a profile by name; on ``ProfileError``, render it and return ``None``.
+
+    The cli's shared profile-load tail: handlers that need a loaded
+    ``AgentProfile`` wrap ``load_profile`` in the same try/except (no hint - a
+    missing profile file is not a did-you-mean situation). Returning ``None``
+    lets the caller exit 1 without re-spelling the except block. Callers that
+    load several profiles in one try (``fix-run``) keep their own block - this
+    helper is for the single-load case.
+    """
+    try:
+        return load_profile(repo_root, name)
+    except ProfileError as exc:
+        _render_error(exc)
+        return None
+
+
+def _exit_value_error(
+    repo_root: Path, feature_id: str, exc: BaseException, *, run_id: str | None = None
+) -> int:
+    """Render a precondition ``ValueError`` with a did-you-mean hint; return 1.
+
+    The cli's shared exit-1 tail: a §24.2 precondition failure (missing
+    feature/lane/run, unfrozen artifact, unknown id) surfaces as one
+    ``error:`` line plus a ``_lookup_hint`` did-you-mean, exit 1. Centralising
+    it keeps the hint's call shape in one place across the handler except
+    blocks. ``run_id`` is passed only by run-scoped commands (``validate-run``)
+    so their hint can point at a missing run rather than a missing feature.
+    """
+    _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
+    return 1
 
 
 def _existing_ids(parent: Path, prefix: str) -> list[str]:
@@ -325,7 +402,418 @@ def _triage_hint(
     return _lookup_hint(repo_root, feature_id)
 
 
+# --- per-command argument declarations -------------------------------------
+# Each ``_args_*`` adds one subcommand's positional/optional args to the parser
+# built from its ``Command`` row. ``_build_parser`` loops over ``COMMANDS`` and
+# calls the row's ``add_args`` - so the arg surface lives next to the run/plan
+# handlers, not in a separate hand-maintained block. Help strings are the
+# user-facing contract; keep them verbatim when editing.
+
+
+def _add_run_flags(
+    sub: argparse.ArgumentParser,
+    *,
+    profile_default: str | None,
+    profile_help: str,
+    per_call: bool = False,
+) -> None:
+    """Add the ``--profile``/``--max-turns``/``--permission-mode`` trio shared by
+    ``run-headless`` and the agent/``fix-run`` commands. ``per_call`` switches the
+    max-turns/permission-mode help to ``fix-run``'s "each headless agent call"
+    wording (it spawns three legs, not one)."""
+    sub.add_argument("--profile", default=profile_default, help=profile_help)
+    if per_call:
+        sub.add_argument(
+            "--max-turns",
+            type=int,
+            default=DEFAULT_MAX_TURNS,
+            help="Bounded --max-turns for each headless agent call (default: 12).",
+        )
+        sub.add_argument(
+            "--permission-mode",
+            default=DEFAULT_PERMISSION_MODE,
+            help="claude --permission-mode for each headless agent call "
+            "(default: bypassPermissions).",
+        )
+    else:
+        sub.add_argument(
+            "--max-turns",
+            type=int,
+            default=DEFAULT_MAX_TURNS,
+            help="Bounded --max-turns for the headless call (default: 12).",
+        )
+        sub.add_argument(
+            "--permission-mode",
+            default=DEFAULT_PERMISSION_MODE,
+            help="claude --permission-mode (default: bypassPermissions; the wrapper "
+            "enforces the file boundary post-hoc, §14.2).",
+        )
+
+
+def _args_create_feature_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("intent", help="The original user intent text to record.")
+
+
+def _args_freeze(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id of the run to update.")
+    sub.add_argument(
+        "artifact",
+        choices=FROZEN_ARTIFACTS,
+        help="Which frozen artifact to flip (one of the §4.2 four).",
+    )
+
+
+def _args_render(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical .json a human directly edited.",
+    )
+    sub.add_argument(
+        "artifact",
+        choices=RENDERABLE_ARTIFACTS,
+        help="Which artifact's mirror to re-render (requirements / design / "
+        "tasks; lane_graph has no md mirror).",
+    )
+
+
+def _args_allocate_id(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN whose per-type id counter to bump."
+    )
+    sub.add_argument(
+        "id_type",
+        choices=ID_TYPES,
+        help="Which §5.2 stable-id type to allocate (REQ / AC / DES / TASK / …).",
+    )
+
+
+def _args_show_profile(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
+
+
+def _args_list_features(sub: argparse.ArgumentParser) -> None:
+    # No command-specific args; the shared --repo-root/--json parents suffice.
+    pass
+
+
+def _args_show_status(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id to inspect.")
+
+
+def _args_log(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
+    )
+
+
+def _args_prepare_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id to prepare the run under.")
+    sub.add_argument(
+        "--role",
+        required=True,
+        help="The role for this run (e.g. Implementer, Reviewer, Spec-Gap).",
+    )
+    sub.add_argument(
+        "--task",
+        required=True,
+        help="The task text for this run (written verbatim into task-package.md).",
+    )
+    sub.add_argument(
+        "--allowed-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="A RUN-relative path the run may create or modify (§14.2), in "
+        "addition to output/result.json and output/result.md. Repeatable: "
+        "--allowed-file workspace/hello.py --allowed-file workspace/util.py. "
+        "Declare every task-specific workspace file so validate-run's boundary "
+        "check passes (ticket 05 integration seam).",
+    )
+
+
+def _args_run_headless(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    sub.add_argument("run_id", help="The RUN-NNN id to invoke.")
+    _add_run_flags(
+        sub,
+        profile_default="cc-glm52",
+        profile_help="Agent profile to invoke (default: cc-glm52, the v0 "
+        "recommended profile, §23.4).",
+    )
+
+
+def _args_validate_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
+    sub.add_argument("run_id", help="The RUN-NNN id to validate.")
+
+
+def _args_generate_requirements(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose intent (00-intent.md) the Planner elaborates "
+        "into a requirements proposal.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 01-requirements until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_generate_design(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "the Planner designs against. Requirements must be frozen first.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 02-design until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_generate_tasks(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
+        "AND design (02-design.json) the Planner tasks against. Both must be "
+        "frozen first.",
+    )
+    sub.add_argument(
+        "--feedback",
+        default=None,
+        help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 03-tasks until you freeze it.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
+        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
+        "refusal).",
+    )
+
+
+def _args_implement(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml)."
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[implementer] "
+        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_review(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id to review (must have an implement-result)."
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[reviewer] in "
+        "agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_spec_gap(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to gap-analyse (must have an implement-result).",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke (default: role_defaults[spec_gap_analyst] "
+        "in agent-profiles.yml, ticket 03; --profile always overrides, no "
+        "allowed-set, no refusal).",
+    )
+
+
+def _args_verify(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has an implement-result to verify.",
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to verify (must declare verification_commands).",
+    )
+    sub.add_argument(
+        "--timeout",
+        type=float,
+        default=300,
+        help="Per-command timeout in seconds (default: 300; a hung command is "
+        "recorded as a verification failure, not raised, §24.1).",
+    )
+
+
+def _args_collect_issues(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id", help="The FEATURE-NNN id whose lane has checking reports."
+    )
+    sub.add_argument(
+        "lane_id", help="The LANE-NNN id whose checking reports should be collected."
+    )
+
+
+def _args_lane_gate(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane has implement/verify/bundle artifacts.",
+    )
+    sub.add_argument("lane_id", help="The LANE-NNN id whose gate should be evaluated.")
+
+
+def _args_coherence_gate(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose lane gate has passed and is ready for "
+        "the final coherence verdict.",
+    )
+
+
+def _args_final_report(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose coherence verdict should be projected "
+        "into the final report.",
+    )
+
+
+def _args_triage(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose issues/ holds the issue to triage.",
+    )
+    sub.add_argument(
+        "--issue",
+        required=True,
+        metavar="ISSUE-NNN",
+        help="The issue id whose disposition is being written (e.g. ISSUE-001).",
+    )
+    sub.add_argument(
+        "--disposition",
+        required=True,
+        choices=DISPOSITIONS,
+        help="The Human-Triage disposition (§16): accept | reject | defer | "
+        "override | request_fix | request_change_proposal.",
+    )
+    sub.add_argument(
+        "--reason",
+        default=None,
+        help="Recorded rationale. Required for override (P1) and reject on "
+        "P0/P1 (ADR-0001 #6); optional otherwise.",
+    )
+    sub.add_argument(
+        "--by",
+        default="human",
+        help="Who applied the triage (default: human; models may only propose).",
+    )
+
+
+def _args_fix_run(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN id whose request_fix issues should be targeted.",
+    )
+    sub.add_argument(
+        "lane_id",
+        help="The LANE-NNN id to run through implement/review/spec-gap/verify/collect.",
+    )
+    _add_run_flags(
+        sub,
+        profile_default=None,
+        profile_help="Agent profile to invoke for implement/review/spec-gap "
+        "(default: each leg's role_defaults entry, ticket 03; --profile, if "
+        "given, overrides all three legs - no allowed-set, no refusal).",
+        per_call=True,
+    )
+    sub.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=300,
+        help="Per-command verifier timeout in seconds (default: 300).",
+    )
+
+
+def _args_compare_profiles(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The anchor FEATURE-NNN (one of the two compared runs; the "
+        "projection lands in its projections/ dir).",
+    )
+    sub.add_argument(
+        "--profiles",
+        required=True,
+        help="Exactly two comma-separated profile names to compare, e.g. "
+        "cc-glm52,codex-default. Each is matched to the intent-sibling "
+        "feature-run whose implementer used it.",
+    )
+
+
+def _args_project_github(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "feature_id",
+        help="The FEATURE-NNN whose canonical issues/ + final-report to project.",
+    )
+    sub.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="A PR number to comment the final-report on (ADR-0006 D3). Stored "
+        "as feature -> PR on first projection; without it projection is "
+        "issues-only. The orchestrator never creates the PR - a human does.",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argparse parser from the ``COMMANDS`` registry.
+
+    The command surface is ``COMMANDS`` (one row per subcommand). Each row
+    carries its ``help_text``, ``add_args`` callback, and ``json`` flag, so
+    adding a command is one registry entry - not a separate ``add_parser`` block
+    plus a ``_dispatch`` branch plus a ``_DRY_RUN_COMMANDS`` entry. The
+    ``--dry-run`` flag attaches automatically when ``plan is not None``
+    (side-effect command); read-only commands (``plan is None``) skip it
+    (ADR-0004 - a dry-run flag on a no-side-effect command is noise). The table
+    is ordered to match the historical ``--help`` listing so the refactor is
+    output-neutral.
+    """
     parser = argparse.ArgumentParser(
         prog="ai-dev",
         description="Multi-Agent Profile orchestrator (v0 walking skeleton).",
@@ -339,12 +827,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # v0.4 ticket 03: ``--repo-root`` is declared once on this parent parser and
-    # attached to every subparser via ``parents=[...]``. The declaration is
-    # deduplicated (one source of truth) without changing the invocation syntax
-    # — every command still accepts ``<command> ... --repo-root X`` exactly as
-    # before, so existing calls and scripts are unaffected. A second parent
-    # carries the read-only commands' shared ``--json`` flag.
+    # ``--repo-root`` is declared once on this parent and attached to every
+    # subparser via ``parents=[...]``: one source of truth, unchanged invocation
+    # syntax (every command still takes ``<command> ... --repo-root X``). A
+    # second parent carries the read-only commands' shared ``--json`` flag.
     repo_root_parent = argparse.ArgumentParser(add_help=False)
     repo_root_parent.add_argument(
         "--repo-root",
@@ -359,396 +845,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "(read-only commands only; default: human-readable).",
     )
 
-    create = subparsers.add_parser(
-        "create-feature-run",
-        help="Create a new feature run from an intent string (ticket 01).",
-        parents=[repo_root_parent],
-    )
-    create.add_argument("intent", help="The original user intent text to record.")
-
-    freeze = subparsers.add_parser(
-        "freeze",
-        help="Freeze a canonical artifact after its human gate passes (§4.2, ticket 04).",
-        parents=[repo_root_parent],
-    )
-    freeze.add_argument("feature_id", help="The FEATURE-NNN id of the run to update.")
-    freeze.add_argument(
-        "artifact",
-        choices=FROZEN_ARTIFACTS,
-        help="Which frozen artifact to flip (one of the §4.2 four).",
-    )
-
-    show = subparsers.add_parser(
-        "show-profile",
-        help="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
-        parents=[repo_root_parent],
-    )
-    show.add_argument("name", help="The profile name to resolve (e.g. cc-glm52).")
-
-    prepare = subparsers.add_parser(
-        "prepare-run",
-        help="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
-        parents=[repo_root_parent],
-    )
-    prepare.add_argument(
-        "feature_id", help="The FEATURE-NNN id to prepare the run under."
-    )
-    prepare.add_argument(
-        "--role",
-        required=True,
-        help="The role for this run (e.g. Implementer, Reviewer, Spec-Gap).",
-    )
-    prepare.add_argument(
-        "--task",
-        required=True,
-        help="The task text for this run (written verbatim into task-package.md).",
-    )
-    prepare.add_argument(
-        "--allowed-file",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help="A RUN-relative path the run may create or modify (§14.2), in "
-        "addition to output/result.json and output/result.md. Repeatable: "
-        "--allowed-file workspace/hello.py --allowed-file workspace/util.py. "
-        "Declare every task-specific workspace file so validate-run's boundary "
-        "check passes (ticket 05 integration seam).",
-    )
-
-    run = subparsers.add_parser(
-        "run-headless",
-        help="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
-        parents=[repo_root_parent],
-    )
-    run.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
-    run.add_argument("run_id", help="The RUN-NNN id to invoke.")
-    run.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
-    )
-    run.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    run.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    validate = subparsers.add_parser(
-        "validate-run",
-        help="Run the §14 deterministic validation (schema + boundary + frozen) "
-        "on a captured run (ticket 04).",
-        parents=[repo_root_parent],
-    )
-    validate.add_argument("feature_id", help="The FEATURE-NNN id the run lives under.")
-    validate.add_argument("run_id", help="The RUN-NNN id to validate.")
-
-    implement = subparsers.add_parser(
-        "implement",
-        help="Run the Implementer leg: prepare -> run -> validate -> writeback -> "
-        "rollup (v0.2 ticket 01, §9.2).",
-        parents=[repo_root_parent],
-    )
-    implement.add_argument("feature_id", help="The FEATURE-NNN id whose tasks/lane-graph are frozen.")
-    implement.add_argument("lane_id", help="The LANE-NNN id to implement (must be in 04-lane-graph.yml).")
-    implement.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
-    )
-    implement.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    implement.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    review = subparsers.add_parser(
-        "review",
-        help="Run the Code Reviewer leg: build -> run -> validate -> "
-        "review-report (v0.2 ticket 02, §9.3).",
-        parents=[repo_root_parent],
-    )
-    review.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
-    )
-    review.add_argument(
-        "lane_id", help="The LANE-NNN id to review (must have an implement-result)."
-    )
-    review.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
-    )
-    review.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    review.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    spec_gap = subparsers.add_parser(
-        "spec-gap",
-        help="Run the Spec Gap Analyst leg: build -> run -> validate -> "
-        "spec-gap-report (v0.2 ticket 02, §9.4).",
-        parents=[repo_root_parent],
-    )
-    spec_gap.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose lane has an implement-result."
-    )
-    spec_gap.add_argument(
-        "lane_id", help="The LANE-NNN id to gap-analyse (must have an implement-result)."
-    )
-    spec_gap.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke (default: cc-glm52, the v0 recommended "
-        "profile, §23.4).",
-    )
-    spec_gap.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for the headless call (default: 12).",
-    )
-    spec_gap.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode (default: bypassPermissions; the wrapper "
-        "enforces the file boundary post-hoc, §14.2).",
-    )
-
-    verify = subparsers.add_parser(
-        "verify",
-        help="Run the shell Verifier leg: execute the lane's declared verify "
-        "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
-        parents=[repo_root_parent],
-    )
-    verify.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has an implement-result to verify.",
-    )
-    verify.add_argument(
-        "lane_id",
-        help="The LANE-NNN id to verify (must declare verification_commands).",
-    )
-    verify.add_argument(
-        "--timeout",
-        type=float,
-        default=300,
-        help="Per-command timeout in seconds (default: 300; a hung command is "
-        "recorded as a verification failure, not raised, §24.1).",
-    )
-
-    collect = subparsers.add_parser(
-        "collect-issues",
-        help="Collect reviewer + spec-gap issues into feature issues and the "
-        "lane issue-bundle (v0.2 ticket 04, §15).",
-        parents=[repo_root_parent],
-    )
-    collect.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has checking reports.",
-    )
-    collect.add_argument(
-        "lane_id",
-        help="The LANE-NNN id whose checking reports should be collected.",
-    )
-
-    lane_gate = subparsers.add_parser(
-        "lane-gate",
-        help="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
-        "(v0.2 ticket 05).",
-        parents=[repo_root_parent],
-    )
-    lane_gate.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane has implement/verify/bundle artifacts.",
-    )
-    lane_gate.add_argument(
-        "lane_id",
-        help="The LANE-NNN id whose gate should be evaluated.",
-    )
-
-    coherence_gate = subparsers.add_parser(
-        "coherence-gate",
-        help="Evaluate the §18.5 feature coherence gate and write the terminal "
-        "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
-        parents=[repo_root_parent],
-    )
-    coherence_gate.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose lane gate has passed and is ready for "
-        "the final coherence verdict.",
-    )
-
-    final_report = subparsers.add_parser(
-        "final-report",
-        help="Generate final-report.{json,md} from the coherence verdict "
-        "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
-        parents=[repo_root_parent],
-    )
-    final_report.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose coherence verdict should be projected "
-        "into the final report.",
-    )
-
-    triage = subparsers.add_parser(
-        "triage",
-        help="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
-        "ticket 05). Deterministic - no model.",
-        parents=[repo_root_parent],
-    )
-    triage.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose issues/ holds the issue to triage.",
-    )
-    triage.add_argument(
-        "--issue",
-        required=True,
-        metavar="ISSUE-NNN",
-        help="The issue id whose disposition is being written (e.g. ISSUE-001).",
-    )
-    triage.add_argument(
-        "--disposition",
-        required=True,
-        choices=DISPOSITIONS,
-        help="The Human-Triage disposition (§16): accept | reject | defer | "
-        "override | request_fix | request_change_proposal.",
-    )
-    triage.add_argument(
-        "--reason",
-        default=None,
-        help="Recorded rationale. Required for override (P1) and reject on "
-        "P0/P1 (ADR-0001 #6); optional otherwise.",
-    )
-    triage.add_argument(
-        "--by",
-        default="human",
-        help="Who applied the triage (default: human; models may only propose).",
-    )
-
-    fix_run = subparsers.add_parser(
-        "fix-run",
-        help="Run one bounded fix-loop bookend for active request_fix issues "
-        "(ADR-0002, v0.3 ticket 07).",
-        parents=[repo_root_parent],
-    )
-    fix_run.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN id whose request_fix issues should be targeted.",
-    )
-    fix_run.add_argument(
-        "lane_id",
-        help="The LANE-NNN id to run through implement/review/spec-gap/verify/collect.",
-    )
-    fix_run.add_argument(
-        "--profile",
-        default="cc-glm52",
-        help="Agent profile to invoke for implement/review/spec-gap (default: cc-glm52).",
-    )
-    fix_run.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help="Bounded --max-turns for each headless agent call (default: 12).",
-    )
-    fix_run.add_argument(
-        "--permission-mode",
-        default=DEFAULT_PERMISSION_MODE,
-        help="claude --permission-mode for each headless agent call (default: bypassPermissions).",
-    )
-    fix_run.add_argument(
-        "--verify-timeout",
-        type=float,
-        default=300,
-        help="Per-command verifier timeout in seconds (default: 300).",
-    )
-
-    # v0.4 ticket 03: the three read-only observability commands (§26.5 CLI UX).
-    # They carry the shared ``--json`` flag (human-readable by default, JSON
-    # opt-in) on top of the shared ``--repo-root`` parent. They are deliberately
-    # absent from ``_DRY_RUN_COMMANDS`` below — a dry-run flag on a command with
-    # no side effects is noise.
-    subparsers.add_parser(
-        "list-features",
-        help="List every FEATURE-NNN with its derived status + current gate "
-        "(v0.4 ticket 03). Read-only.",
-        parents=[repo_root_parent, json_parent],
-    )
-
-    show_status = subparsers.add_parser(
-        "show-status",
-        help="Show a feature's gate/verdict/derived status + each lane's "
-        "lane-decision (v0.4 ticket 03). Read-only.",
-        parents=[repo_root_parent, json_parent],
-    )
-    show_status.add_argument(
-        "feature_id", help="The FEATURE-NNN id to inspect."
-    )
-
-    log_cmd = subparsers.add_parser(
-        "log",
-        help="Pretty-print a feature's audit timeline (v0.4 ticket 03). "
-        "Read-only; renders audit.log.json (consumes ticket 02's "
-        "origin/elapsed_ms).",
-        parents=[repo_root_parent, json_parent],
-    )
-    log_cmd.add_argument(
-        "feature_id", help="The FEATURE-NNN id whose audit timeline to print."
-    )
-
-    # ADR-0004: attach ``--dry-run`` to every side-effect subparser in one place
-    # rather than repeating the add_argument per command. Read-only commands are
-    # excluded (a dry-run flag on a command with no side effects is noise).
-    for name, sub in subparsers.choices.items():
-        if name in _DRY_RUN_COMMANDS:
+    for cmd in COMMANDS:
+        parents = [repo_root_parent]
+        if cmd.json:
+            parents.append(json_parent)
+        sub = subparsers.add_parser(cmd.name, help=cmd.help_text, parents=parents)
+        cmd.add_args(sub)
+        if cmd.plan is not None:
             _add_dry_run(sub)
 
     return parser
 
-
-# The side-effect commands that accept ``--dry-run`` (ADR-0004). Agent commands
-# spawn a claude subprocess; deterministic commands write canonical state.
-# Already-pure/read-only commands (show-profile, validate-run, the v0.4
-# read-only commands) are deliberately excluded - a dry-run flag on a command
-# with no side effects is noise.
-_DRY_RUN_COMMANDS: frozenset[str] = frozenset(
-    {
-        "run-headless",
-        "implement",
-        "review",
-        "spec-gap",
-        "fix-run",
-        "freeze",
-        "triage",
-        "coherence-gate",
-        "final-report",
-        "lane-gate",
-    }
-)
 
 
 def _add_dry_run(subparser: argparse.ArgumentParser) -> None:
@@ -789,19 +896,34 @@ def _run_dry_plan(planner: "Callable[[], DryRunPlan]") -> int:
 
 
 def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
-    """Resolve the feature run and delegate to ``freeze_artifact``.
+    """Resolve the feature run, run the freeze-gate coverage precheck, then freeze.
 
-    Returns a process exit code: ``0`` on a successful freeze, ``1`` if the run
-    is missing or the artifact is already frozen (§4.2 monotonic — re-freezing
-    is rejected, not silently reapplied). Other failures propagate (§24.2 fail
-    loud).
+    Returns a process exit code: ``0`` on a successful freeze; ``1`` if the run
+    is missing, the artifact is already frozen (§4.2 monotonic), or the
+    freeze-gate coverage precheck refuses (ADR-0008 D3 - a planning artifact
+    with an upstream coverage invariant may not freeze until every upstream id is
+    referenced, e.g. every REQ in some design ``requirement_mapping`` for the
+    design gate, §18.2). Other failures propagate (§24.2 fail loud).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        _render_error(
-            ValueError(f"feature run {feature_id} not found under {repo_root}"),
-            hint=_lookup_hint(repo_root, feature_id),
-        )
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    # ADR-0008 D3: coverage-completeness is checked at the freeze action. Stages
+    # with no upstream coverage invariant (requirements = root, lane_graph)
+    # return None - no precheck. A gap refuses to freeze (no self-heal): the
+    # human refines (generate-X --feedback) or routes to Triage. The precheck
+    # gates the freeze here (the CLI layer), not inside ``freeze_artifact``: the
+    # primitive is a pure low-level writer with no artifact-reading dependency,
+    # and the CLI is the sole production freeze path.
+    try:
+        coverage = freeze_gate_coverage(artifact, feature_root)
+    except ValueError as exc:
+        # A corrupt precondition (e.g. design freeze before requirements frozen)
+        # surfaces as a clean error rather than a traceback.
+        return _exit_value_error(repo_root, feature_id, exc)
+    if coverage is not None and not coverage.ok:
+        _render_error(ValueError(coverage.refusal_message(artifact)))
         return 1
     try:
         freeze_artifact(feature_root, artifact, origin=ORIGIN_CLI)
@@ -809,6 +931,62 @@ def _run_freeze(repo_root: Path, feature_id: str, artifact: str) -> int:
         _render_error(exc)
         return 1
     print(f"{feature_id}: froze {artifact}")
+    return 0
+
+
+def _run_render(repo_root: Path, feature_id: str, artifact: str) -> int:
+    """Re-render an unfrozen artifact's ``.md`` mirror from its ``.json``
+    (v0.6 ticket 06, ADR-0008 D4).
+
+    Deterministic bookend of the direct-edit channel - no profile, no token, no
+    model. Delegates to ``render_artifact`` (refuses a frozen artifact, fails
+    loud on a missing/unreadable canonical ``.json``, re-renders the mirror via
+    the sole stage renderer, audits). Returns ``0`` on a successful re-render;
+    ``1`` when the artifact is frozen (the direct-edit channel is closed past
+    freeze - surfaced as a clean ``error:`` line, not a traceback) or when a
+    precondition is missing (unknown/non-renderable artifact, no feature run,
+    nothing promoted to render - §24.2 fail loud).
+    """
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    try:
+        result: RenderResult = render_artifact(
+            feature_root, feature_id, artifact, origin=ORIGIN_CLI
+        )
+    except FrozenArtifactWriteError as exc:
+        _render_error(exc)
+        return 1
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    print(
+        f"{feature_id}: re-rendered {result.md_path.name} from "
+        f"{result.json_path.name} ({artifact}, unfrozen)"
+    )
+    return 0
+
+
+def _run_allocate_id(repo_root: Path, feature_id: str, id_type: str) -> int:
+    """Allocate the next stable id of ``id_type`` from the counter (v0.6 ticket
+    06, ADR-0008 D4).
+
+    Deterministic - no profile, no token, no model. Delegates to ``allocate_id``
+    (bumps the per-type high-water mark, appends an ``allocate_id`` audit
+    record) and prints the minted id — the sanctioned way for a human adding an
+    item to a direct-edited unfrozen artifact to get a counter-tracked id, so ids
+    stay in the counter and out of human hands (§4.3). Returns ``0`` on a
+    successful mint; ``1`` on an unknown id type or missing feature run (§24.2).
+    """
+    try:
+        feature_root = require_feature_root(repo_root, feature_id)
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    try:
+        allocated_id = allocate_id(feature_root, id_type, origin=ORIGIN_CLI)
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    print(allocated_id)
     return 0
 
 
@@ -823,10 +1001,8 @@ def _run_show_profile(repo_root: Path, name: str) -> int:
     unset (the latter still prints the profile so the operator can see what is
     configured, then signals non-readiness via the exit code).
     """
-    try:
-        profile = load_profile(repo_root, name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, name)
+    if profile is None:
         return 1
 
     source = token_source_var(profile)
@@ -871,8 +1047,7 @@ def _run_prepare_run(
             origin=ORIGIN_CLI,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(run_id)
     return 0
 
@@ -895,10 +1070,8 @@ def _run_run_headless(
     ``1`` when the profile cannot load or the run cannot start (missing token /
     run directory), surfacing the message rather than a traceback.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = run_headless(
@@ -911,8 +1084,7 @@ def _run_run_headless(
             origin=ORIGIN_CLI,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc, run_id=run_id)
     print(
         f"{result.run_id}: profile={result.profile} exit_code={result.exit_code} "
         f"changed_files={len(result.changed_files)}"
@@ -934,8 +1106,7 @@ def _run_validate_run(repo_root: Path, feature_id: str, run_id: str) -> int:
     try:
         result = validate_run(repo_root, feature_id, run_id, origin=ORIGIN_CLI)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id, run_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc, run_id=run_id)
     if result.passed:
         print(
             f"VALIDATE PASS - {run_id} (schema + boundary + frozen OK)"
@@ -967,10 +1138,8 @@ def _run_implement(
     the writeback), so this command never writes canonical status for a failed
     run.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = run_implementer_leg(
@@ -983,8 +1152,7 @@ def _run_implement(
             origin=ORIGIN_IMPLEMENT_LEG,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     status = (
         f"IMPLEMENT PASS - {result.run_id} lane={result.lane_id} "
         f"status={result.result_status} tasks_marked={result.task_ids_marked}"
@@ -994,6 +1162,202 @@ def _run_implement(
         return 0
     print(f"IMPLEMENT FAIL - {result.run_id} lane={result.lane_id} "
           f"({len(result.validation.issues)} problem(s)):")
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_requirements(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner requirements leg end to end (v0.6 ticket 02, §9.1).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_requirements`` (build the Planner input package from the
+    feature intent -> run headless -> validate -> promote, gated on validation),
+    and prints a one-line summary. Returns ``0`` when the run validated and
+    promote wrote the canonical-unfrozen ``01-requirements.{json,md}``; ``1``
+    when validation failed (a captured run failure is reported, not raised — no
+    canonical artifact is written for a schema-invalid proposal) or when the leg
+    cannot start (missing feature/intent, missing token). promote errors
+    (malformed proposal / frozen artifact) propagate as a clean ``error:`` line
+    via the top-level handler.
+    """
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_requirements(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
+    # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        req_ids = list(promote.allocated.get("REQ", []))
+        ac_ids = list(promote.allocated.get("AC", []))
+        print(
+            f"GENERATE-REQUIREMENTS PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"REQ={req_ids} AC={ac_ids}"
+        )
+        return 0
+    # Distinguish the two no-promote causes honestly. Validation failing is the
+    # expected one (a captured run failure / §14 breach → no canonical write). The
+    # belt-and-braces race where validation passed but no readable result.json
+    # reached promote is reported as the unexpected case it is — NOT as a schema
+    # failure, since validation already attested the proposal is schema-valid.
+    if result.validation.passed:
+        print(
+            f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_design(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner design leg end to end (v0.6 ticket 03, §9.1, ADR-0008 D2).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_design`` (build the Planner input package from the feature
+    intent + frozen requirements -> run headless -> validate -> promote, gated on
+    validation), and prints a one-line summary. Returns ``0`` when the run
+    validated and promote wrote the canonical-unfrozen ``02-design.{json,md}``;
+    ``1`` when validation failed (a captured run failure is reported, not raised
+    - no canonical artifact is written for a schema-invalid proposal) or when the
+    leg cannot start (missing feature/intent, requirements not frozen, missing
+    token). promote errors (malformed proposal / unresolved ref / frozen artifact)
+    propagate as a clean ``error:`` line via the top-level handler.
+    """
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_design(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
+    # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        des_ids = list(promote.allocated.get("DES", []))
+        print(
+            f"GENERATE-DESIGN PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"DES={des_ids}"
+        )
+        return 0
+    # Distinguish the two no-promote causes honestly (mirrors the requirements leg).
+    if result.validation.passed:
+        print(
+            f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
+    _print_validation_issues(result.validation.issues)
+    return 1
+
+
+def _run_generate_tasks(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner tasks leg end to end (v0.6 ticket 04, §9.1, ADR-0008 D2).
+
+    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
+    ``run_generate_tasks`` (build the Planner input package from the feature
+    intent + frozen requirements + frozen design -> run headless -> validate ->
+    promote, gated on validation), and prints a one-line summary. Returns ``0``
+    when the run validated and promote wrote the canonical-unfrozen
+    ``03-tasks.{json,md}`` (+ seeded ``task-status.yml`` + populated
+    ``04-lane-graph.yml``); ``1`` when validation failed (a captured run failure
+    is reported, not raised - no canonical artifact is written for a schema-invalid
+    proposal) or when the leg cannot start (missing feature/intent, requirements or
+    design not frozen, missing token). promote errors (malformed proposal /
+    unresolved ref / frozen artifact) propagate as a clean ``error:`` line via the
+    top-level handler.
+    """
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
+        return 1
+    try:
+        result: PlannerLegResult = run_generate_tasks(
+            repo_root,
+            feature_id,
+            profile,
+            feedback=feedback,
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            origin=ORIGIN_PLANNER_LEG,
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    promote = result.promote
+    if result.validation.passed and promote is not None:
+        task_ids = list(promote.allocated.get("TASK", []))
+        print(
+            f"GENERATE-TASKS PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} "
+            f"TASK={task_ids}"
+        )
+        return 0
+    if result.validation.passed:
+        print(
+            f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage}; validation passed but no result.json proposal "
+            f"was readable to promote (unexpected):"
+        )
+        return 1
+    print(
+        f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
+        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
+        f"§14 validation):"
+    )
     _print_validation_issues(result.validation.issues)
     return 1
 
@@ -1023,10 +1387,8 @@ def _run_checking(
     implement-result, missing token). The checking legs write no canonical
     status (§4.3), so this command never mutates ``task-status.yml``.
     """
-    try:
-        profile = load_profile(repo_root, profile_name)
-    except ProfileError as exc:
-        _render_error(exc)
+    profile = _load_profile_or_render(repo_root, profile_name)
+    if profile is None:
         return 1
     try:
         result = leg(
@@ -1039,8 +1401,7 @@ def _run_checking(
             origin=origin,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     status = (
         f"{label} PASS - {result.run_id} lane={result.lane_id} "
         f"role={result.role} issues={result.issue_count}"
@@ -1086,8 +1447,7 @@ def _run_verify(
             repo_root, feature_id, lane_id, timeout=timeout, origin=ORIGIN_VERIFIER
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     passed = sum(1 for r in result.command_results if r.passed)
     total = len(result.command_results)
     if result.verdict == "pass":
@@ -1122,8 +1482,7 @@ def _run_collect_issues(
             repo_root, feature_id, lane_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"COLLECT-ISSUES PASS - lane={result.lane_id} "
         f"issues={result.issue_count} bundle={result.bundle_json_path}"
@@ -1146,8 +1505,7 @@ def _run_lane_gate(
             repo_root, feature_id, lane_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if result.passed:
         print(
             f"LANE-GATE PASS - lane={result.lane_id} "
@@ -1179,8 +1537,7 @@ def _run_coherence_gate(repo_root: Path, feature_id: str) -> int:
             repo_root, feature_id, origin=ORIGIN_CLI
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if result.passed:
         print(
             f"COHERENCE-GATE PASS - feature={result.feature_id} verdict=pass "
@@ -1210,11 +1567,79 @@ def _run_final_report(repo_root: Path, feature_id: str) -> int:
     try:
         result: FinalReportResult = generate_final_report(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"FINAL-REPORT - feature={result.feature_id} verdict={result.verdict} "
         f"failure_class={result.failure_class} report={result.report_json_path}"
+    )
+    return 0
+
+
+def _run_compare_profiles(
+    repo_root: Path,
+    feature_id: str,
+    profile_names: list[str],
+    as_json: bool,
+) -> int:
+    """``compare-profiles``: project two parallel feature-runs (v0.5 ticket 06).
+
+    Always writes the non-canonical ``projections/profile-comparison.{json,md}``
+    under the anchor feature; ``--json`` additionally emits the full report as
+    JSON to stdout, otherwise a one-line human summary. Non-canonical: no audit
+    append, no canonical-state mutation. Returns ``1`` with a clean ``error:``
+    line on any §24.2 precondition miss (missing sibling, missing final-report).
+    """
+    try:
+        result: ProfileComparisonResult = generate_profile_comparison(
+            repo_root, feature_id, profile_names
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    if as_json:
+        _print_json(json.loads(result.projection_json_path.read_text()))
+    else:
+        print(
+            f"COMPARE-PROFILES - feature={result.feature_id} "
+            f"profiles={','.join(profile_names)} "
+            f"projection={result.projection_json_path}"
+        )
+    return 0
+
+
+def _run_project_github(
+    repo_root: Path, feature_id: str, pr_number: int | None
+) -> int:
+    """``project-github``: push issues + PR comment to GitHub (v0.5 ticket 07).
+
+    Delegates to ``project_github`` (preflight -> per-issue gh create/edit ->
+    optional PR comment, all idempotent via ``projections/github/mapping.json``).
+    Returns ``0`` on a complete projection, ``1`` on a pre-flight failure or a
+    mid-stream push failure (D4: successes + their mapping entries are kept
+    either way; re-running resumes from the mapping). A missing feature run is a
+    fail-loud §24.2 precondition surfaced as a clean ``error:`` line.
+    """
+    try:
+        result: GithubProjectionResult = project_github(
+            repo_root, feature_id, pr_number
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    if result.failure_reason is not None:
+        _render_error(
+            ValueError(result.failure_reason),
+            hint=(
+                "re-run `ai-dev project-github` to resume from the mapping "
+                "(already-pushed items are edited, not re-created)"
+            ),
+        )
+        return 1
+    created = [i.issue_id for i in result.issues if i.action == "created"]
+    updated = [i.issue_id for i in result.issues if i.action == "updated"]
+    pr = f" pr={result.pr_number} comment={result.pr_comment_action}" if result.pr_number else ""
+    print(
+        f"PROJECT-GITHUB - feature={result.feature_id} "
+        f"issues_created={created} issues_updated={updated}{pr} "
+        f"mapping={result.mapping_path}"
     )
     return 0
 
@@ -1223,14 +1648,24 @@ def _run_fix_run(
     repo_root: Path,
     feature_id: str,
     lane_id: str,
-    profile_name: str,
+    implement_profile_name: str,
+    reviewer_profile_name: str,
+    spec_gap_profile_name: str,
     max_turns: int,
     permission_mode: str,
     verify_timeout: float,
 ) -> int:
-    """Run one bounded fix-loop bookend and stop before human re-triage."""
+    """Run one bounded fix-loop bookend and stop before human re-triage.
+
+    v0.5 ticket 03: loads one profile per leg (per-leg role defaults resolved by
+    the dispatcher); a missing profile surfaces as a clean ``error:`` + exit 1
+    before any leg runs. ``--profile``, when given, was applied to all three
+    names upstream so a single override covers the whole chain.
+    """
     try:
-        profile = load_profile(repo_root, profile_name)
+        implement_profile = load_profile(repo_root, implement_profile_name)
+        reviewer_profile = load_profile(repo_root, reviewer_profile_name)
+        spec_gap_profile = load_profile(repo_root, spec_gap_profile_name)
     except ProfileError as exc:
         _render_error(exc)
         return 1
@@ -1239,15 +1674,16 @@ def _run_fix_run(
             repo_root,
             feature_id,
             lane_id,
-            profile,
+            implement_profile,
+            reviewer_profile,
+            spec_gap_profile,
             max_turns=max_turns,
             permission_mode=permission_mode,
             verify_timeout=verify_timeout,
             origin=ORIGIN_FIX_RUN_DRIVER,
         )
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     print(
         f"FIX-RUN PASS - lane={result.lane_id} implement_run={result.implement_run_id} "
         f"targets={result.target_issue_ids} budget={result.budget_used}/{result.budget_max} "
@@ -1378,8 +1814,7 @@ def _run_show_status(repo_root: Path, feature_id: str, as_json: bool) -> int:
     try:
         view = show_feature_status(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if as_json:
         _print_json(view.to_dict())
     else:
@@ -1422,13 +1857,510 @@ def _run_log(repo_root: Path, feature_id: str, as_json: bool) -> int:
     try:
         records = read_audit_timeline(repo_root, feature_id)
     except ValueError as exc:
-        _render_error(exc, hint=_lookup_hint(repo_root, feature_id))
-        return 1
+        return _exit_value_error(repo_root, feature_id, exc)
     if as_json:
         _print_json([record.to_dict() for record in records])
     else:
         _render_log(records)
     return 0
+
+
+@dataclass(frozen=True)
+class Command:
+    """One row in the cli command registry - the single source of truth for the
+    command surface. ``_build_parser`` declares the subcommand from this row
+    (``help_text`` + ``add_args`` + ``json`` + the ``--dry-run`` flag when
+    ``plan is not None``); ``_dispatch`` routes to ``run`` (or ``plan`` under
+    ``--dry-run``). Adding a command is one entry here - not three hand-maintained
+    lists (parser block + dispatch branch + dry-run set).
+    """
+
+    name: str
+    help_text: str
+    add_args: "Callable[[argparse.ArgumentParser], None]"
+    run: "Callable[[argparse.Namespace], int]"
+    plan: "Callable[[argparse.Namespace], DryRunPlan] | None"
+    json: bool = False
+
+
+def _agent_command(
+    name: str,
+    help_text: str,
+    add_args: "Callable[[argparse.ArgumentParser], None]",
+    role: str,
+    origin: str,
+    real: "Callable[[Path, str, str, argparse.Namespace], int]",
+    plan: "Callable[[Path, str, AgentProfile, argparse.Namespace], DryRunPlan]",
+    json: bool = False,
+) -> Command:
+    """Build an agent Command: resolve profile, then (dry) plan with a loaded
+    ``AgentProfile`` or (real) record + run with the name.
+
+    The resolve/record preamble - previously copy-pasted for the six agent
+    commands in ``_dispatch`` - lives once here. ``real`` takes the profile
+    *name* (records it; the leg loads internally); ``plan`` takes the *loaded*
+    Profile (dry-run never records). The dry-vs-real branch is the dispatch
+    loop's job, not the closure's: this factory builds two clean callables and
+    the loop picks. ``ProfileError`` from resolve renders on the real path
+    (``_render_error``) and propagates to ``_run_dry_plan``'s catch on the dry
+    path - identical ``error:`` shape either way.
+    """
+
+    def run(args: argparse.Namespace) -> int:
+        repo_root = Path(args.repo_root)
+        try:
+            profile_name = resolve_profile_name(repo_root, role, args.profile)
+        except ProfileError as exc:
+            _render_error(exc)
+            return 1
+        record_agent_profile(
+            feature_dir(repo_root, args.feature_id), role, profile_name, origin=origin
+        )
+        return real(repo_root, args.feature_id, profile_name, args)
+
+    def dry(args: argparse.Namespace) -> DryRunPlan:
+        repo_root = Path(args.repo_root)
+        profile_name = resolve_profile_name(repo_root, role, args.profile)
+        return plan(
+            repo_root, args.feature_id, load_profile(repo_root, profile_name), args
+        )
+
+    return Command(
+        name=name,
+        help_text=help_text,
+        add_args=add_args,
+        run=run,
+        plan=dry,
+        json=json,
+    )
+
+
+def _run_create_feature_run_cmd(args: argparse.Namespace) -> int:
+    """``create-feature-run`` - prints the minted id and exits 0 (no ``_run_*``)."""
+    feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
+    print(feature_id)
+    return 0
+
+
+def _profile_names(args: argparse.Namespace) -> list[str]:
+    """Parse ``compare-profiles``' comma-separated ``--profiles`` into a list."""
+    return [p.strip() for p in args.profiles.split(",") if p.strip()]
+
+
+def _resolve_fix_profiles(
+    repo_root: Path, profile_override: str | None
+) -> tuple[str, str, str]:
+    """Resolve fix-run's three role profiles from one ``--profile`` override.
+
+    Raises ``ProfileError`` on a bad name - the caller decides whether to render
+    (real path) or let it propagate to ``_run_dry_plan``'s catch (dry path).
+    """
+    return (
+        resolve_profile_name(repo_root, ROLE_IMPLEMENTER, profile_override),
+        resolve_profile_name(repo_root, ROLE_REVIEWER, profile_override),
+        resolve_profile_name(repo_root, ROLE_SPEC_GAP_ANALYST, profile_override),
+    )
+
+
+def _run_fix_run_cmd(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo_root)
+    try:
+        implement_name, reviewer_name, spec_gap_name = _resolve_fix_profiles(
+            repo_root, args.profile
+        )
+    except ProfileError as exc:
+        _render_error(exc)
+        return 1
+    fix_feature_root = feature_dir(repo_root, args.feature_id)
+    record_agent_profile(
+        fix_feature_root, ROLE_IMPLEMENTER, implement_name, origin=ORIGIN_FIX_RUN_DRIVER
+    )
+    record_agent_profile(
+        fix_feature_root, ROLE_REVIEWER, reviewer_name, origin=ORIGIN_FIX_RUN_DRIVER
+    )
+    record_agent_profile(
+        fix_feature_root,
+        ROLE_SPEC_GAP_ANALYST,
+        spec_gap_name,
+        origin=ORIGIN_FIX_RUN_DRIVER,
+    )
+    return _run_fix_run(
+        repo_root,
+        args.feature_id,
+        args.lane_id,
+        implement_name,
+        reviewer_name,
+        spec_gap_name,
+        args.max_turns,
+        args.permission_mode,
+        args.verify_timeout,
+    )
+
+
+def _plan_fix_run_cmd(args: argparse.Namespace) -> DryRunPlan:
+    repo_root = Path(args.repo_root)
+    implement_name, reviewer_name, spec_gap_name = _resolve_fix_profiles(
+        repo_root, args.profile
+    )
+    return plan_fix_run(
+        repo_root,
+        args.feature_id,
+        args.lane_id,
+        load_profile(repo_root, implement_name),
+        load_profile(repo_root, reviewer_name),
+        load_profile(repo_root, spec_gap_name),
+        max_turns=args.max_turns,
+        permission_mode=args.permission_mode,
+        verify_timeout=args.verify_timeout,
+    )
+
+
+# The command registry: one row per subcommand - the single source of
+# truth for the command surface. ``_build_parser`` declares the subcommand
+# (help + args + --dry-run when plan is not None); ``_dispatch`` routes to
+# run (or plan under --dry-run). Adding a command is one entry here - not
+# three hand-maintained lists (parser block + dispatch branch + dry-run set).
+COMMANDS: list[Command] = [
+    Command(
+        "create-feature-run",
+        help_text="Create a new feature run from an intent string (ticket 01).",
+        add_args=_args_create_feature_run,
+        run=_run_create_feature_run_cmd,
+        plan=None,
+    ),
+    Command(
+        "freeze",
+        help_text="Freeze a canonical artifact after its human gate passes (§4.2, ticket 04).",
+        add_args=_args_freeze,
+        run=lambda a: _run_freeze(Path(a.repo_root), a.feature_id, a.artifact),
+        plan=lambda a: plan_freeze(Path(a.repo_root), a.feature_id, a.artifact),
+    ),
+    Command(
+        "render",
+        help_text="Re-render an unfrozen artifact's .md mirror from its (hand-edited) "
+        ".json (v0.6 ticket 06, ADR-0008 D4). Deterministic - no model.",
+        add_args=_args_render,
+        run=lambda a: _run_render(Path(a.repo_root), a.feature_id, a.artifact),
+        plan=lambda a: plan_render(Path(a.repo_root), a.feature_id, a.artifact),
+    ),
+    Command(
+        "allocate-id",
+        help_text="Allocate the next stable id of a type from the counter "
+        "(v0.6 ticket 06, ADR-0008 D4). Deterministic - no model. For human-"
+        "added items in a direct-edited unfrozen artifact, so ids stay in the "
+        "counter and out of human hands (§4.3).",
+        add_args=_args_allocate_id,
+        run=lambda a: _run_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
+        plan=lambda a: plan_allocate_id(Path(a.repo_root), a.feature_id, a.id_type),
+    ),
+    Command(
+        "show-profile",
+        help_text="Load and display a resolved agent profile (§10.1, run-adapter ticket 01).",
+        add_args=_args_show_profile,
+        run=lambda a: _run_show_profile(Path(a.repo_root), a.name),
+        plan=None,
+    ),
+    Command(
+        "prepare-run",
+        help_text="Allocate RUN-NNN and scaffold its input package (§12, ticket 02).",
+        add_args=_args_prepare_run,
+        run=lambda a: _run_prepare_run(
+            Path(a.repo_root),
+            a.feature_id,
+            a.role,
+            a.task,
+            a.allowed_file,
+        ),
+        plan=None,
+    ),
+    Command(
+        "run-headless",
+        help_text="Run a prepared RUN-NNN headless via a profile and capture it (§11, ticket 03).",
+        add_args=_args_run_headless,
+        run=lambda a: _run_run_headless(
+            Path(a.repo_root),
+            a.feature_id,
+            a.run_id,
+            a.profile,
+            a.max_turns,
+            a.permission_mode,
+        ),
+        plan=lambda a: plan_run_headless(
+            Path(a.repo_root),
+            a.feature_id,
+            a.run_id,
+            load_profile(Path(a.repo_root), a.profile),
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    Command(
+        "validate-run",
+        help_text="Run the §14 deterministic validation (schema + boundary + frozen) "
+        "on a captured run (ticket 04).",
+        add_args=_args_validate_run,
+        run=lambda a: _run_validate_run(Path(a.repo_root), a.feature_id, a.run_id),
+        plan=None,
+    ),
+    _agent_command(
+        "generate-requirements",
+        "Run the Planner requirements leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 01-requirements (v0.6 ticket 02, ADR-0008).",
+        _args_generate_requirements,
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_requirements(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_requirements(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "generate-design",
+        "Run the Planner design leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 02-design against the frozen requirements "
+        "(v0.6 ticket 03, ADR-0008).",
+        _args_generate_design,
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_design(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_design(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "generate-tasks",
+        "Run the Planner tasks leg: generate -> validate -> auto promote "
+        "the canonical-unfrozen 03-tasks (+ task-status.yml + 04-lane-graph.yml) "
+        "against the frozen requirements and design (v0.6 ticket 04, ADR-0008).",
+        _args_generate_tasks,
+        ROLE_PLANNER,
+        ORIGIN_PLANNER_LEG,
+        real=lambda repo, fid, name, a: _run_generate_tasks(
+            repo, fid, name, a.feedback, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_generate_tasks(
+            repo,
+            fid,
+            prof,
+            feedback=a.feedback,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "implement",
+        "Run the Implementer leg: prepare -> run -> validate -> writeback -> "
+        "rollup (v0.2 ticket 01, §9.2).",
+        _args_implement,
+        ROLE_IMPLEMENTER,
+        ORIGIN_IMPLEMENT_LEG,
+        real=lambda repo, fid, name, a: _run_implement(
+            repo, fid, a.lane_id, name, a.max_turns, a.permission_mode
+        ),
+        plan=lambda repo, fid, prof, a: plan_implement(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "review",
+        "Run the Code Reviewer leg: build -> run -> validate -> "
+        "review-report (v0.2 ticket 02, §9.3).",
+        _args_review,
+        ROLE_REVIEWER,
+        ORIGIN_REVIEW_LEG,
+        real=lambda repo, fid, name, a: _run_checking(
+            repo,
+            fid,
+            a.lane_id,
+            name,
+            a.max_turns,
+            a.permission_mode,
+            leg=run_reviewer_leg,
+            label="REVIEW",
+            origin=ORIGIN_REVIEW_LEG,
+        ),
+        plan=lambda repo, fid, prof, a: plan_review(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    _agent_command(
+        "spec-gap",
+        "Run the Spec Gap Analyst leg: build -> run -> validate -> "
+        "spec-gap-report (v0.2 ticket 02, §9.4).",
+        _args_spec_gap,
+        ROLE_SPEC_GAP_ANALYST,
+        ORIGIN_SPEC_GAP_LEG,
+        real=lambda repo, fid, name, a: _run_checking(
+            repo,
+            fid,
+            a.lane_id,
+            name,
+            a.max_turns,
+            a.permission_mode,
+            leg=run_spec_gap_leg,
+            label="SPEC-GAP",
+            origin=ORIGIN_SPEC_GAP_LEG,
+        ),
+        plan=lambda repo, fid, prof, a: plan_spec_gap(
+            repo,
+            fid,
+            a.lane_id,
+            prof,
+            max_turns=a.max_turns,
+            permission_mode=a.permission_mode,
+        ),
+    ),
+    Command(
+        "verify",
+        help_text="Run the shell Verifier leg: execute the lane's declared verify "
+        "commands and roll up a verification-report (v0.2 ticket 03, §9.5).",
+        add_args=_args_verify,
+        run=lambda a: _run_verify(
+            Path(a.repo_root), a.feature_id, a.lane_id, a.timeout
+        ),
+        plan=None,
+    ),
+    Command(
+        "collect-issues",
+        help_text="Collect reviewer + spec-gap issues into feature issues and the "
+        "lane issue-bundle (v0.2 ticket 04, §15).",
+        add_args=_args_collect_issues,
+        run=lambda a: _run_collect_issues(Path(a.repo_root), a.feature_id, a.lane_id),
+        plan=None,
+    ),
+    Command(
+        "lane-gate",
+        help_text="Evaluate the §18.4 lane gate and write lane-decision.{md,json} "
+        "(v0.2 ticket 05).",
+        add_args=_args_lane_gate,
+        run=lambda a: _run_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
+        plan=lambda a: plan_lane_gate(Path(a.repo_root), a.feature_id, a.lane_id),
+    ),
+    Command(
+        "coherence-gate",
+        help_text="Evaluate the §18.5 feature coherence gate and write the terminal "
+        "verdict on feature-status.yml (ADR-0003, v0.3 ticket 08).",
+        add_args=_args_coherence_gate,
+        run=lambda a: _run_coherence_gate(Path(a.repo_root), a.feature_id),
+        plan=lambda a: plan_coherence_gate(Path(a.repo_root), a.feature_id),
+    ),
+    Command(
+        "final-report",
+        help_text="Generate final-report.{json,md} from the coherence verdict "
+        "(ADR-0003 D5/D6/D7, v0.3 ticket 09). Deterministic projection - no model.",
+        add_args=_args_final_report,
+        run=lambda a: _run_final_report(Path(a.repo_root), a.feature_id),
+        plan=lambda a: plan_final_report(Path(a.repo_root), a.feature_id),
+    ),
+    Command(
+        "triage",
+        help_text="Apply a Human-Triage disposition to one issue (ADR-0001, v0.3 "
+        "ticket 05). Deterministic - no model.",
+        add_args=_args_triage,
+        run=lambda a: _run_triage(
+            Path(a.repo_root),
+            a.feature_id,
+            a.issue,
+            a.disposition,
+            a.reason,
+            a.by,
+        ),
+        plan=lambda a: plan_triage(
+            Path(a.repo_root),
+            a.feature_id,
+            a.issue,
+            a.disposition,
+            a.reason,
+            a.by,
+        ),
+    ),
+    Command(
+        "fix-run",
+        help_text="Run one bounded fix-loop bookend for active request_fix issues "
+        "(ADR-0002, v0.3 ticket 07).",
+        add_args=_args_fix_run,
+        run=_run_fix_run_cmd,
+        plan=_plan_fix_run_cmd,
+    ),
+    Command(
+        "list-features",
+        help_text="List every FEATURE-NNN with its derived status + current gate "
+        "(v0.4 ticket 03). Read-only.",
+        add_args=_args_list_features,
+        run=lambda a: _run_list_features(Path(a.repo_root), a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "show-status",
+        help_text="Show a feature's gate/verdict/derived status + each lane's "
+        "lane-decision (v0.4 ticket 03). Read-only.",
+        add_args=_args_show_status,
+        run=lambda a: _run_show_status(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "log",
+        help_text="Pretty-print a feature's audit timeline (v0.4 ticket 03). "
+        "Read-only; renders audit.log.json (consumes ticket 02's "
+        "origin/elapsed_ms).",
+        add_args=_args_log,
+        run=lambda a: _run_log(Path(a.repo_root), a.feature_id, a.json),
+        plan=None,
+        json=True,
+    ),
+    Command(
+        "compare-profiles",
+        help_text="Project a side-by-side comparison of two parallel feature-runs "
+        "(same intent, one profile each) into "
+        "projections/profile-comparison.{json,md} (v0.5 ticket 06, "
+        "ADR-0003-style non-canonical projection). Read-only.",
+        add_args=_args_compare_profiles,
+        run=lambda a: _run_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a), a.json
+        ),
+        plan=lambda a: plan_compare_profiles(
+            Path(a.repo_root), a.feature_id, _profile_names(a)
+        ),
+        json=True,
+    ),
+    Command(
+        "project-github",
+        help_text="Push canonical issues to GitHub issues + post the final-report as "
+        "a PR comment (v0.5 ticket 07, ADR-0006). Network-bound; idempotent via "
+        "projections/github/mapping.json.",
+        add_args=_args_project_github,
+        run=lambda a: _run_project_github(Path(a.repo_root), a.feature_id, a.pr),
+        plan=lambda a: plan_project_github(Path(a.repo_root), a.feature_id, a.pr),
+    ),
+]
+
+_COMMAND_BY_NAME: dict[str, Command] = {c.name: c for c in COMMANDS}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1456,227 +2388,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run the parsed subcommand and return its exit code (no catch-all here).
 
-    Expected failures (missing feature/run, refused triage, bad input) are
-    surfaced by each ``_run_*`` through ``_render_error`` + ``return 1``; this
-    function lets anything else propagate to ``main``'s top-level handler.
+    The command surface is the ``COMMANDS`` registry - one row per subcommand,
+    each carrying its real ``run`` and (for dry-capable commands) a ``plan``.
+    The dry-vs-real branch lives here once, not in a per-command if/elif: a
+    dry run defers ``cmd.plan(args)`` into ``_run_dry_plan`` so its
+    precondition ``ValueError``/``ProfileError`` surface as one ``error:``
+    line. Expected precondition failures exit 1; anything else propagates
+    to ``main``'s top-level handler.
     """
-    if args.command == "create-feature-run":
-        feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
-        print(feature_id)
-        return 0
-
-    if args.command == "freeze":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_freeze(
-                    Path(args.repo_root), args.feature_id, args.artifact
-                )
-            )
-        return _run_freeze(Path(args.repo_root), args.feature_id, args.artifact)
-
-    if args.command == "show-profile":
-        return _run_show_profile(Path(args.repo_root), args.name)
-
-    if args.command == "list-features":
-        return _run_list_features(Path(args.repo_root), args.json)
-
-    if args.command == "show-status":
-        return _run_show_status(Path(args.repo_root), args.feature_id, args.json)
-
-    if args.command == "log":
-        return _run_log(Path(args.repo_root), args.feature_id, args.json)
-
-    if args.command == "prepare-run":
-        return _run_prepare_run(
-            Path(args.repo_root),
-            args.feature_id,
-            args.role,
-            args.task,
-            args.allowed_file,
-        )
-
-    if args.command == "run-headless":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_run_headless(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.run_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        return _run_run_headless(
-            Path(args.repo_root),
-            args.feature_id,
-            args.run_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "validate-run":
-        return _run_validate_run(Path(args.repo_root), args.feature_id, args.run_id)
-
-    if args.command == "implement":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_implement(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        return _run_implement(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-        )
-
-    if args.command == "review":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_review(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        return _run_checking(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-            leg=run_reviewer_leg,
-            label="REVIEW",
-            origin=ORIGIN_REVIEW_LEG,
-        )
-
-    if args.command == "spec-gap":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_spec_gap(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                )
-            )
-        return _run_checking(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-            leg=run_spec_gap_leg,
-            label="SPEC-GAP",
-            origin=ORIGIN_SPEC_GAP_LEG,
-        )
-
-    if args.command == "verify":
-        return _run_verify(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.timeout,
-        )
-
-    if args.command == "collect-issues":
-        return _run_collect_issues(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-        )
-
-    if args.command == "lane-gate":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_lane_gate(
-                    Path(args.repo_root), args.feature_id, args.lane_id
-                )
-            )
-        return _run_lane_gate(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-        )
-
-    if args.command == "coherence-gate":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_coherence_gate(Path(args.repo_root), args.feature_id)
-            )
-        return _run_coherence_gate(Path(args.repo_root), args.feature_id)
-
-    if args.command == "final-report":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_final_report(Path(args.repo_root), args.feature_id)
-            )
-        return _run_final_report(Path(args.repo_root), args.feature_id)
-
-    if args.command == "fix-run":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_fix_run(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.lane_id,
-                    load_profile(Path(args.repo_root), args.profile),
-                    max_turns=args.max_turns,
-                    permission_mode=args.permission_mode,
-                    verify_timeout=args.verify_timeout,
-                )
-            )
-        return _run_fix_run(
-            Path(args.repo_root),
-            args.feature_id,
-            args.lane_id,
-            args.profile,
-            args.max_turns,
-            args.permission_mode,
-            args.verify_timeout,
-        )
-
-    if args.command == "triage":
-        if args.dry_run:
-            return _run_dry_plan(
-                lambda: plan_triage(
-                    Path(args.repo_root),
-                    args.feature_id,
-                    args.issue,
-                    args.disposition,
-                    args.reason,
-                    args.by,
-                )
-            )
-        return _run_triage(
-            Path(args.repo_root),
-            args.feature_id,
-            args.issue,
-            args.disposition,
-            args.reason,
-            args.by,
-        )
-
-    # Unreachable: argparse rejects unknown/missing subcommands before we get
-    # here (required=True). error() is NoReturn, so this ends the function.
-    parser.error(f"unknown command: {args.command!r}")
+    cmd = _COMMAND_BY_NAME[args.command]
+    if getattr(args, "dry_run", False) and cmd.plan is not None:
+        planner = cmd.plan
+        return _run_dry_plan(lambda: planner(args))
+    return cmd.run(args)
 
 
 if __name__ == "__main__":  # pragma: no cover

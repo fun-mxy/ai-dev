@@ -668,6 +668,15 @@ agent_profiles:
     model: null
     invocation: headless
     extra_env: {}
+
+# role_defaults（v0.5 ticket 03）：role -> profile 名的默认策略表。每个 agent leg
+# 在未传 --profile 时按 role 解析默认 profile；--profile 永远覆盖（无 allowed-set、
+# 无拒绝逻辑——“无约束”边界）。fix-run 三条 leg 各取各的 role 默认。可选字段：缺失
+# 等价于无 role 默认（调用方必须显式传 --profile）。
+role_defaults:
+  implementer: codex-default
+  reviewer: cc-glm52
+  spec_gap_analyst: cc-glm52
 ```
 
 > **认证字段语义**（补充 §10.2 的"只用变量名"规则）：
@@ -979,6 +988,19 @@ output/metadata.json
 如果这些 artifact 已冻结，则任何直接修改都失败。
 
 允许方式只有 CP。
+
+### 14.4 Traceability Declaration Validation (ADR-0007)
+
+对 **Implementer** 角色的 run（且 feature 已分配 REQ/AC 时），检查 `result.json`：
+
+- 是否声明了 `related_requirements` / `related_acceptance_criteria`；
+- 声明的每个 id 是否真实存在于 `01-requirements.json`。
+
+缺失（未声明）或畸形（非 list / 引用不存在的 id）→ run `failed`。
+
+仅校验**本 lane 实际承担的** REQ/AC，不要求声明全部（部分作用域 lane 只声明自己的子集）；`[]` 在"确实未涉及"时为合法形态。诚实的交叉校验由 Spec Gap Analyst（§9）承担，§14.4 只管**形式**。orchestrator 不做 `changed_files → requirement` 推断、也不把 AC 当可执行测试跑（ADR-0007 D4）。
+
+当 feature 尚未分配任何 REQ/AC（空 spec）时，本检查为 no-op——无可覆盖之物。
 
 ---
 

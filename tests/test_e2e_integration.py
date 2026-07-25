@@ -734,6 +734,182 @@ class TestV02EndToEndIntegration:
         _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
 
 
+# v0.5 ticket 04 (CI seam): a registry with both profiles + the ticket-03
+# ``role_defaults`` policy table - implementer on codex-default, the two checking
+# roles on cc-glm52. Mirrors the on-disk examples/string-utils profile so the
+# multi-CLI dispatch (ADR-0005 D1/D2) and the role->profile policy are exercised
+# together, not just one CLI in isolation.
+_MIXED_ROLE_DEFAULTS_YAML = """\
+agent_profiles:
+  cc-glm52:
+    cli: claude
+    backend: glm
+    base_url: "https://ark.cn-beijing.volces.com/api/coding"
+    auth_env: "CC_GLM52_TOKEN"
+    auth_env_fallback: "ANTHROPIC_AUTH_TOKEN"
+    auth_target: "ANTHROPIC_AUTH_TOKEN"
+    model: "glm-5.2"
+    invocation: headless
+    extra_env:
+      ANTHROPIC_BASE_URL: "https://ark.cn-beijing.volces.com/api/coding"
+      ANTHROPIC_MODEL: "glm-5.2"
+    env_strip_pattern: "^(CLAUDE_CODE_|CLAUDECODE$|AI_AGENT$|CLAUDE_EFFORT$)"
+  codex-default:
+    cli: codex
+    backend: openai
+    base_url: null
+    auth_env: "OPENAI_API_KEY"
+    model: null
+    invocation: headless
+    extra_env: {}
+role_defaults:
+  implementer: codex-default
+  reviewer: cc-glm52
+  spec_gap_analyst: cc-glm52
+"""
+
+# A fake ``codex`` for the multi-CLI e2e: reads the prompt off stdin (the codex
+# runner pipes it, unlike claude's --flag form), writes ``workspace/hello.py``
+# (so the v0.2 verify command passes) + the §13.1 implementer ``result.json``.
+# Mirrors ``_FAKE_CODEX`` in test_run_wrapper but lives next to the v0.2 lane
+# helpers it drives; named ``codex`` so ``shutil.which("codex")`` resolves it.
+_FAKE_CODEX_V02 = """\
+#!__PY__
+import json, os, sys
+_prompt = sys.stdin.read()
+os.makedirs("workspace", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+with open("workspace/hello.py", "w") as f:
+    f.write("# codex-written module\\n")
+    f.write("def answer():\\n    return 42\\n")
+with open("output/result.md", "w") as f:
+    f.write("Codex wrote workspace/hello.py for the run.\\n")
+with open("output/result.json", "w") as f:
+    json.dump(
+        {
+            "status": "proposed_done",
+            "summary": "Codex wrote workspace/hello.py for the run.",
+            "tasks": [
+                {"id": "TASK-001", "status": "proposed_done",
+                 "evidence": ["workspace/hello.py"]}
+            ],
+        },
+        f,
+    )
+sys.exit(0)
+"""
+
+
+def _write_fake_codex(bin_dir: Path, body: str = _FAKE_CODEX_V02) -> Path:
+    """Write a fake ``codex`` script into ``bin_dir`` and return its path."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "codex"
+    script.write_text(body.replace("__PY__", sys.executable))
+    os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+class TestV05CodexMultiCliE2E:
+    """Ticket 04 (CI seam): deterministic fake-codex e2e locking the multi-CLI
+    dispatch + role_defaults policy in CI.
+
+    Drives the whole happy path through the ``ai-dev`` console with BOTH a fake
+    ``codex`` and a fake ``claude`` on ``PATH`` and no ``--profile`` passed, so
+    each leg resolves its profile from the ``role_defaults`` table: the
+    Implementer runs on codex-default (CodexRunner), the Code Reviewer and Spec
+    Gap Analyst run on cc-glm52 (ClaudeRunner). Reaches ``verdict=pass`` /
+    ``status=done`` and asserts the per-run CLI dispatch, continuous
+    RUN/LANE/ISSUE ids, and the token-not-on-disk invariant - the deterministic
+    CI lock backing ticket 04's real codex run (the real run is the evidence of
+    record; this test guards the seam against regressions).
+    """
+
+    def test_role_defaults_dispatches_codex_implementer_and_claude_reviewers(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(repo_root, _MIXED_ROLE_DEFAULTS_YAML)
+        sentinel = "tok-V05-MIXED-LEAK-CHECK-9e3f1a"
+        monkeypatch.setenv("CC_GLM52_TOKEN", sentinel)
+        # codex-default has token_source=null (stored-cred path) and the codex
+        # adapter is token-not-required (ADR-0005 D3/D5): OPENAI_API_KEY is
+        # explicitly unset, so the implementer leg deterministically spawns on
+        # path (b) without a token check (clean_token_env only clears the
+        # cc-glm52 names, not OPENAI_API_KEY).
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        py = sys.executable
+        verify_command = (
+            f'{py} -c "import hello; import sys; '
+            f'sys.exit(0 if hello.answer()==42 else 1)"'
+        )
+        # fake codex = Implementer; fake claude = Reviewer then Spec-gap (queued).
+        fake_codex = _write_fake_codex(tmp_path / "bin-codex")
+        fake_claude = _write_fake_claude_sequence(
+            tmp_path / "bin-claude",
+            [_V02_REVIEW_PASS_PAYLOAD, _V02_GAP_PASS_PAYLOAD],
+        )
+        monkeypatch.setenv(
+            "PATH",
+            f"{fake_codex.parent}{os.pathsep}{fake_claude.parent}"
+            f"{os.pathsep}{os.environ['PATH']}",
+        )
+
+        assert main(
+            ["create-feature-run", "v0.5 multi-CLI codex+claude seam",
+             "--repo-root", str(repo_root)]
+        ) == 0
+        feature_id = "FEATURE-001"
+        lane_id = "LANE-001"
+        _freeze_v02_lane(
+            repo_root, feature_id, lane_id, verification_command=verify_command
+        )
+
+        # No --profile on any leg: role_defaults resolves implementer->codex,
+        # reviewer/spec-gap->claude. All exit 0 on the green path.
+        assert main(["implement", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["review", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["spec-gap", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["verify", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["collect-issues", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["lane-gate", feature_id, lane_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["coherence-gate", feature_id, "--repo-root", str(repo_root)]) == 0
+        assert main(["final-report", feature_id, "--repo-root", str(repo_root)]) == 0
+
+        # Per-run CLI dispatch (ADR-0005 D1/D2): RUN-001 spawned codex, RUN-002
+        # and RUN-003 spawned claude - each run records the cli + profile it used.
+        runs_root = _feature_root(repo_root, feature_id) / "runs"
+        expected = {
+            "RUN-001": ("codex", "codex-default"),
+            "RUN-002": ("claude", "cc-glm52"),
+            "RUN-003": ("claude", "cc-glm52"),
+        }
+        for run_id, (cli, profile) in expected.items():
+            md = json.loads((runs_root / run_id / "output" / "metadata.json").read_text())
+            assert md["cli"] == cli, (run_id, md["cli"])
+            assert md["profile"] == profile, (run_id, md["profile"])
+
+        # Final verdict = pass / status = done (ticket item #1's full headline).
+        report = json.loads(
+            (_feature_root(repo_root, feature_id) / "final-report.json").read_text()
+        )
+        assert report["verdict"] == "pass"
+        assert report["meta"]["feature_status"] == "done"
+
+        # Continuous ids; no issue allocated on the green path.
+        assert sorted(p.name for p in runs_root.iterdir()) == [
+            "RUN-001", "RUN-002", "RUN-003",
+        ]
+        counters = (_feature_root(repo_root, feature_id) / "id-counters.yml").read_text()
+        assert "LANE: 1" in counters
+        assert "RUN: 3" in counters
+        assert "ISSUE:" not in counters
+        _assert_no_token_in_feature_artifacts(repo_root, feature_id, sentinel)
+
+
 class TestV03EndToEndIntegration:
     """Ticket 10: v0.3 walking skeleton over one real feature run.
 
@@ -1407,7 +1583,7 @@ class TestV03EndToEndIntegration:
         # fix-run: RUN-004 implement, RUN-005 review(pass), RUN-006 spec-gap(pass),
         # verify, collect (ISSUE-001 resolved, bundle emptied).
         fix = run_fix_run(
-            repo_root, feature_id, lane_id, profile,
+            repo_root, feature_id, lane_id, profile, profile, profile,
             max_turns=DEFAULT_MAX_TURNS,
             permission_mode=DEFAULT_PERMISSION_MODE,
             verify_timeout=30.0,

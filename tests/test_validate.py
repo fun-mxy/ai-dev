@@ -19,10 +19,12 @@ import pytest
 
 from ai_dev.audit import AUDIT_LOG_JSON
 from ai_dev.feature_run import create_feature_run
+from ai_dev.json_artifact import write_json
 from ai_dev.paths import feature_dir, run_dir
 from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import write_metadata
 from ai_dev.status import freeze_artifact, frozen_artifacts_status
+from ai_dev.templates import REQUIREMENTS_JSON
 from ai_dev.validate import (
     RESULT_JSON,
     RETRYABLE_CODES,
@@ -33,11 +35,13 @@ from ai_dev.validate import (
     ValidationResult,
     read_allowed_files,
     read_changed_files,
+    read_run_role,
     validate_against_schema,
     validate_boundary,
     validate_frozen,
     validate_run,
     validate_schema,
+    validate_traceability,
     validate_with_retry,
 )
 
@@ -706,6 +710,213 @@ class TestValidateRun:
             if r.get("event") == "validate"
         ]
         assert passed == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# §14.4 traceability-declaration validation (ADR-0007 D2).
+# ---------------------------------------------------------------------------
+
+
+def _seed_requirements(
+    repo_root: Path, feature_id: str, *, reqs: list[str], acs: list[str]
+) -> None:
+    """Overwrite 01-requirements.json with the given REQ/AC ids (frozen)."""
+    root = feature_dir(repo_root, feature_id)
+    write_json(
+        root / REQUIREMENTS_JSON,
+        {
+            "feature": feature_id,
+            "frozen": True,
+            "requirements": [{"id": r, "statement": f"{r} statement"} for r in reqs],
+            "acceptance_criteria": [
+                {"id": a, "statement": f"{a} statement"} for a in acs
+            ],
+            "priority": None,
+            "scope": None,
+            "constraints": [],
+            "open_questions": [],
+        },
+    )
+
+
+def _declaring_result() -> dict[str, object]:
+    """A valid result.json that declares REQ-001 / AC-001."""
+    return dict(
+        _VALID_RESULT,
+        related_requirements=["REQ-001"],
+        related_acceptance_criteria=["AC-001"],
+    )
+
+
+class TestValidateTraceabilityUnit:
+    """``validate_traceability`` + ``read_run_role`` - the §14.4 seam in isolation."""
+
+    def test_read_run_role_parses_implementer(self, repo_root: Path) -> None:
+        feature_id, run_id = _make_run(repo_root)
+        assert read_run_role(run_dir(repo_root, feature_id, run_id)) == "Implementer"
+
+    def test_read_run_role_none_when_role_md_missing(self, tmp_path: Path) -> None:
+        assert read_run_role(tmp_path) is None
+
+    def test_non_implementer_role_is_skipped(self) -> None:
+        # A Code Reviewer run never declares coverage; the check is a no-op.
+        issues = validate_traceability(
+            {"related_requirements": []}, "Code Reviewer", ["REQ-001"], ["AC-001"]
+        )
+        assert issues == []
+
+    def test_empty_spec_is_noop(self) -> None:
+        # No REQ/AC allocated -> nothing to cover -> the check does not fire even
+        # for an implementer that declares nothing (matches the "honestly empty
+        # when there is no spec" baseline, ADR-0007).
+        assert validate_traceability({}, "Implementer", [], []) == []
+
+    def test_missing_declaration_fails(self) -> None:
+        issues = validate_traceability({}, "Implementer", ["REQ-001"], ["AC-001"])
+        assert len(issues) == 2  # both fields required when both id-sets exist
+        assert {i.code for i in issues} == {"traceability_missing"}
+        assert all(i.check == "traceability" and i.severity == "P1" for i in issues)
+
+    def test_unknown_id_fails(self) -> None:
+        result = {
+            "related_requirements": ["REQ-999"],  # not allocated
+            "related_acceptance_criteria": ["AC-001"],
+        }
+        issues = validate_traceability(result, "Implementer", ["REQ-001"], ["AC-001"])
+        assert len(issues) == 1
+        assert issues[0].code == "traceability_unknown_id"
+        assert "REQ-999" in issues[0].message
+
+    def test_malformed_non_list_fails(self) -> None:
+        result = {"related_requirements": "REQ-001", "related_acceptance_criteria": []}
+        issues = validate_traceability(result, "Implementer", ["REQ-001"], ["AC-001"])
+        assert any(i.code == "traceability_malformed" for i in issues)
+
+    def test_partial_scope_declaration_passes(self) -> None:
+        # ADR-0007 D2: a lane declares only its own subset, not every req. With
+        # REQ-001/REQ-002 allocated, declaring just REQ-001 is well-formed.
+        result = {"related_requirements": ["REQ-001"], "related_acceptance_criteria": []}
+        assert (
+            validate_traceability(result, "Implementer", ["REQ-001", "REQ-002"], ["AC-001"])
+            == []
+        )
+
+    def test_reqs_without_acs_do_not_require_ac_field(self) -> None:
+        # Only AC-001 allocated, no REQs: related_requirements is not required.
+        result = {"related_acceptance_criteria": ["AC-001"]}
+        assert validate_traceability(result, "Implementer", [], ["AC-001"]) == []
+
+
+class TestValidateRunTraceability:
+    """``validate_run`` enforces §14.4 end-to-end on an implementer run."""
+
+    def test_declaring_run_passes_when_spec_allocated(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+    ) -> None:
+        feature_id, run_id = _make_run(repo_root)
+        _seed_requirements(repo_root, feature_id, reqs=["REQ-001"], acs=["AC-001"])
+        _write_result(repo_root, feature_id, run_id, _declaring_result())
+        _write_metadata_with_profile(
+            repo_root, feature_id, run_id,
+            ["output/result.json", "output/result.md"], write_profiles,
+        )
+
+        result = validate_run(repo_root, feature_id, run_id)
+
+        assert result.passed is True
+        assert result.failed_check is None
+
+    def test_non_declaring_run_fails_when_spec_allocated(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+    ) -> None:
+        # The implementer was required to declare but result.json omits both
+        # fields -> §14.4 fails the run (ADR-0007 D2).
+        feature_id, run_id = _make_run(repo_root)
+        _seed_requirements(repo_root, feature_id, reqs=["REQ-001"], acs=["AC-001"])
+        _write_result(repo_root, feature_id, run_id, _VALID_RESULT)  # no declaration
+        _write_metadata_with_profile(
+            repo_root, feature_id, run_id,
+            ["output/result.json", "output/result.md"], write_profiles,
+        )
+
+        result = validate_run(repo_root, feature_id, run_id)
+
+        assert result.passed is False
+        assert result.failed_check == "traceability"
+        assert result.is_retryable is False
+        codes = {i.code for i in result.issues}
+        assert codes == {"traceability_missing"}
+
+    def test_empty_spec_run_passes_without_declaration(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+    ) -> None:
+        # No REQ/AC allocated (the seeded de-risking feature) -> §14.4 is a
+        # no-op, so a result.json without the declaration still validates. This
+        # is what keeps the v0.1-era de-risking fixtures green.
+        feature_id, run_id = _make_run(repo_root)
+        _write_result(repo_root, feature_id, run_id, _VALID_RESULT)
+        _write_metadata_with_profile(
+            repo_root, feature_id, run_id,
+            ["output/result.json", "output/result.md"], write_profiles,
+        )
+
+        result = validate_run(repo_root, feature_id, run_id)
+        assert result.passed is True
+
+    def test_non_implementer_run_not_checked(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+    ) -> None:
+        # A Code Reviewer run over an allocated spec: the §13 issues-schema
+        # result.json carries no declaration and must NOT trip §14.4.
+        feature_id, run_id = _make_run(repo_root, role="Code Reviewer")
+        _seed_requirements(repo_root, feature_id, reqs=["REQ-001"], acs=["AC-001"])
+        # The reviewer's result.json is an issues payload, not a task payload;
+        # it still passes the (role-agnostic) schema check because
+        # additionalProperties is true, and §14.4 skips non-implementer roles.
+        _write_result(
+            repo_root, feature_id, run_id, {"status": "proposed_done",
+                                            "summary": "reviewed", "tasks": [
+                                                {"id": "TASK-001",
+                                                 "status": "proposed_done",
+                                                 "evidence": []}]}
+        )
+        _write_metadata_with_profile(
+            repo_root, feature_id, run_id,
+            ["output/result.json", "output/result.md"], write_profiles,
+        )
+
+        result = validate_run(repo_root, feature_id, run_id)
+        assert result.passed is True
+
+    def test_corrupt_requirements_doc_fails_loud(
+        self,
+        repo_root: Path,
+        write_profiles: Callable[..., Path],
+    ) -> None:
+        # §24.2: a present-but-corrupt 01-requirements.json is not a silent
+        # "empty spec" -> it fails loud for an implementer run (the honesty gate
+        # must not be bypassed by corruption).
+        feature_id, run_id = _make_run(repo_root)
+        req_path = feature_dir(repo_root, feature_id) / REQUIREMENTS_JSON
+        req_path.write_text("{ not valid json")
+        _write_result(repo_root, feature_id, run_id, _VALID_RESULT)
+        _write_metadata_with_profile(
+            repo_root, feature_id, run_id,
+            ["output/result.json", "output/result.md"], write_profiles,
+        )
+
+        result = validate_run(repo_root, feature_id, run_id)
+
+        assert result.passed is False
+        assert any(i.code == "traceability_requirements_corrupt" for i in result.issues)
 
 
 # ---------------------------------------------------------------------------
