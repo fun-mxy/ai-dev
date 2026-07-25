@@ -50,12 +50,14 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from ai_dev.audit import append_audit_event
 from ai_dev.paths import (
     METADATA_JSON,
     OUTPUT_DIR,
+    RESULT_JSON,
+    RESULT_MD,
     WORKSPACE_DIR,
     feature_dir,
     run_dir,
@@ -357,6 +359,11 @@ def write_metadata(
     ended_at: str,
     exit_code: int,
     changed_files: list[str],
+    lane_id: str | None = None,
+    worktree_path: str | None = None,
+    branch: str | None = None,
+    base_ref: str | None = None,
+    commands: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write the §13.2 ``metadata.json`` with the wrapper-computed fact set.
 
@@ -367,10 +374,21 @@ def write_metadata(
     capture and the §14 verification commands are later tickets' concerns - but
     the fields are present so the schema is stable from day one.
 
+    v0.7 (ADR-0009 D2): when the run was performed in a lane worktree, the
+    caller passes the v0.7 lane identity (``lane_id`` / ``worktree_path`` /
+    ``branch`` / ``base_ref`` / ``commands``) so the run-home ``metadata.json``
+    records the lane context too. A standalone (non-lane) run omits these
+    kwargs; the JSON keys are absent rather than null - the §13.2 shape is
+    additive, not retroactively required. The lane-level ``metadata.json``
+    written by ``lane_run.write_lane_metadata`` is the canonical lane record;
+    this is the same fields stamped on the run-home record so the two files
+    agree on the lane identity by construction (``run_in_lane_worktree`` is
+    the only writer of both).
+
     No token field is ever written: the profile carries only variable *names*
     (§10.2) and the token value never reaches this function.
     """
-    md: dict[str, object] = {
+    md: dict[str, Any] = {
         "run_id": run_id,
         "profile": profile.name,
         "cli": profile.cli,
@@ -383,6 +401,20 @@ def write_metadata(
         "commits": [],
         "checks": [],
     }
+    # v0.7 lane identity: only present when this run was performed in a lane
+    # worktree (``run_in_lane_worktree`` always passes the kwargs; a v0.5-era
+    # caller that invokes ``run_headless`` without ``lane_context`` omits
+    # them and gets the v0.1 shape back).
+    if lane_id is not None:
+        md["lane_id"] = lane_id
+    if worktree_path is not None:
+        md["worktree_path"] = worktree_path
+    if branch is not None:
+        md["branch"] = branch
+    if base_ref is not None:
+        md["base_ref"] = base_ref
+    if commands is not None:
+        md["commands"] = commands
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         json.dump(md, f, indent=2)
@@ -538,6 +570,27 @@ def _resolve_claude(claude_path: str | None) -> str:
             f"claude CLI not found on PATH (set --claude-path or install claude)"
         )
     return resolved
+
+
+def _copy_agent_outputs(agent_cwd: Path, output_dir: Path) -> None:
+    """Copy the agent's ``output/result.{json,md}`` from ``agent_cwd`` to ``output_dir``.
+
+    v0.7 (ADR-0009 D2): when the agent ran in a non-run-home cwd (the lane
+    worktree), the §13.1 outputs land in the worktree's ``output/`` (the
+    agent writes to a relative path). This helper copies them back to the
+    run-home's ``output/`` so the §13.1 contract lives in the canonical
+    location the §14 validator reads from. The copy is best-effort: a
+    missing file is silently skipped (the agent did not write one yet, or
+    the §14.1 validator will surface it; this helper is not a validator).
+    Files outside ``output/`` (e.g. ``workspace/...``) are not touched -
+    only the two §13.1 mandatory outputs are collected.
+    """
+    for filename in (RESULT_JSON, RESULT_MD):
+        src = agent_cwd / OUTPUT_DIR / filename
+        if not src.is_file():
+            continue
+        dst = output_dir / filename
+        shutil.copyfile(src, dst)
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +925,8 @@ def run_headless(
     started_at: str | None = None,
     ended_at: str | None = None,
     origin: str | None = None,
+    cwd: Path | None = None,
+    lane_context: Mapping[str, Any] | None = None,
 ) -> RunResult:
     """Run a prepared ``RUN-NNN`` headless against ``profile`` and capture it.
 
@@ -895,6 +950,28 @@ def run_headless(
     ``claude_path`` is kept as a backward-compatible alias (existing callers and
     tests pass it). Whichever is set wins; the adapter resolves it onto its own
     binary (``claude`` / ``codex``).
+
+    v0.7 (ADR-0009 D2) affordances:
+
+    * ``cwd`` overrides the agent's working directory - normally the run-home
+      (the default and the v0.1-v0.6 behavior), now optionally the lane's
+      git worktree (``run_in_lane_worktree`` passes the worktree path). The
+      pre-run artifacts (``env-snapshot.txt`` / ``.run-settings.json``) and
+      ``stdout.log``/``stderr.log`` still live under the run-home's ``output/``
+      (so a single grep across the run-home finds every wrapper artifact);
+      ``changed_files`` is computed from the *cwd* (so an implement run on a
+      lane worktree correctly reports the files the agent wrote in the
+      worktree, not files copied into the run-home). When ``cwd`` differs from
+      the run-home, the agent's ``output/result.{json,md}`` are copied from
+      the cwd to the run-home after the run, so the §13.1 contract and the
+      §14 validator read from the canonical run-home.
+    * ``lane_context`` is the v0.7 lane identity dict (``lane_id`` /
+      ``worktree_path`` / ``branch`` / ``base_ref`` / ``commands``) - the
+      wrapper stamps the fields on the run-home ``metadata.json`` so the
+      run-home and the lane-level ``metadata.json`` agree. ``commands`` is the
+      per-leg command list (empty for the implementer / fix legs, populated by
+      the shell verifier's per-command results - the ticket names the field
+      for the metadata shape).
 
     The token *value* is read from ``os.environ`` by source name and lives only
     in the in-memory child env passed to the subprocess - it is on no returned
@@ -921,6 +998,23 @@ def run_headless(
     workspace_dir = run_root / WORKSPACE_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    # v0.7 (ADR-0009 D2): when the caller passes a ``cwd`` (e.g. the lane
+    # worktree), the agent runs in that directory. The pre-run artifacts
+    # (env snapshot, settings file) and ``stdout.log``/``stderr.log`` are
+    # still written to the run-home's ``output/`` (so the wrapper's artifacts
+    # stay in one canonical place); the agent's ``output/result.{json,md}``
+    # are written to the *cwd*'s ``output/`` and copied back to the run-home
+    # after the run (the §13.1 contract and §14 validator read from the
+    # run-home). The ``changed_files`` snapshot diff is taken against the
+    # *cwd* so it reports what the agent actually wrote in the worktree,
+    # not the run-home's mirror.
+    agent_cwd = cwd.resolve() if cwd is not None else run_root
+    if agent_cwd != run_root and not agent_cwd.is_dir():
+        raise ValueError(
+            f"lane_run cwd {agent_cwd} is not a directory; cannot run "
+            f"agent there (lane_run D2)"
+        )
 
     # §10.2/§10.3: resolve the token source NAME, then read the value from the
     # live env. A token-required adapter (claude) fails loud before any subprocess
@@ -962,7 +1056,7 @@ def run_headless(
         started=started,
     )
 
-    before = snapshot_tree(run_root)
+    before = snapshot_tree(agent_cwd)
 
     prompt = build_prompt(run_id, run_root)
     binary = runner.resolve_binary(cli_path if cli_path is not None else claude_path)
@@ -986,7 +1080,7 @@ def run_headless(
             # codex: prompt piped on stdin (``codex exec -``).
             completed = subprocess.run(
                 invocation.argv,
-                cwd=str(run_root),
+                cwd=str(agent_cwd),
                 env=child_env,
                 stdout=out_f,
                 stderr=err_f,
@@ -998,7 +1092,7 @@ def run_headless(
             # exactly as before the dispatch refactor.
             completed = subprocess.run(
                 invocation.argv,
-                cwd=str(run_root),
+                cwd=str(agent_cwd),
                 env=child_env,
                 stdout=out_f,
                 stderr=err_f,
@@ -1007,10 +1101,38 @@ def run_headless(
 
     ended = ended_at if ended_at is not None else utc_now_iso()
 
-    after = snapshot_tree(run_root)
+    # v0.7 (ADR-0009 D2): when the agent ran in a non-run-home cwd (the lane
+    # worktree), the agent's ``output/result.{json,md}`` are written there
+    # (the agent writes to a relative ``output/`` path). Copy them back to
+    # the run-home so the §13.1 contract lives in the canonical location
+    # the §14 validator reads from. The run-home's own ``output/`` was
+    # pre-populated with the wrapper's env-snapshot + settings + the
+    # ``stdout.log``/``stderr.log``; the copy is additive - it adds the
+    # agent's two §13.1 outputs without disturbing the wrapper's artifacts.
+    if agent_cwd != run_root:
+        _copy_agent_outputs(agent_cwd, output_dir)
+
+    after = snapshot_tree(agent_cwd)
     changed_files = compute_changed_files(before, after, runner.wrapper_owned_re)
 
     metadata_path = output_dir / METADATA_JSON
+    # v0.7 lane identity: stamp the run-home ``metadata.json`` with the lane
+    # fields so the run-home and the lane-level ``metadata.json`` agree. The
+    # keys are present only when ``lane_context`` was passed; a v0.1-v0.6
+    # caller (no lane context) gets the v0.1 shape back.
+    lane_kwargs: dict[str, Any] = {}
+    if lane_context is not None:
+        if "lane_id" in lane_context:
+            lane_kwargs["lane_id"] = str(lane_context["lane_id"])
+        if "worktree_path" in lane_context:
+            lane_kwargs["worktree_path"] = str(lane_context["worktree_path"])
+        if "branch" in lane_context:
+            lane_kwargs["branch"] = str(lane_context["branch"])
+        if "base_ref" in lane_context:
+            lane_kwargs["base_ref"] = str(lane_context["base_ref"])
+        if "commands" in lane_context:
+            raw_cmds = lane_context["commands"]
+            lane_kwargs["commands"] = list(raw_cmds) if raw_cmds else []
     write_metadata(
         metadata_path,
         run_id=run_id,
@@ -1019,6 +1141,7 @@ def run_headless(
         ended_at=ended,
         exit_code=exit_code,
         changed_files=changed_files,
+        **lane_kwargs,
     )
 
     # §2.1: the run lifecycle flows through the audit log. Carries no token -

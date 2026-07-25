@@ -1,4 +1,4 @@
-"""Implementer leg - v0.2 ticket 01 (spec §9.2, §26.3).
+"""Implementer leg - v0.2 ticket 01 / v0.7 ticket 03 (spec §9.2, §26.3, ADR-0009 D2).
 
 The Implementer leg is the first half of the v0.2 implement -> review/gap ->
 verify -> bundle -> lane-gate loop. From a feature run whose tasks + lane-graph
@@ -7,8 +7,13 @@ are *frozen* (§4.2), it:
 1. builds an Implementer input package - task text read from ``03-tasks.md``,
    allowed-files read from ``04-lane-graph.yml``'s expected/exclusive files for
    the lane - by *reusing* the v0.1 ``prepare_run`` (no new run mechanism);
-2. runs it headless via the v0.1 ``run_headless`` and validates it with the v0.1
-   ``validate_run`` (the §14 checks, including §14.4 traceability);
+2. v0.7 (ADR-0009 D2): runs the agent inside the lane's git worktree via
+   ``run_in_lane_worktree`` (the v0.7 lane-aware run orchestrator) - the
+   agent's ``cwd`` is the worktree, the lane-level ``metadata.json`` /
+   ``diff.patch`` / ``commits.log`` are written from there, and the
+   agent's ``output/result.{json,md}`` are collected back into the run-home
+   for the §13.1 contract. ``validate_run`` is then run against the run-home
+   (the §14 contract), the same proposed_done writeback as v0.2;
 3. writes the run's ``result.json`` task status back to canonical
    ``task-status.yml`` as ``proposed_done`` - via the deterministic
    ``mark_task_proposed_done`` writer, never the model (§4.3);
@@ -40,6 +45,7 @@ from typing import Any, Mapping
 import yaml
 
 from ai_dev.json_artifact import read_json_object
+from ai_dev.lane_run import run_in_lane_worktree
 from ai_dev.paths import (
     LANES_DIR,
     METADATA_JSON,
@@ -54,7 +60,6 @@ from ai_dev.run_prepare import prepare_run
 from ai_dev.run_wrapper import (
     DEFAULT_MAX_TURNS,
     DEFAULT_PERMISSION_MODE,
-    run_headless,
 )
 from ai_dev.status import frozen_artifacts_status, mark_task_proposed_done
 from ai_dev.templates import LANE_GRAPH_YML, TASKS_MD
@@ -560,47 +565,74 @@ def run_implementer_leg(
 ) -> ImplementerLegResult:
     """Run the full Implementer leg: prepare -> run -> validate -> writeback -> rollup.
 
-    Composes the v0.1 seams unchanged: ``build_implementer_input_package`` (which
-    reuses ``prepare_run``), ``run_headless`` (env isolation + capture), and
-    ``validate_run`` (the §14 checks, including the §14.4 traceability
-    declaration this leg's prompt now requires). The §9.2 limits fall out of this
-    composition: the boundary is the existing ``validate-run`` (reused, not
-    rebuilt), and the ``proposed_done`` writeback is *gated on a passing
-    validation* - a boundary-breaching or schema-invalid run never reaches
-    canonical ``task-status.yml``. The writeback is also lane-scoped: when the
-    lane declares its tasks, a ``proposed_done`` task the model declares outside
-    that set is rejected (§24.2) rather than written to canonical status, so the
-    model cannot propose work outside its lane. Finally the run's result +
-    metadata + verdict are rolled up into
-    ``lanes/<lane_id>/implement-result.{md,json}``.
+    v0.7 (ADR-0009 D2): the leg now executes inside the lane's git worktree
+    via ``run_in_lane_worktree``, which composes ``prepare_run`` +
+    ``run_headless`` (with ``cwd=worktree``) + the lane-level diff/commits/
+    metadata writers. The worktree is the v0.7 isolation primitive; the
+    run-home is the canonical §13.1 contract home the §14 validator reads
+    from. The agent's ``output/result.{json,md}`` are written into the
+    worktree (its relative cwd) and copied back to the run-home by the
+    wrapper; the lane-level ``metadata.json`` / ``diff.patch`` / ``commits.log``
+    are written by ``run_in_lane_worktree`` itself. This function then runs
+    the v0.1 ``validate_run`` against the run-home (the §14 contract), the
+    same proposed_done writeback as v0.2, and writes the lane-level
+    ``implement-result.{md,json}`` rollup - so the leg's *output surface* is
+    unchanged for downstream tickets.
+
+    The §9.2 limits still fall out of this composition: the boundary is the
+    existing ``validate-run`` (reused, not rebuilt), and the ``proposed_done``
+    writeback is *gated on a passing validation* - a boundary-breaching or
+    schema-invalid run never reaches canonical ``task-status.yml``. The
+    writeback is also lane-scoped: when the lane declares its tasks, a
+    ``proposed_done`` task the model declares outside that set is rejected
+    (§24.2) rather than written to canonical status, so the model cannot
+    propose work outside its lane.
 
     Returns an ``ImplementerLegResult`` whether the run passed or failed
     validation - the caller (CLI, ticket 06 e2e) decides what to do with a
-    failed leg; this function does not raise on a captured run failure (mirrors
-    ``run_headless`` / ``validate_run`` returning verdicts rather than raising).
-    It *does* raise ``ValueError`` (§24.2) when a passing run declares
-    ``proposed_done`` for a task outside the lane's declared task set - that is a
-    contract breach, not a captured run failure.
+    failed leg; this function does not raise on a captured run failure
+    (mirrors ``run_headless`` / ``validate_run`` returning verdicts rather
+    than raising). It *does* raise ``ValueError`` (§24.2) when a passing run
+    declares ``proposed_done`` for a task outside the lane's declared task
+    set - that is a contract breach, not a captured run failure.
     """
-    run_id = build_implementer_input_package(
-        repo_root, feature_id, lane_id, task_context_append=task_context_append,
-        origin=origin,
-    )
-    run_result = run_headless(
+    feature_root = require_feature_root(repo_root, feature_id)
+    # §4.2: the implementer leg consumes frozen tasks + lane-graph. An unfrozen
+    # precondition is rejected before reading anything or allocating a run.
+    require_frozen_tasks_and_lane_graph(feature_root)
+    task_text = read_task_text(feature_root)
+    # ADR-0007 D2: the implementer must declare its addressed REQs/ACs. The
+    # instruction is appended to the (frozen) task text so it reaches the
+    # implementer prompt without modifying the frozen 03-tasks.md artifact.
+    task_text = f"{task_text}{_TRACEABILITY_INSTRUCTION}"
+    if task_context_append is not None and task_context_append.strip():
+        task_text = f"{task_text}\n\n{task_context_append.strip()}"
+    lane = read_lane_entry(feature_root, lane_id)
+
+    # v0.7 lane-aware run: ``run_in_lane_worktree`` allocates the RUN-NNN
+    # inside ``prepare_run``, runs the agent with ``cwd=lane worktree``,
+    # collects ``output/result.{json,md}`` back to the run-home, captures the
+    # worktree's diff/commits, and writes the lane-level ``metadata.json`` /
+    # ``diff.patch`` / ``commits.log``. The returned ``run_id`` is the
+    # canonical run id; ``exit_code`` is the agent's exit; the lane-level
+    # artifacts are at ``LaneRunResult.lane_*``.
+    lane_result = run_in_lane_worktree(
         repo_root,
         feature_id,
-        run_id,
-        profile,
+        lane_id,
+        role=_IMPLEMENTER_ROLE,
+        task=task_text,
+        profile=profile,
+        allowed_files=lane_allowed_files(lane),
         max_turns=max_turns,
         permission_mode=permission_mode,
         claude_path=claude_path,
-        started_at=started_at,
-        ended_at=ended_at,
+        timestamp=started_at,
         origin=origin,
     )
+    run_id = lane_result.run_id
     validation = validate_run(repo_root, feature_id, run_id, origin=origin)
 
-    feature_root = feature_dir(repo_root, feature_id)
     run_root = run_dir(repo_root, feature_id, run_id)
     result = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
     metadata = read_json_object(run_root / OUTPUT_DIR / METADATA_JSON)
@@ -620,7 +652,6 @@ def run_implementer_leg(
         # task to canonical status. A lane with no declared tasks (the Planner
         # has not yet filled ``tasks:``) cannot be scoped, so the check is
         # skipped - the writeback trusts the model's declaration in that case.
-        lane = read_lane_entry(feature_root, lane_id)
         if lane.tasks:
             out_of_lane = [t for t in proposed_ids if t not in lane.tasks]
             if out_of_lane:
@@ -649,7 +680,7 @@ def run_implementer_leg(
         lane_id=lane_id,
         feature_id=feature_id,
         profile=profile.name,
-        exit_code=run_result.exit_code,
+        exit_code=lane_result.exit_code,
         result_status=result_status,
         validation=validation,
         task_ids_marked=task_ids_marked,

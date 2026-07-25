@@ -1,4 +1,4 @@
-"""Checking legs - v0.2 ticket 02 (spec §9.3/§9.4/§15, §26.3).
+"""Checking legs - v0.2 ticket 02 / v0.7 ticket 03 (spec §9.3/§9.4/§15, §26.3, ADR-0009 D2).
 
 The checking legs are the two review roles that run after an implement run:
 the Code Reviewer (§9.3) and the Spec Gap Analyst (§9.4). Both emit
@@ -7,13 +7,16 @@ output-schema and one ticket. From a feature run whose tasks + lane-graph are
 *frozen* (§4.2) AND whose lane has an ``implement-result`` (ticket 01), each
 leg:
 
-1. builds its input package by *reusing* the v0.1 ``prepare_run`` with the
-   shared §15 issues output-schema (no new run mechanism) - the reviewer's
-   task carries the implement run's ``changed_files`` + their contents (the
-   "diff") + the task context; the gap's carries requirements/design/tasks +
-   the implement diff;
-2. runs it headless via ``run_headless`` and validates it with ``validate_run``
-   (the §14 three checks, now against the issues schema);
+1. gathers the implement run facts - ``read_implement_run_facts`` reads the
+   lane's ``implement-result.json`` + the run's ``metadata.json`` +
+   each changed file's content from the lane's worktree (v0.7, ADR-0009 D2)
+   or the implement run dir (v0.1-v0.6 fallback);
+2. v0.7: runs the agent inside the lane's git worktree via
+   ``run_in_lane_worktree`` (the v0.7 lane-aware run orchestrator) - the
+   reviewer / gap agents see the lane's checkout as their cwd (the files
+   under review), and the lane-level ``metadata.json`` / ``diff.patch`` /
+   ``commits.log`` are written from there; ``validate_run`` runs against the
+   run-home (the §14 contract) - same as the implementer leg;
 3. rolls the run's ``issues[]`` + ``metadata`` + validation up into the
    lane-level ``review-report.{md,json}`` / ``spec-gap-report.{md,json}`` §4.4
    double product.
@@ -51,6 +54,11 @@ from typing import Any, Callable, Mapping
 
 from ai_dev.json_artifact import read_json_object
 from ai_dev.implement_leg import read_task_text
+from ai_dev.lane_run import run_in_lane_worktree
+from ai_dev.lane_worktree import (
+    WORKTREE_LIFECYCLE_ACTIVE,
+    load_lane_worktree,
+)
 from ai_dev.paths import (
     LANES_DIR,
     METADATA_JSON,
@@ -194,23 +202,52 @@ class ImplementRunFacts:
 
 
 def _read_changed_file_contents(
-    implement_run_root: Path, changed_files: list[str]
+    source_root: Path, changed_files: list[str]
 ) -> dict[str, str]:
-    """Read each changed file's content from the implement run dir (the "diff").
+    """Read each changed file's content from the source root (the "diff").
 
     v0.2's empty-workspace model means there is no before-state to diff against,
     so the new content of each changed file IS the change the reviewer/gap
-    inspects. A file that cannot be read (binary, permissions) is recorded as a
-    placeholder rather than crashing the gatherer - the report still carries the
-    ``changed_files`` list, and an unreadable blob is surfaced, not hidden.
+    inspects. v0.7 (ADR-0009 D2): ``source_root`` is the lane's worktree when
+    one is active (the implementer leg writes the files there); falls back to
+    the implement run dir (the v0.1-v0.6 location) for non-lane runs / tests
+    that bypass the worktree. A file that cannot be read (binary, permissions)
+    is recorded as a placeholder rather than crashing the gatherer - the
+    report still carries the ``changed_files`` list, and an unreadable blob is
+    surfaced, not hidden.
     """
     contents: dict[str, str] = {}
     for rel in changed_files:
         try:
-            contents[rel] = (implement_run_root / rel).read_text()
+            contents[rel] = (source_root / rel).read_text()
         except (OSError, UnicodeDecodeError):
             contents[rel] = f"<could not read {rel}>"
     return contents
+
+
+def _lane_worktree_root(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> Path | None:
+    """Return the lane's active worktree path, or ``None`` when no active one.
+
+    v0.7 (ADR-0009 D2): the implement leg writes the changed files into the
+    lane's git worktree; the checking legs read them from there so they
+    review the same files that were actually authored. When the lane has no
+    active worktree (v0.1-v0.6 run, a removed worktree, or a test that
+    bypassed the lane-aware path), this returns ``None`` and the caller
+    falls back to the implement run dir.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    metadata = load_lane_worktree(feature_root, lane_id)
+    if metadata is None or metadata.get("lifecycle") != WORKTREE_LIFECYCLE_ACTIVE:
+        return None
+    path_str = metadata.get("path")
+    if not isinstance(path_str, str) or not path_str:
+        return None
+    path = Path(path_str)
+    if not path.is_dir():
+        return None
+    return path
 
 
 def read_implement_run_facts(
@@ -219,13 +256,15 @@ def read_implement_run_facts(
     """Gather the implement run facts a checking leg reviews (ticket 01 -> 02).
 
     Reads the lane's ``implement-result.json`` for the implement run id, the
-    implement run's ``metadata.json`` for ``changed_files``, each changed file's
-    content from the implement run dir (the "diff"), and the task text from
-    ``03-tasks.md`` (the reviewer's task context, reusing the implementer leg's
-    reader so the two legs agree on what "the task" is). Fail-loud (§24.2) when
-    the lane has no ``implement-result`` (no implement run to check) or the
-    implement run / its metadata are missing - a checking leg with nothing to
-    review is a precondition breach, not a silent no-op.
+    implement run's ``metadata.json`` for ``changed_files``, each changed
+    file's content from the lane's worktree (v0.7, ADR-0009 D2) - or the
+    implement run dir as a fallback (v0.1-v0.6 path / no active worktree) -
+    and the task text from ``03-tasks.md`` (the reviewer's task context,
+    reusing the implementer leg's reader so the two legs agree on what "the
+    task" is). Fail-loud (§24.2) when the lane has no ``implement-result`` (no
+    implement run to check) or the implement run / its metadata are missing -
+    a checking leg with nothing to review is a precondition breach, not a
+    silent no-op.
     """
     feature_root = feature_dir(repo_root, feature_id)
     implement_result_path = (
@@ -258,7 +297,13 @@ def read_implement_run_facts(
         if isinstance(raw_changed, list)
         else []
     )
-    file_contents = _read_changed_file_contents(implement_run_root, changed_files)
+    # v0.7: prefer the lane's worktree (the canonical source of the
+    # implementer's authored files) when an active worktree exists; fall back
+    # to the implement run dir for v0.1-v0.6 runs / no-worktree cases. The
+    # file contents read here are the "diff" the reviewer / gap inspect.
+    worktree_root = _lane_worktree_root(repo_root, feature_id, lane_id)
+    source_root = worktree_root if worktree_root is not None else implement_run_root
+    file_contents = _read_changed_file_contents(source_root, changed_files)
     task_text = read_task_text(feature_root)
     return ImplementRunFacts(
         run_id=implement_run_id,
@@ -725,6 +770,7 @@ def _run_checking_leg(
     report_md_name: str,
     report_json_name: str,
     build_input_package: Callable[..., str],
+    output_schema: Mapping[str, Any] | None = None,
     claude_path: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
@@ -734,29 +780,75 @@ def _run_checking_leg(
 ) -> CheckingLegResult:
     """Run a checking leg end to end: build input -> run -> validate -> rollup.
 
-    Composes the v0.1 seams unchanged: the role-specific ``build_input_package``
-    (which reuses ``prepare_run`` with the issues schema), ``run_headless`` (env
-    isolation + capture), and ``validate_run`` (the §14 three checks against the
-    issues schema). Unlike the implementer leg there is no canonical writeback:
-    the checking legs only read the implement run and produce a report, so a
-    passing or failing validation both flow straight to the rollup. Returns a
+    v0.7 (ADR-0009 D2): the leg now executes inside the lane's git worktree
+    via ``run_in_lane_worktree`` (the same seam the implementer leg uses).
+    The reviewer / spec-gap agents see the lane's checkout (the implement
+    result they review) as their working directory; the lane-level
+    ``metadata.json`` / ``diff.patch`` / ``commits.log`` are written from
+    there. The run-home ``output/result.{json,md}`` are still collected back
+    from the worktree for the §13.1 contract the §14 validator reads from.
+
+    The role-specific ``build_input_package`` is still invoked first so the
+    §12.2 input package (with the issues schema) is rendered, and the
+    ``read_implement_run_facts`` gatherer reads the changed files from the
+    worktree (also v0.7-aware). The leg then delegates to
+    ``run_in_lane_worktree`` with the rendered task text and the lane's
+    allowed-files - the same as the implementer leg, just with a different
+    role and schema.
+
+    Unlike the implementer leg there is no canonical writeback: the checking
+    legs only read the implement run and produce a report, so a passing or
+    failing validation both flow straight to the rollup. Returns a
     ``CheckingLegResult`` whether the run passed or failed validation (mirrors
     ``run_implementer_leg`` / ``run_headless`` returning verdicts rather than
     raising on a captured run failure).
     """
-    run_id = build_input_package(repo_root, feature_id, lane_id, origin=origin)
-    run_result = run_headless(
+    feature_root = feature_dir(repo_root, feature_id)
+    if not feature_root.is_dir():
+        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
+    _require_frozen(feature_root)
+    # ``read_implement_run_facts`` is v0.7-aware (reads the changed files
+    # from the lane's worktree when one is active), so calling it here both
+    # pre-validates the precondition (no implement-result -> ValueError,
+    # §24.2) and gives us the task text the input package carries.
+    facts = read_implement_run_facts(repo_root, feature_id, lane_id)
+    # Render the role-specific task text the same way ``build_input_package``
+    # does, but compose it with the per-role allowed-files (we don't have
+    # a lane-entry handy here, so the file boundary is the empty allow-list
+    # - reviewer/gap agents don't write files; §14.2 only kicks in for an
+    # agent that wrote a file outside the allow-list, and the canonical
+    # shape is "no writes" for these legs).
+    from ai_dev.lane_run import DEFAULT_BASE_REF
+    if role == _REVIEWER_ROLE:
+        task_text = _reviewer_task_text(facts)
+    elif role == _SPEC_GAP_ROLE:
+        task_text = _spec_gap_task_text(feature_root, facts)
+    else:
+        raise ValueError(
+            f"checking leg role {role!r} is not a known role; "
+            f"expected one of {_REVIEWER_ROLE!r}, {_SPEC_GAP_ROLE!r} (§24.2)"
+        )
+    # v0.7 lane-aware run: ``run_in_lane_worktree`` allocates the RUN-NNN,
+    # runs the agent with ``cwd=lane worktree``, and writes the lane-level
+    # artifacts. The run id is the canonical id; the run-home is where
+    # ``validate_run`` reads from.
+    lane_result = run_in_lane_worktree(
         repo_root,
         feature_id,
-        run_id,
-        profile,
+        lane_id,
+        role=role,
+        task=task_text,
+        profile=profile,
+        allowed_files=[],
+        output_schema=output_schema,
+        base_ref=DEFAULT_BASE_REF,
         max_turns=max_turns,
         permission_mode=permission_mode,
         claude_path=claude_path,
-        started_at=started_at,
-        ended_at=ended_at,
+        timestamp=started_at,
         origin=origin,
     )
+    run_id = lane_result.run_id
     validation = validate_run(repo_root, feature_id, run_id, origin=origin)
 
     feature_root = feature_dir(repo_root, feature_id)
@@ -786,7 +878,7 @@ def _run_checking_leg(
         profile=profile.name,
         role=role,
         source=source,
-        exit_code=run_result.exit_code,
+        exit_code=lane_result.exit_code,
         validation=validation,
         issue_count=issue_count,
         report_md=md_path,
@@ -819,6 +911,7 @@ def run_reviewer_leg(
         report_md_name=REVIEW_REPORT_MD,
         report_json_name=REVIEW_REPORT_JSON,
         build_input_package=build_reviewer_input_package,
+        output_schema=ISSUES_OUTPUT_SCHEMA,
         claude_path=claude_path,
         max_turns=max_turns,
         permission_mode=permission_mode,
@@ -853,6 +946,7 @@ def run_spec_gap_leg(
         report_md_name=SPEC_GAP_REPORT_MD,
         report_json_name=SPEC_GAP_REPORT_JSON,
         build_input_package=build_spec_gap_input_package,
+        output_schema=ISSUES_OUTPUT_SCHEMA,
         claude_path=claude_path,
         max_turns=max_turns,
         permission_mode=permission_mode,

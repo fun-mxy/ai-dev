@@ -6,6 +6,7 @@ throwaway tmp directory that stands in for a repo root.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Callable
 
@@ -81,3 +82,44 @@ def clean_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for var in TOKEN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """Throwaway git repo at ``tmp_path`` with an initial commit + identity.
+
+    v0.7 lane worktree tests need a real git working tree to call
+    ``git worktree add``. This fixture inits a repo, sets a commit identity,
+    and makes a single README commit so the worktree machinery has a
+    non-empty base ref. Mirrors the v0.7 ``tests/test_lane_run.py``
+    ``git_repo`` fixture - now hoisted to conftest so v0.2 / v0.3 / v0.5
+    / e2e tests can opt in by replacing ``repo_root`` with ``git_repo``
+    in the test signature.
+    """
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "tester"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("init\n")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "README.md"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+    return tmp_path

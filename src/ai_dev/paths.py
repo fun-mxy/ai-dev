@@ -28,6 +28,7 @@ WORKSPACE_DIR = "workspace"
 # truth for the on-disk contract names - previously the wrapper held
 # ``metadata.json`` as a private constant and the validator re-spelled it.
 RESULT_JSON = "result.json"
+RESULT_MD = "result.md"
 METADATA_JSON = "metadata.json"
 
 

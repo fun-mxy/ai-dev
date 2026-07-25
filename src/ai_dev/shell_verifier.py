@@ -58,6 +58,10 @@ from typing import Any, Mapping, Sequence
 from ai_dev.audit import append_audit_event
 from ai_dev.implement_leg import read_lane_entry
 from ai_dev.json_artifact import read_json_object
+from ai_dev.lane_worktree import (
+    WORKTREE_LIFECYCLE_ACTIVE,
+    load_lane_worktree,
+)
 from ai_dev.paths import (
     LANES_DIR,
     WORKSPACE_DIR,
@@ -493,6 +497,33 @@ class VerifierResult:
     report_json: Path
 
 
+def _lane_worktree_root(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> Path | None:
+    """Return the lane's active worktree path, or ``None`` when no active one.
+
+    v0.7 (ADR-0009 D2): the implementer leg writes the files under
+    verification into the lane's git worktree; the verifier runs its
+    commands in that worktree's cwd so it sees the implemented files
+    (and any files written into the worktree between implement and
+    verify). When the lane has no active worktree (v0.1-v0.6 run, a
+    removed worktree, or a test that bypassed the lane-aware path),
+    this returns ``None`` and the caller falls back to the implement
+    run's ``workspace/``.
+    """
+    feature_root = feature_dir(repo_root, feature_id)
+    metadata = load_lane_worktree(feature_root, lane_id)
+    if metadata is None or metadata.get("lifecycle") != WORKTREE_LIFECYCLE_ACTIVE:
+        return None
+    path_str = metadata.get("path")
+    if not isinstance(path_str, str) or not path_str:
+        return None
+    path = Path(path_str)
+    if not path.is_dir():
+        return None
+    return path
+
+
 def run_verifier(
     repo_root: Path,
     feature_id: str,
@@ -509,14 +540,21 @@ def run_verifier(
     declared command set from the frozen lane-graph), ``read_implement_run_id``
     (the implement run whose workspace is verified), ``run_verify_command`` per
     command (deterministic shell, no model), then ``write_verification_report``
-    (the lane-level §4.4 double product) and one ``verify`` audit record. Returns
-    a ``VerifierResult`` whether every command passed or some failed - a
-    verification failure is a captured result (reported, non-zero CLI exit), not
-    a raised exception. It *does* raise ``ValueError`` (§24.2 fail loud) when the
-    precondition is broken: an unfrozen feature, a lane with no declared verify
-    commands, a missing ``implement-result``, or a missing implement-run
-    workspace - all config/precondition breaches needing human triage, raised
-    before any command runs.
+    (the lane-level §4.4 double product) and one ``verify`` audit record.
+
+    v0.7 (ADR-0009 D2): the verify commands run with ``cwd=lane worktree`` (the
+    same cwd the implementer leg wrote the files into) when an active lane
+    worktree exists; otherwise the v0.1-v0.6 cwd (``implement_run/workspace/``)
+    is used. This way a file written into the worktree between implement and
+    verify is visible to the verify command (the §18.4 lane gate's
+    "verification of what was actually implemented" precondition). Returns a
+    ``VerifierResult`` whether every command passed or some failed - a
+    verification failure is a captured result (reported, non-zero CLI exit),
+    not a raised exception. It *does* raise ``ValueError`` (§24.2 fail loud)
+    when the precondition is broken: an unfrozen feature, a lane with no
+    declared verify commands, a missing ``implement-result``, or a missing
+    cwd (worktree or workspace) - all config/precondition breaches needing
+    human triage, raised before any command runs.
 
     ``timeout`` bounds each command (§24.1 timeout); ``started_at`` /
     ``ended_at`` are injectable for deterministic tests (defaulting to
@@ -531,17 +569,28 @@ def run_verifier(
     commands = read_verification_commands(feature_root, lane_id)
     implement_run_id = read_implement_run_id(feature_root, lane_id)
 
-    implement_run_root = run_dir(repo_root, feature_id, implement_run_id)
-    workspace = implement_run_root / WORKSPACE_DIR
-    if not workspace.is_dir():
-        raise ValueError(
-            f"implement run {implement_run_id} has no workspace/ at "
-            f"{workspace}; cannot run verify commands against it (§24.2)"
-        )
+    # v0.7 cwd resolution: prefer the lane's worktree (the canonical cwd of
+    # the implement leg's writes) when an active worktree exists; fall back
+    # to the implement run's ``workspace/`` (the v0.1-v0.6 cwd) for the
+    # non-lane path. The fallback keeps the v0.1-v0.6 tests and ticket-03
+    # e2e green without forcing every caller through the lane worktree
+    # lifecycle; the lane-worktree path is the v0.7 default.
+    worktree_root = _lane_worktree_root(repo_root, feature_id, lane_id)
+    if worktree_root is not None:
+        cwd = worktree_root
+    else:
+        implement_run_root = run_dir(repo_root, feature_id, implement_run_id)
+        workspace = implement_run_root / WORKSPACE_DIR
+        if not workspace.is_dir():
+            raise ValueError(
+                f"implement run {implement_run_id} has no workspace/ at "
+                f"{workspace}; cannot run verify commands against it (§24.2)"
+            )
+        cwd = workspace
 
     started = started_at if started_at is not None else utc_now_iso()
     results = [
-        run_verify_command(cmd, workspace, timeout=timeout) for cmd in commands
+        run_verify_command(cmd, cwd, timeout=timeout) for cmd in commands
     ]
     ended = ended_at if ended_at is not None else utc_now_iso()
 
@@ -565,6 +614,15 @@ def run_verifier(
             "verdict": verdict,
             "command_count": len(results),
             "passed_count": sum(1 for r in results if r.passed),
+            "commands": [
+                {
+                    "name": r.name,
+                    "command": r.command,
+                    "exit_code": r.exit_code,
+                    "passed": r.passed,
+                }
+                for r in results
+            ],
             "elapsed_ms": elapsed_ms_between(started, ended),
         },
         origin=origin,
