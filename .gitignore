@@ -3,6 +3,7 @@
 
 # Claude Code worktrees — local isolated working copies, not project state
 .claude/worktrees/
+.claude/plans/
 
 # Throwaway adapter prototype (de-risk artifact). Kept on disk as a v0.1
 # reference, NOT project code — see prototype/adapter/run.sh header "Do NOT promote".
