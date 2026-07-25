@@ -547,70 +547,59 @@ def _args_validate_run(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("run_id", help="The RUN-NNN id to validate.")
 
 
-def _args_generate_requirements(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose intent (00-intent.md) the Planner elaborates "
-        "into a requirements proposal.",
-    )
-    sub.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
-        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
-        "unfrozen 01-requirements until you freeze it.",
-    )
+def _args_generate(
+    sub: argparse.ArgumentParser, *, feature_help: str, feedback_help: str
+) -> None:
+    """Shared argsetup for the planner generate-* commands (v0.6 tickets 02-04).
+
+    Each planner leg takes the same surface: a ``feature_id`` positional, an
+    optional ``--feedback`` refinement note (ADR-0008 D4), and the shared run
+    flags. Only the two help strings differ per stage, so they are the parameters;
+    the planner ``profile_help`` is one source here, not three copies.
+    """
+    sub.add_argument("feature_id", help=feature_help)
+    sub.add_argument("--feedback", default=None, help=feedback_help)
     _add_run_flags(
         sub,
         profile_default=None,
         profile_help="Agent profile to invoke (default: role_defaults[planner] in "
         "agent-profiles.yml; --profile always overrides, no allowed-set, no "
         "refusal).",
+    )
+
+
+def _args_generate_requirements(sub: argparse.ArgumentParser) -> None:
+    _args_generate(
+        sub,
+        feature_help="The FEATURE-NNN whose intent (00-intent.md) the Planner "
+        "elaborates into a requirements proposal.",
+        feedback_help="Human refinement note carried into the Planner input package "
+        "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
+        "unfrozen 01-requirements until you freeze it.",
     )
 
 
 def _args_generate_design(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
-        "the Planner designs against. Requirements must be frozen first.",
-    )
-    sub.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
+    _args_generate(
+        sub,
+        feature_help="The FEATURE-NNN whose frozen requirements "
+        "(01-requirements.json) the Planner designs against. Requirements must be "
+        "frozen first.",
+        feedback_help="Human refinement note carried into the Planner input package "
         "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
         "unfrozen 02-design until you freeze it.",
-    )
-    _add_run_flags(
-        sub,
-        profile_default=None,
-        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
-        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
-        "refusal).",
     )
 
 
 def _args_generate_tasks(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "feature_id",
-        help="The FEATURE-NNN whose frozen requirements (01-requirements.json) "
-        "AND design (02-design.json) the Planner tasks against. Both must be "
-        "frozen first.",
-    )
-    sub.add_argument(
-        "--feedback",
-        default=None,
-        help="Human refinement note carried into the Planner input package "
+    _args_generate(
+        sub,
+        feature_help="The FEATURE-NNN whose frozen requirements "
+        "(01-requirements.json) AND design (02-design.json) the Planner tasks "
+        "against. Both must be frozen first.",
+        feedback_help="Human refinement note carried into the Planner input package "
         "(ADR-0008 D4). Re-run with --feedback to refine; promote overwrites the "
         "unfrozen 03-tasks until you freeze it.",
-    )
-    _add_run_flags(
-        sub,
-        profile_default=None,
-        profile_help="Agent profile to invoke (default: role_defaults[planner] in "
-        "agent-profiles.yml; --profile always overrides, no allowed-set, no "
-        "refusal).",
     )
 
 
@@ -1166,32 +1155,37 @@ def _run_implement(
     return 1
 
 
-def _run_generate_requirements(
+def _run_generate(
     repo_root: Path,
     feature_id: str,
     profile_name: str,
     feedback: str | None,
     max_turns: int,
     permission_mode: str,
+    *,
+    leg: Callable[..., PlannerLegResult],
+    label: str,
+    id_keys: Sequence[str],
 ) -> int:
-    """Run the Planner requirements leg end to end (v0.6 ticket 02, §9.1).
+    """Run a Planner generate leg end to end (v0.6 tickets 02-04, §9.1, ADR-0008 D2).
 
-    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
-    ``run_generate_requirements`` (build the Planner input package from the
-    feature intent -> run headless -> validate -> promote, gated on validation),
-    and prints a one-line summary. Returns ``0`` when the run validated and
-    promote wrote the canonical-unfrozen ``01-requirements.{json,md}``; ``1``
-    when validation failed (a captured run failure is reported, not raised — no
-    canonical artifact is written for a schema-invalid proposal) or when the leg
-    cannot start (missing feature/intent, missing token). promote errors
-    (malformed proposal / frozen artifact) propagate as a clean ``error:`` line
-    via the top-level handler.
+    Shared by the ``generate-requirements``/``generate-design``/``generate-tasks``
+    commands: loads the profile (fail loud on a missing file/profile, §24.2),
+    delegates to the leg (build the Planner input package from the feature intent
+    [+ frozen requirements [+ frozen design]] -> run headless -> validate ->
+    promote, gated on validation), and prints a one-line summary. Returns ``0``
+    when the run validated and promote wrote the canonical-unfrozen artifact;
+    ``1`` when validation failed (a captured run failure is reported, not raised
+    — no canonical artifact is written for a schema-invalid proposal) or when the
+    leg cannot start (missing feature/intent, upstream not frozen, missing token).
+    promote errors (malformed proposal / unresolved ref / frozen artifact)
+    propagate as a clean ``error:`` line via the top-level handler.
     """
     profile = _load_profile_or_render(repo_root, profile_name)
     if profile is None:
         return 1
     try:
-        result: PlannerLegResult = run_generate_requirements(
+        result: PlannerLegResult = leg(
             repo_root,
             feature_id,
             profile,
@@ -1206,12 +1200,12 @@ def _run_generate_requirements(
     # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
     promote = result.promote
     if result.validation.passed and promote is not None:
-        req_ids = list(promote.allocated.get("REQ", []))
-        ac_ids = list(promote.allocated.get("AC", []))
+        ids_part = " ".join(
+            f"{key}={list(promote.allocated.get(key, []))}" for key in id_keys
+        )
         print(
-            f"GENERATE-REQUIREMENTS PASS - {result.run_id} feature={result.feature_id} "
-            f"stage={result.stage} promoted={promote.json_path.name} "
-            f"REQ={req_ids} AC={ac_ids}"
+            f"{label} PASS - {result.run_id} feature={result.feature_id} "
+            f"stage={result.stage} promoted={promote.json_path.name} {ids_part}"
         )
         return 0
     # Distinguish the two no-promote causes honestly. Validation failing is the
@@ -1221,18 +1215,45 @@ def _run_generate_requirements(
     # failure, since validation already attested the proposal is schema-valid.
     if result.validation.passed:
         print(
-            f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+            f"{label} FAIL - {result.run_id} feature={result.feature_id} "
             f"stage={result.stage}; validation passed but no result.json proposal "
             f"was readable to promote (unexpected):"
         )
         return 1
     print(
-        f"GENERATE-REQUIREMENTS FAIL - {result.run_id} feature={result.feature_id} "
+        f"{label} FAIL - {result.run_id} feature={result.feature_id} "
         f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
         f"§14 validation):"
     )
     _print_validation_issues(result.validation.issues)
     return 1
+
+
+def _run_generate_requirements(
+    repo_root: Path,
+    feature_id: str,
+    profile_name: str,
+    feedback: str | None,
+    max_turns: int,
+    permission_mode: str,
+) -> int:
+    """Run the Planner requirements leg (v0.6 ticket 02, §9.1, ADR-0008 D2).
+
+    promote allocates REQ/AC ids, stitches the AC local refs (D3), and writes the
+    canonical-unfrozen ``01-requirements.{json,md}``; no upstream frozen
+    precondition (the requirements leg is the head of the chain).
+    """
+    return _run_generate(
+        repo_root,
+        feature_id,
+        profile_name,
+        feedback,
+        max_turns,
+        permission_mode,
+        leg=run_generate_requirements,
+        label="GENERATE-REQUIREMENTS",
+        id_keys=("REQ", "AC"),
+    )
 
 
 def _run_generate_design(
@@ -1243,60 +1264,23 @@ def _run_generate_design(
     max_turns: int,
     permission_mode: str,
 ) -> int:
-    """Run the Planner design leg end to end (v0.6 ticket 03, §9.1, ADR-0008 D2).
+    """Run the Planner design leg (v0.6 ticket 03, §9.1, ADR-0008 D2).
 
-    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
-    ``run_generate_design`` (build the Planner input package from the feature
-    intent + frozen requirements -> run headless -> validate -> promote, gated on
-    validation), and prints a one-line summary. Returns ``0`` when the run
-    validated and promote wrote the canonical-unfrozen ``02-design.{json,md}``;
-    ``1`` when validation failed (a captured run failure is reported, not raised
-    - no canonical artifact is written for a schema-invalid proposal) or when the
-    leg cannot start (missing feature/intent, requirements not frozen, missing
-    token). promote errors (malformed proposal / unresolved ref / frozen artifact)
-    propagate as a clean ``error:`` line via the top-level handler.
+    Requires ``01-requirements.json`` frozen first. promote allocates DES ids,
+    resolves refs against the frozen requirements, and writes the
+    canonical-unfrozen ``02-design.{json,md}``.
     """
-    profile = _load_profile_or_render(repo_root, profile_name)
-    if profile is None:
-        return 1
-    try:
-        result: PlannerLegResult = run_generate_design(
-            repo_root,
-            feature_id,
-            profile,
-            feedback=feedback,
-            max_turns=max_turns,
-            permission_mode=permission_mode,
-            origin=ORIGIN_PLANNER_LEG,
-        )
-    except ValueError as exc:
-        return _exit_value_error(repo_root, feature_id, exc)
-    # ``result.promote`` narrows to ``PromoteResult`` here (no type: ignore): the
-    # ``is not None`` guard is what mypy follows, unlike the ``promoted`` property.
-    promote = result.promote
-    if result.validation.passed and promote is not None:
-        des_ids = list(promote.allocated.get("DES", []))
-        print(
-            f"GENERATE-DESIGN PASS - {result.run_id} feature={result.feature_id} "
-            f"stage={result.stage} promoted={promote.json_path.name} "
-            f"DES={des_ids}"
-        )
-        return 0
-    # Distinguish the two no-promote causes honestly (mirrors the requirements leg).
-    if result.validation.passed:
-        print(
-            f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
-            f"stage={result.stage}; validation passed but no result.json proposal "
-            f"was readable to promote (unexpected):"
-        )
-        return 1
-    print(
-        f"GENERATE-DESIGN FAIL - {result.run_id} feature={result.feature_id} "
-        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
-        f"§14 validation):"
+    return _run_generate(
+        repo_root,
+        feature_id,
+        profile_name,
+        feedback,
+        max_turns,
+        permission_mode,
+        leg=run_generate_design,
+        label="GENERATE-DESIGN",
+        id_keys=("DES",),
     )
-    _print_validation_issues(result.validation.issues)
-    return 1
 
 
 def _run_generate_tasks(
@@ -1307,59 +1291,24 @@ def _run_generate_tasks(
     max_turns: int,
     permission_mode: str,
 ) -> int:
-    """Run the Planner tasks leg end to end (v0.6 ticket 04, §9.1, ADR-0008 D2).
+    """Run the Planner tasks leg (v0.6 ticket 04, §9.1, ADR-0008 D2).
 
-    Loads the profile (fail loud on a missing file/profile, §24.2), delegates to
-    ``run_generate_tasks`` (build the Planner input package from the feature
-    intent + frozen requirements + frozen design -> run headless -> validate ->
-    promote, gated on validation), and prints a one-line summary. Returns ``0``
-    when the run validated and promote wrote the canonical-unfrozen
-    ``03-tasks.{json,md}`` (+ seeded ``task-status.yml`` + populated
-    ``04-lane-graph.yml``); ``1`` when validation failed (a captured run failure
-    is reported, not raised - no canonical artifact is written for a schema-invalid
-    proposal) or when the leg cannot start (missing feature/intent, requirements or
-    design not frozen, missing token). promote errors (malformed proposal /
-    unresolved ref / frozen artifact) propagate as a clean ``error:`` line via the
-    top-level handler.
+    Requires ``01-requirements.json`` and ``02-design.json`` frozen first. promote
+    allocates TASK ids, resolves refs against the frozen requirements + design, and
+    writes the canonical-unfrozen ``03-tasks.{json,md}`` (plus seeded
+    ``task-status.yml`` and populated ``04-lane-graph.yml``).
     """
-    profile = _load_profile_or_render(repo_root, profile_name)
-    if profile is None:
-        return 1
-    try:
-        result: PlannerLegResult = run_generate_tasks(
-            repo_root,
-            feature_id,
-            profile,
-            feedback=feedback,
-            max_turns=max_turns,
-            permission_mode=permission_mode,
-            origin=ORIGIN_PLANNER_LEG,
-        )
-    except ValueError as exc:
-        return _exit_value_error(repo_root, feature_id, exc)
-    promote = result.promote
-    if result.validation.passed and promote is not None:
-        task_ids = list(promote.allocated.get("TASK", []))
-        print(
-            f"GENERATE-TASKS PASS - {result.run_id} feature={result.feature_id} "
-            f"stage={result.stage} promoted={promote.json_path.name} "
-            f"TASK={task_ids}"
-        )
-        return 0
-    if result.validation.passed:
-        print(
-            f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
-            f"stage={result.stage}; validation passed but no result.json proposal "
-            f"was readable to promote (unexpected):"
-        )
-        return 1
-    print(
-        f"GENERATE-TASKS FAIL - {result.run_id} feature={result.feature_id} "
-        f"({len(result.validation.issues)} problem(s)); no promote (proposal failed "
-        f"§14 validation):"
+    return _run_generate(
+        repo_root,
+        feature_id,
+        profile_name,
+        feedback,
+        max_turns,
+        permission_mode,
+        leg=run_generate_tasks,
+        label="GENERATE-TASKS",
+        id_keys=("TASK",),
     )
-    _print_validation_issues(result.validation.issues)
-    return 1
 
 
 def _run_checking(
