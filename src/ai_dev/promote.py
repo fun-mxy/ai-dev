@@ -1558,6 +1558,135 @@ def _upstream_id_set(feature_root: Path, json_name: str, field: str) -> set[str]
     return _doc_id_set(doc, field)
 
 
+class _RefSpec(NamedTuple):
+    """One reference-integrity check on a (possibly hand-edited) canonical doc.
+
+    The table-driven core of :func:`validate_artifact_refs` (mirrors the
+    ``_ARTIFACT_BUILDER`` table-driven shape candidate 4 gave promote): each row
+    says - walk ``walk_field``; on each mapping entry, read ``ref_field`` (a
+    scalar or a list of refs per ``cardinality``); every non-empty string ref
+    must resolve against the known ids sourced from this doc (``known_json`` is
+    ``None`` -> intra-doc ``known_field``) or a frozen upstream (``known_json`` +
+    ``known_field``). The message bits reproduce the existing per-context
+    diagnostics byte-for-byte via :func:`_ref_violation_msg`. Adding a ref field
+    is one row here, not a new ``if/elif`` branch.
+    """
+
+    walk_field: str
+    ref_field: str
+    cardinality: str  # "scalar" | "list"
+    known_field: str  # doc field holding the target ids
+    known_json: str | None  # upstream json filename, or None for intra-doc
+    subject_label: str  # "acceptance criterion" | "design mapping" | "task"
+    subject_id_field: str  # entry field shown as the subject ("id" | "key")
+    ref_prefix: str  # "" | "design element " | "requirement "
+    target_phrase: str  # "a requirement id in this doc" | "a frozen design id" | ...
+    known_label: str | None  # None = omit known list; else "known" | "known REQ" | "known DES"
+
+
+# Per-artifact reference-integrity checks. Each row is one ref-kind; the walker
+# below is generic. ``known_json is None`` marks an intra-doc check (always run);
+# a frozen-upstream check is best-effort (skipped if the upstream file is
+# unreadable). REQ refs in requirements and DES refs in design are intra-doc;
+# cross-stage REQ/DES refs resolve against the frozen upstream artifact.
+_REF_SPECS: Mapping[str, tuple[_RefSpec, ...]] = {
+    REQUIREMENTS_ARTIFACT: (
+        _RefSpec(
+            walk_field="acceptance_criteria", ref_field="requirement",
+            cardinality="scalar",
+            known_field="requirements", known_json=None,
+            subject_label="acceptance criterion", subject_id_field="id",
+            ref_prefix="", target_phrase="a requirement id in this doc",
+            known_label="known",
+        ),
+    ),
+    DESIGN_ARTIFACT: (
+        _RefSpec(
+            walk_field="requirement_mapping", ref_field="requirement",
+            cardinality="scalar",
+            known_field="requirements", known_json=REQUIREMENTS_JSON,
+            subject_label="design mapping", subject_id_field="key",
+            ref_prefix="", target_phrase="a frozen requirement id",
+            known_label="known REQ",
+        ),
+        _RefSpec(
+            walk_field="requirement_mapping", ref_field="design_elements",
+            cardinality="list",
+            known_field="design_elements", known_json=None,
+            subject_label="design mapping", subject_id_field="key",
+            ref_prefix="design element ", target_phrase="defined in this doc",
+            known_label="known DES",
+        ),
+    ),
+    TASKS_ARTIFACT: (
+        _RefSpec(
+            walk_field="tasks", ref_field="related_requirements",
+            cardinality="list",
+            known_field="requirements", known_json=REQUIREMENTS_JSON,
+            subject_label="task", subject_id_field="id",
+            ref_prefix="requirement ", target_phrase="a frozen requirement id",
+            known_label=None,
+        ),
+        _RefSpec(
+            walk_field="tasks", ref_field="related_design",
+            cardinality="list",
+            known_field="design_elements", known_json=DESIGN_JSON,
+            subject_label="task", subject_id_field="id",
+            ref_prefix="design element ", target_phrase="a frozen design id",
+            known_label=None,
+        ),
+    ),
+}
+
+
+def _known_ids(
+    spec: _RefSpec, doc: Mapping[str, Any], feature_root: Path
+) -> set[str] | None:
+    """The known-id set for ``spec``'s target, or ``None`` if upstream is unreadable.
+
+    Intra-doc (``known_json is None``) reads ids from this doc via
+    :func:`_doc_id_set` (always returns a set). Upstream reads a frozen artifact
+    via :func:`_upstream_id_set` (``None`` when absent/unreadable -> caller skips).
+    """
+    if spec.known_json is None:
+        return _doc_id_set(doc, spec.known_field)
+    return _upstream_id_set(feature_root, spec.known_json, spec.known_field)
+
+
+def _iter_refs(value: Any, cardinality: str) -> list[Any]:
+    """Yield the ref(s) held in a ``ref_field`` value (scalar -> one, list -> many).
+
+    A scalar field yields the single value; a list field yields its members
+    (``None``/missing -> ``[]``, matching the prior ``... or []`` coercion). The
+    walker's ``isinstance(ref, str) and ref`` filter then ignores non-string /
+    empty members for both cardinalities - the same shape the per-branch code had.
+    """
+    if cardinality == "scalar":
+        return [value]
+    return value or []
+
+
+def _ref_violation_msg(
+    spec: _RefSpec, entry: Mapping[str, Any], ref: str, known: set[str], artifact: str
+) -> str:
+    """Reproduce the existing per-context violation message byte-for-byte.
+
+    One template; the per-row bits (subject label + id field, ref prefix, target
+    phrase, known-list label) carry the variation the 3-branch ``if/elif`` spelled
+    inline. ``known_label is None`` omits the known list (the tasks-stage messages).
+    """
+    subject = f"{spec.subject_label} {entry.get(spec.subject_id_field, '?')!r}"
+    ref_phrase = f"{spec.ref_prefix}{ref!r}"
+    if spec.known_label is None:
+        known_phrase = ""
+    else:
+        known_phrase = f" ({spec.known_label}: {sorted(known) or '(none)'})"
+    return (
+        f"{subject} references {ref_phrase}, which is not {spec.target_phrase}"
+        f"{known_phrase}; the edited {artifact} artifact is malformed (ADR-0008 D3)"
+    )
+
+
 def validate_artifact_refs(
     artifact: str, doc: Mapping[str, Any], feature_root: Path
 ) -> None:
@@ -1577,78 +1706,23 @@ def validate_artifact_refs(
     an unrelated reason. Intra-doc refs are always checked (the ids live in the
     same doc). Tasks have no intra-doc refs (their refs are all upstream).
     """
-    if artifact == REQUIREMENTS_ARTIFACT:
-        req_ids = _doc_id_set(doc, "requirements")
-        for ac in doc.get("acceptance_criteria", []) or []:
-            if not isinstance(ac, Mapping):
+    specs = _REF_SPECS.get(artifact, ())
+    if not specs:
+        # An unknown / non-renderable artifact has no refs to validate; render's
+        # own guard rejects it before reaching here, so this is a quiet no-op.
+        return
+    for spec in specs:
+        known = _known_ids(spec, doc, feature_root)
+        if known is None:
+            continue  # best-effort: an unreadable upstream skips this ref-kind
+        for entry in doc.get(spec.walk_field, []) or []:
+            if not isinstance(entry, Mapping):
                 continue
-            ref = ac.get("requirement")
-            if isinstance(ref, str) and ref and ref not in req_ids:
-                raise UnresolvedRefError(
-                    f"acceptance criterion {ac.get('id', '?')!r} references "
-                    f"{ref!r}, which is not a requirement id in this doc "
-                    f"(known: {sorted(req_ids) or '(none)'}); the edited "
-                    f"requirements artifact is malformed (ADR-0008 D3)"
-                )
-    elif artifact == DESIGN_ARTIFACT:
-        des_ids = _doc_id_set(doc, "design_elements")
-        upstream_req = _upstream_id_set(feature_root, REQUIREMENTS_JSON, "requirements")
-        for m in doc.get("requirement_mapping", []) or []:
-            if not isinstance(m, Mapping):
-                continue
-            req = m.get("requirement")
-            if (
-                isinstance(req, str)
-                and req
-                and upstream_req is not None
-                and req not in upstream_req
-            ):
-                raise UnresolvedRefError(
-                    f"design mapping {m.get('key', '?')!r} references {req!r}, "
-                    f"which is not a frozen requirement id (known REQ: "
-                    f"{sorted(upstream_req) or '(none)'}); the edited design "
-                    f"artifact is malformed (ADR-0008 D3)"
-                )
-            for d in m.get("design_elements", []) or []:
-                if isinstance(d, str) and d and d not in des_ids:
+            for ref in _iter_refs(entry.get(spec.ref_field), spec.cardinality):
+                if isinstance(ref, str) and ref and ref not in known:
                     raise UnresolvedRefError(
-                        f"design mapping {m.get('key', '?')!r} references design "
-                        f"element {d!r}, which is not defined in this doc "
-                        f"(known DES: {sorted(des_ids) or '(none)'}); the edited "
-                        f"design artifact is malformed (ADR-0008 D3)"
+                        _ref_violation_msg(spec, entry, ref, known, artifact)
                     )
-    elif artifact == TASKS_ARTIFACT:
-        upstream_req = _upstream_id_set(feature_root, REQUIREMENTS_JSON, "requirements")
-        upstream_des = _upstream_id_set(feature_root, DESIGN_JSON, "design_elements")
-        for t in doc.get("tasks", []) or []:
-            if not isinstance(t, Mapping):
-                continue
-            for r in t.get("related_requirements", []) or []:
-                if (
-                    isinstance(r, str)
-                    and r
-                    and upstream_req is not None
-                    and r not in upstream_req
-                ):
-                    raise UnresolvedRefError(
-                        f"task {t.get('id', '?')!r} references requirement {r!r}, "
-                        f"which is not a frozen requirement id; the edited tasks "
-                        f"artifact is malformed (ADR-0008 D3)"
-                    )
-            for d in t.get("related_design", []) or []:
-                if (
-                    isinstance(d, str)
-                    and d
-                    and upstream_des is not None
-                    and d not in upstream_des
-                ):
-                    raise UnresolvedRefError(
-                        f"task {t.get('id', '?')!r} references design element "
-                        f"{d!r}, which is not a frozen design id; the edited "
-                        f"tasks artifact is malformed (ADR-0008 D3)"
-                    )
-    # An unknown / non-renderable artifact has no refs to validate; render's own
-    # guard rejects it before reaching here, so this is a quiet no-op for safety.
 
 
 # artifact -> sole stage renderer (resolved lazily after the renderers are

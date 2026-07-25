@@ -25,11 +25,18 @@ from ai_dev.promote import (
     UnresolvedRefError,
     promote_design,
     promote_requirements,
+    promote_tasks,
     render_artifact,
     validate_artifact_refs,
 )
 from ai_dev.status import freeze_artifact
-from ai_dev.templates import DESIGN_JSON, DESIGN_MD, REQUIREMENTS_JSON, REQUIREMENTS_MD
+from ai_dev.templates import (
+    DESIGN_JSON,
+    DESIGN_MD,
+    REQUIREMENTS_JSON,
+    REQUIREMENTS_MD,
+    TASKS_JSON,
+)
 
 FEATURE_ID = "FEATURE-001"
 
@@ -336,6 +343,49 @@ class TestRenderReferenceIntegrity:
         _write_json(root / DESIGN_JSON, doc)
         with pytest.raises(UnresolvedRefError, match="REQ-999"):
             render_artifact(root, FEATURE_ID, "design", origin="test")
+
+    def _tasks_feature(self, tmp_path: Path) -> Path:
+        # Tasks stitch against FROZEN requirements AND design (two upstreams),
+        # so both must be promoted then frozen before tasks is promoted.
+        root = self._design_feature(tmp_path)
+        freeze_artifact(root, "design", origin="test")
+        promote_tasks(
+            root,
+            FEATURE_ID,
+            {
+                "lane_purpose": "Implement the greet CLI end to end.",
+                "tasks": [
+                    {
+                        "key": "t1",
+                        "summary": "Implement greeting formatter",
+                        "related_requirements": ["REQ-001"],
+                        "related_design": ["DES-001"],
+                        "expected_files": ["src/greet.py"],
+                        "exclusive_files": ["src/greet.py"],
+                    },
+                ],
+            },
+            origin="test",
+        )
+        return root
+
+    def test_render_catches_a_dangling_task_req_ref(self, tmp_path: Path) -> None:
+        root = self._tasks_feature(tmp_path)
+        doc = json.loads((root / TASKS_JSON).read_text())
+        # Point a task's related_requirements at a REQ not in the frozen upstream.
+        doc["tasks"][0]["related_requirements"] = ["REQ-999"]
+        _write_json(root / TASKS_JSON, doc)
+        with pytest.raises(UnresolvedRefError, match="REQ-999"):
+            render_artifact(root, FEATURE_ID, "tasks", origin="test")
+
+    def test_render_catches_a_dangling_task_des_ref(self, tmp_path: Path) -> None:
+        root = self._tasks_feature(tmp_path)
+        doc = json.loads((root / TASKS_JSON).read_text())
+        # Point a task's related_design at a DES not in the frozen upstream.
+        doc["tasks"][0]["related_design"] = ["DES-999"]
+        _write_json(root / TASKS_JSON, doc)
+        with pytest.raises(UnresolvedRefError, match="DES-999"):
+            render_artifact(root, FEATURE_ID, "tasks", origin="test")
 
     def test_render_does_not_resync_mirror_over_a_malformed_edit(self, tmp_path: Path) -> None:
         root = _feature_root(tmp_path)
