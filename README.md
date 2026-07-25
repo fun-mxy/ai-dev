@@ -52,6 +52,21 @@ PR-comment edit path built an argv real `gh` rejects; the mocked-`gh` test could
 Evidence of record: `.scratch/ai-dev-v0-5-second-profile/evidence/` (the genuine backend +
 real-GitHub proof, not the fake-claude / mocked-`gh` tests).
 
+v0.6 — Planner propose→promote→freeze (ADR-0008) complete: Planner runs now generate id-free
+structured JSON proposals for requirements/design/tasks; deterministic `promote` allocates stable
+REQ/AC/DES/TASK ids, stitches refs, writes canonical JSON, and renders Markdown mirrors; freeze
+gates enforce coverage completeness. The milestone closes with a zero-hand-authored-planning
+capstone reaching `verdict=pass` on real cc-glm52/Ark. Evidence of record:
+`.scratch/ai-dev-v0-6-planner/evidence/`.
+
+v0.7 — multi-lane worktree execution + lane PR projection (ADR-0009) planned/open: true
+multi-lane lane graph/status, one git worktree + branch per lane, lane legs executed inside their
+worktrees, dependency prechecks and independent lane gates, automatic lane-level PR projection
+after lane gate pass, and multi-lane final-report aggregation. Scope boundary: v0.7 makes lanes
+independently executable/auditable and projectable as PRs; it does **not** implement automatic merge,
+semantic conflict resolution, or the Merge Coordinator. Tickets live under
+`.scratch/ai-dev-v0-7-multilane-worktree/issues/`.
+
 ## Test coverage
 
 `uv run pytest` reports line + branch coverage of `ai_dev` (via `pytest-cov`, configured in
