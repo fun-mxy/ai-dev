@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ai_dev.json_artifact import read_json_object
 from ai_dev.paths import OUTPUT_DIR, RESULT_JSON, feature_dir, run_dir
@@ -264,11 +264,14 @@ class PlannerLegResult:
         return self.promote is not None
 
 
-def run_generate_requirements(
+def _run_planner_leg(
     repo_root: Path,
     feature_id: str,
     profile: AgentProfile,
     *,
+    build_input_package: Callable[..., str],
+    promote: Callable[..., PromoteResult],
+    stage: str,
     feedback: str | None = None,
     claude_path: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
@@ -277,20 +280,15 @@ def run_generate_requirements(
     ended_at: str | None = None,
     origin: str | None = None,
 ) -> PlannerLegResult:
-    """Run the full Planner requirements leg: prepare -> run -> validate -> promote.
+    """Run a Planner leg end to end: build input -> run -> validate -> promote.
 
-    Composes the v0.1/v0.2 seams unchanged: ``build_requirements_input_package``
-    (which reuses ``prepare_run`` with the role-aware proposal schema),
-    ``run_headless`` (env isolation + capture), and ``validate_run`` (the §14
-    three-check). promote (the deterministic stitcher/renderer, ticket 01) then
-    fires **automatically** — gated on a passing validation, exactly as the
+    Composes the v0.1/v0.2 seams unchanged: ``build_input_package`` (which
+    reuses ``prepare_run`` with the role-aware proposal schema), ``run_headless``
+    (env isolation + capture), and ``validate_run`` (the §14 three-check).
+    ``promote`` — the deterministic stitcher/renderer — then fires
+    **automatically** — gated on a passing validation, exactly as the
     implementer leg gates its ``proposed_done`` writeback: a schema-invalid or
-    boundary-breaching proposal never reaches the canonical artifact. promote
-    allocates REQ/AC ids, stitches the AC local refs (reference-integrity, D3),
-    and writes ``01-requirements.json`` + renders ``01-requirements.md`` — the
-    canonical-unfrozen state. ``feedback`` threads the human's refinement note
-    (ADR-0008 D4); re-running overwrites the unfrozen artifact (promote refuses
-    a frozen one, §4.2).
+    boundary-breaching proposal never reaches the canonical artifact.
 
     Returns a ``PlannerLegResult`` whether the run passed or failed validation
     (mirrors ``run_implementer_leg`` / ``run_headless`` returning verdicts
@@ -299,7 +297,7 @@ def run_generate_requirements(
     validation-passing run whose proposal promote cannot stitch is a malformed
     proposal (§24.2), reported loud rather than silently dropped.
     """
-    run_id = build_requirements_input_package(
+    run_id = build_input_package(
         repo_root, feature_id, feedback=feedback, origin=origin
     )
     run_result = run_headless(
@@ -329,7 +327,7 @@ def run_generate_requirements(
     if validation.passed:
         proposal = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
         if proposal is not None:
-            promote_result = promote_requirements(
+            promote_result = promote(
                 feature_root,
                 feature_id,
                 proposal,
@@ -340,10 +338,49 @@ def run_generate_requirements(
         run_id=run_id,
         feature_id=feature_id,
         profile=profile.name,
-        stage=_STAGE_REQUIREMENTS,
+        stage=stage,
         exit_code=run_result.exit_code,
         validation=validation,
         promote=promote_result,
+    )
+
+
+def run_generate_requirements(
+    repo_root: Path,
+    feature_id: str,
+    profile: AgentProfile,
+    *,
+    feedback: str | None = None,
+    claude_path: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    origin: str | None = None,
+) -> PlannerLegResult:
+    """Run the Planner requirements leg (ticket 02): prepare -> run -> validate -> promote.
+
+    promote allocates REQ/AC ids, stitches the AC local refs (reference-
+    integrity, D3), and writes ``01-requirements.json`` + renders
+    ``01-requirements.md`` — the canonical-unfrozen state. ``feedback`` threads
+    the human's refinement note (ADR-0008 D4); re-running overwrites the
+    unfrozen artifact (promote refuses a frozen one, §4.2). Requirements is the
+    root stage (no upstream artifacts).
+    """
+    return _run_planner_leg(
+        repo_root,
+        feature_id,
+        profile,
+        build_input_package=build_requirements_input_package,
+        promote=promote_requirements,
+        stage=_STAGE_REQUIREMENTS,
+        feedback=feedback,
+        claude_path=claude_path,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        started_at=started_at,
+        ended_at=ended_at,
+        origin=origin,
     )
 
 
@@ -518,69 +555,29 @@ def run_generate_design(
     ended_at: str | None = None,
     origin: str | None = None,
 ) -> PlannerLegResult:
-    """Run the full Planner design leg: prepare -> run -> validate -> promote.
+    """Run the Planner design leg (ticket 03): prepare -> run -> validate -> promote.
 
-    Composes the v0.1/v0.2 seams unchanged: ``build_design_input_package`` (which
-    reuses ``prepare_run`` with the design proposal schema + reads the frozen
-    requirements upstream), ``run_headless``, and ``validate_run`` (the §14
-    three-check). ``promote_design`` (ticket 03) then fires **automatically** -
-    gated on a passing validation, exactly as the requirements leg gates its
-    promote. promote allocates DES ids, stitches each ``requirement_mapping``
-    entry's ``requirement`` ref against the frozen REQ upstream and its
+    promote allocates DES ids, stitches each ``requirement_mapping`` entry's
+    ``requirement`` ref against the frozen REQ upstream and its
     ``design_elements`` local refs to allocated DES ids (reference-integrity,
-    D3), and writes ``02-design.json`` + renders ``02-design.md`` - the
-    canonical-unfrozen state. ``feedback`` threads the human's refinement note
-    (ADR-0008 D4); re-running overwrites the unfrozen artifact.
-
-    Returns a ``PlannerLegResult`` whether the run passed or failed validation
-    (mirrors ``run_generate_requirements``). promote errors
-    (``UnresolvedRefError`` / ``FrozenArtifactWriteError`` / the not-frozen-
-    requirements precondition) propagate - a validation-passing run whose
-    proposal promote cannot stitch is a malformed proposal (§24.2), reported
-    loud rather than silently dropped.
+    D3), and writes ``02-design.json`` + renders ``02-design.md``. ``feedback``
+    threads the refinement note (ADR-0008 D4); re-running overwrites the
+    unfrozen artifact. Requires the requirements artifact frozen.
     """
-    run_id = build_design_input_package(
-        repo_root, feature_id, feedback=feedback, origin=origin
-    )
-    run_result = run_headless(
+    return _run_planner_leg(
         repo_root,
         feature_id,
-        run_id,
         profile,
+        build_input_package=build_design_input_package,
+        promote=promote_design,
+        stage=_STAGE_DESIGN,
+        feedback=feedback,
+        claude_path=claude_path,
         max_turns=max_turns,
         permission_mode=permission_mode,
-        claude_path=claude_path,
         started_at=started_at,
         ended_at=ended_at,
         origin=origin,
-    )
-    validation = validate_run(repo_root, feature_id, run_id, origin=origin)
-
-    feature_root = feature_dir(repo_root, feature_id)
-    run_root = run_dir(repo_root, feature_id, run_id)
-
-    promote_result: PromoteResult | None = None
-    # promote fires only on a passing validation - a schema-invalid or
-    # boundary-breaching proposal has no canonical form. The proposal IS the
-    # run's result.json (validated above against the design proposal schema).
-    if validation.passed:
-        proposal = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
-        if proposal is not None:
-            promote_result = promote_design(
-                feature_root,
-                feature_id,
-                proposal,
-                origin=origin,
-            )
-
-    return PlannerLegResult(
-        run_id=run_id,
-        feature_id=feature_id,
-        profile=profile.name,
-        stage=_STAGE_DESIGN,
-        exit_code=run_result.exit_code,
-        validation=validation,
-        promote=promote_result,
     )
 
 
@@ -796,68 +793,27 @@ def run_generate_tasks(
     ended_at: str | None = None,
     origin: str | None = None,
 ) -> PlannerLegResult:
-    """Run the full Planner tasks leg: prepare -> run -> validate -> promote.
+    """Run the Planner tasks leg (ticket 04): prepare -> run -> validate -> promote.
 
-    Composes the v0.1/v0.2 seams unchanged: ``build_tasks_input_package`` (which
-    reuses ``prepare_run`` with the tasks proposal schema + reads the frozen
-    requirements AND design upstreams), ``run_headless``, and ``validate_run``
-    (the §14 three-check). ``promote_tasks`` (ticket 04) then fires
-    **automatically** - gated on a passing validation, exactly as the
-    requirements/design legs gate their promote. promote allocates TASK ids,
-    stitches each task's ``related_requirements`` / ``related_design`` refs
-    against the frozen REQ / DES upstreams (reference-integrity, D3), and writes
-    ``03-tasks.json`` + renders ``03-tasks.md`` + seeds ``status/task-status.yml``
-    + populates ``04-lane-graph.yml`` - the canonical-unfrozen state. ``feedback``
-    threads the human's refinement note (ADR-0008 D4); re-running overwrites the
-    unfrozen artifact.
-
-    Returns a ``PlannerLegResult`` whether the run passed or failed validation
-    (mirrors ``run_generate_design``). promote errors
-    (``UnresolvedRefError`` / ``FrozenArtifactWriteError`` / the not-frozen-
-    upstreams precondition) propagate - a validation-passing run whose proposal
-    promote cannot stitch is a malformed proposal (§24.2), reported loud rather
-    than silently dropped.
+    promote allocates TASK ids, stitches each task's ``related_requirements`` /
+    ``related_design`` refs against the frozen REQ / DES upstreams (reference-
+    integrity, D3), and writes ``03-tasks.json`` + renders ``03-tasks.md`` +
+    seeds ``status/task-status.yml`` + populates ``04-lane-graph.yml``.
+    ``feedback`` threads the refinement note (ADR-0008 D4); re-running
+    overwrites the unfrozen artifact. Requires requirements AND design frozen.
     """
-    run_id = build_tasks_input_package(
-        repo_root, feature_id, feedback=feedback, origin=origin
-    )
-    run_result = run_headless(
+    return _run_planner_leg(
         repo_root,
         feature_id,
-        run_id,
         profile,
+        build_input_package=build_tasks_input_package,
+        promote=promote_tasks,
+        stage=_STAGE_TASKS,
+        feedback=feedback,
+        claude_path=claude_path,
         max_turns=max_turns,
         permission_mode=permission_mode,
-        claude_path=claude_path,
         started_at=started_at,
         ended_at=ended_at,
         origin=origin,
-    )
-    validation = validate_run(repo_root, feature_id, run_id, origin=origin)
-
-    feature_root = feature_dir(repo_root, feature_id)
-    run_root = run_dir(repo_root, feature_id, run_id)
-
-    promote_result: PromoteResult | None = None
-    # promote fires only on a passing validation - a schema-invalid or
-    # boundary-breaching proposal has no canonical form. The proposal IS the
-    # run's result.json (validated above against the tasks proposal schema).
-    if validation.passed:
-        proposal = read_json_object(run_root / OUTPUT_DIR / RESULT_JSON)
-        if proposal is not None:
-            promote_result = promote_tasks(
-                feature_root,
-                feature_id,
-                proposal,
-                origin=origin,
-            )
-
-    return PlannerLegResult(
-        run_id=run_id,
-        feature_id=feature_id,
-        profile=profile.name,
-        stage=_STAGE_TASKS,
-        exit_code=run_result.exit_code,
-        validation=validation,
-        promote=promote_result,
     )
