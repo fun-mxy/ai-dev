@@ -20,6 +20,7 @@ from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.paths import feature_dir, lane_dir
 from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON
+from ai_dev.status import update_lane_status
 from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 
 LANE_DECISION_MD = "lane-decision.md"
@@ -392,6 +393,22 @@ def evaluate_lane_gate(
     decision_md_path = lane_root / LANE_DECISION_MD
     write_json(decision_json_path, decision)
     decision_md_path.write_text(_decision_md(decision))
+
+    # v0.7 (ADR-0009 D4): record the lane's gate_verdict in lane-status.yml
+    # so the feature-level `declared_lane_ids` / `aggregate_lane_gate_states`
+    # helpers and any future CLI status commands can surface per-lane gate
+    # state without reading every lane's lane-decision.json. The actual
+    # dependency precheck reads lane-decision.json directly (the source of
+    # truth for the gate verdict); lane-status is the runtime mirror.
+    # The lane gate is the sole writer of this field (mirrors how
+    # record_coherence_verdict is the sole writer of the feature-level
+    # verdict).
+    update_lane_status(
+        feature_root,
+        lane_id=lane_id,
+        gate_verdict=str(decision["decision"]),
+        origin=origin,
+    )
 
     result = LaneDecisionResult(
         feature_id=feature_id,

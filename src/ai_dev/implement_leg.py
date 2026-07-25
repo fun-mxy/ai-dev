@@ -600,6 +600,18 @@ def run_implementer_leg(
     # §4.2: the implementer leg consumes frozen tasks + lane-graph. An unfrozen
     # precondition is rejected before reading anything or allocating a run.
     require_frozen_tasks_and_lane_graph(feature_root)
+    # v0.7 (ADR-0009 D4): a lane cannot start until its dependency lanes have
+    # passed their lane gates. Fails early, before any resource allocation
+    # (no partial run left behind). The check reads lane-decision.json verdicts
+    # (not implementer proposed_done — a lane is not "done" until the lane
+    # gate evaluates it, ADR-0009 D5).
+    from ai_dev.lane_dependency import check_dependency_precondition
+    precheck = check_dependency_precondition(repo_root, feature_id, lane_id)
+    if not precheck.passed:
+        raise ValueError(
+            f"lane {lane_id!r} cannot start: dependencies not gate-passed: "
+            f"{precheck.details}"
+        )
     task_text = read_task_text(feature_root)
     # ADR-0007 D2: the implementer must declare its addressed REQs/ACs. The
     # instruction is appended to the (frozen) task text so it reaches the

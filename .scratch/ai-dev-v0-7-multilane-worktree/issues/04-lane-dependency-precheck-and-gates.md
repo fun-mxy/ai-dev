@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 03.
 
-**Status:** open
+**Status:** done
 
-- [ ] lane start precheck rejects a lane whose dependencies are missing, cyclic, failed, pending, or not yet gate-passed
-- [ ] lane gate evaluator accepts an explicit lane id and evaluates only that lane's implement/review/spec-gap/verification/triage evidence
-- [ ] `depends_on` cycles or unknown lane ids fail during validation with clear messages
-- [ ] downstream lane remains blocked until upstream lane gate pass, not merely Implementer `proposed_done`
-- [ ] feature-level helpers aggregate lane gate states without treating a passing lane as feature integration
-- [ ] tests cover no-dependency, satisfied dependency, unsatisfied dependency, missing lane, and cycle cases; `uv run mypy` + `uv run pytest` green
+- [x] lane start precheck rejects a lane whose dependencies are missing, cyclic, failed, pending, or not yet gate-passed
+- [x] lane gate evaluator accepts an explicit lane id and evaluates only that lane's implement/review/spec-gap/verification/triage evidence
+- [x] `depends_on` cycles or unknown lane ids fail during validation with clear messages
+- [x] downstream lane remains blocked until upstream lane gate pass, not merely Implementer `proposed_done`
+- [x] feature-level helpers aggregate lane gate states without treating a passing lane as feature integration
+- [x] tests cover no-dependency, satisfied dependency, unsatisfied dependency, missing lane, and cycle cases; `uv run mypy` + `uv run pytest` green

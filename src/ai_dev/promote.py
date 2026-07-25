@@ -66,6 +66,7 @@ from ai_dev.templates import (
     TASKS_JSON,
     TASKS_MD,
 )
+from ai_dev.lane_dependency import _validate_lane_entries
 
 # The audit event for a promote (the planning-leg analogue of ``implement-result``
 # / ``mark_task_proposed_done``). One record per promote, carrying the stage, the
@@ -1365,6 +1366,12 @@ def _populate_lane_graph_from_doc(
         if lane_verify:
             lane["verification_commands"] = list(lane_verify)
             lane["verification_scope"] = [vc["name"] for vc in lane_verify]
+    # v0.7 (ADR-0009 D4): validate the lane graph for structural correctness
+    # before writing. Catches cycles, unknown depends_on refs, and
+    # self-dependencies introduced by the Planner's proposal or hand-editing.
+    # _validate_lane_entries operates on the in-memory dict so a validation
+    # failure leaves the on-disk graph untouched.
+    _validate_lane_entries(graph["lanes"])
     with (feature_root / LANE_GRAPH_YML).open("w") as f:
         yaml.safe_dump(
             graph, f, sort_keys=False, default_flow_style=False, allow_unicode=True
