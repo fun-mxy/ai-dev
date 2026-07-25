@@ -56,6 +56,10 @@ from ai_dev.github_projection import (
     GITHUB_TOKEN_ENV,
     compute_github_plan,
 )
+from ai_dev.lane_pr_projection import (
+    LANE_PR_MAPPING_JSON,
+    compute_lane_pr_plan,
+)
 from ai_dev.implement_leg import (
     _IMPLEMENTER_ROLE,
     lane_allowed_files,
@@ -1259,6 +1263,93 @@ def _which_gh() -> bool:
     from shutil import which
 
     return which("gh") is not None
+
+
+def plan_lane_pr_projection(
+    repo_root: Path, feature_id: str, lane_id: str
+) -> DryRunPlan:
+    """Plan a ``project-lane-pr``: non-network preflight + plan, no push (ADR-0009).
+
+    The lane-level mirror of ``plan_project_github``. Runs the *non-network*
+    preconditions the operator can fix without touching GitHub (feature exists,
+    lane gate has passed - the D5 trigger, ``GITHUB_TOKEN`` env name set, ``gh``
+    on ``PATH``) and reports what the run would push - the lane branch, whether
+    the PR would be *created* vs *edited* (read from the lane PR mapping), and
+    the mapping it would write. The *network* pre-flight (rate-limit probe,
+    default-branch detection when ``--base`` is omitted) and the push/PR
+    themselves are the expensive/irreversible steps dry-run skips, so they are
+    listed as ``would_run`` rather than executed.
+
+    The lane-gate-pass precondition raises ``ValueError`` (fail loud, §24.2) -
+    ``proposed_done`` alone is insufficient - surfaced by the CLI as a clean
+    ``error:`` + exit 1, not a would-be-refused answer.
+    """
+    # The pure seam: gate-pass + worktree branch + create-vs-edit split (read
+    # from the mapping), so the dry-run faithfully previews D2 idempotency (an
+    # already-projected lane shows as an edit, not a create). Raises ValueError
+    # on a missing feature, a missing/non-passing lane-decision, a missing
+    # worktree, or a corrupt mapping (fail loud, §24.2).
+    plan = compute_lane_pr_plan(repo_root, feature_id, lane_id)
+    # Non-network preflight (ADR-0004: skip the network steps).
+    token_set = os.environ.get(GITHUB_TOKEN_ENV) not in (None, "")
+    gh_on_path = _which_gh()
+    preflight_ok = token_set and gh_on_path
+    action = "create" if plan.would_create_pr else "edit"
+    details: dict[str, Any] = {
+        "head_branch": plan.head_branch,
+        "base_ref": plan.base_ref,
+        "base_branch": plan.base_branch,  # None: default-branch detect is network
+        "lane_gate_passed": plan.lane_gate_passed,
+        "existing_pr_number": plan.existing_pr_number,
+        "pr_action": action,
+        "github_token_set": token_set,
+        "gh_on_path": gh_on_path,
+        "preflight_non_network_ok": preflight_ok,
+        "would_run": [
+            "preflight: GITHUB_TOKEN set, gh on PATH, rate-limit probe, "
+            "default-branch detect (gh repo view) - note: default-branch "
+            "detection is a network call this dry-run does NOT perform; a "
+            "missing --base surfaces only on the real run",
+            "git push -u <remote> <lane branch> (idempotent when up to date)",
+            f"gh pr create (base=detected) --head <lane branch>"
+            if plan.would_create_pr
+            else "gh pr edit <pr number>",
+        ],
+        "would_mint_ids": [],
+        "would_write": [
+            f"projections/github/{LANE_PR_MAPPING_JSON} "
+            "(LANE-NNN -> GH PR number/URL; non-deterministic canonical write)",
+        ],
+        "audited": False,
+    }
+    if not preflight_ok:
+        missing = []
+        if not token_set:
+            missing.append(f"{GITHUB_TOKEN_ENV} env var")
+        if not gh_on_path:
+            missing.append("`gh` on PATH")
+        details["would_be_refused"] = True
+        details["refusal_reason"] = (
+            "pre-flight would fail: missing " + " + ".join(missing)
+        )
+        summary = (
+            f"PROJECT-LANE-PR DRY-RUN - would be REFUSED: pre-flight missing "
+            + " + ".join(missing)
+        )
+    else:
+        details["would_be_refused"] = False
+        summary = (
+            f"PROJECT-LANE-PR DRY-RUN - would push {plan.head_branch} and "
+            f"{action} PR"
+            + (f" #{plan.existing_pr_number}" if plan.existing_pr_number else "")
+            + "; no network call"
+        )
+    return DryRunPlan(
+        command="project-lane-pr",
+        feature_id=feature_id,
+        summary=summary,
+        details=details,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -4,11 +4,11 @@
 
 **Blocked by:** 02, 03, 04.
 
-**Status:** open
+**Status:** done
 
-- [ ] lane PR projection refuses to run before lane gate pass; Implementer `proposed_done` alone is insufficient
-- [ ] projection pushes the lane branch to the configured remote and creates or updates a lane PR using `gh`
-- [ ] PR body includes lane id, feature id, task ids, related REQ/AC/DES ids, lane gate verdict, verification summary, issue summary, branch/worktree metadata, and canonical artifact pointers
-- [ ] projection mapping records lane→PR number/URL/head branch/base branch and supports idempotent reruns/updates
-- [ ] projection failure does not mutate lane/feature verdicts; it exits non-zero with pending/completed side effects reported
-- [ ] tests cover preflight, gate-pass requirement, create, update, mapping reuse, partial failure, and no token persistence; `uv run mypy` + `uv run pytest` green
+- [x] lane PR projection refuses to run before lane gate pass; Implementer `proposed_done` alone is insufficient
+- [x] projection pushes the lane branch to the configured remote and creates or updates a lane PR using `gh`
+- [x] PR body includes lane id, feature id, task ids, related REQ/AC/DES ids, lane gate verdict, verification summary, issue summary, branch/worktree metadata, and canonical artifact pointers
+- [x] projection mapping records lane→PR number/URL/head branch/base branch and supports idempotent reruns/updates
+- [x] projection failure does not mutate lane/feature verdicts; it exits non-zero with pending/completed side effects reported
+- [x] tests cover preflight, gate-pass requirement, create, update, mapping reuse, partial failure, and no token persistence; `uv run mypy` + `uv run pytest` green

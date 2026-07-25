@@ -146,6 +146,7 @@ from ai_dev.dry_run import (
     plan_generate_requirements,
     plan_generate_tasks,
     plan_lane_gate,
+    plan_lane_pr_projection,
     plan_render,
     plan_review,
     plan_run_headless,
@@ -164,6 +165,7 @@ from ai_dev.github_projection import (
 from ai_dev.implement_leg import run_implementer_leg
 from ai_dev.issue_bundle import ISSUES_DIR, IssueBundleResult, collect_issue_bundle
 from ai_dev.lane_gate import LaneDecisionResult, evaluate_lane_gate
+from ai_dev.lane_pr_projection import LanePrProjectionResult, project_lane_pr
 from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.paths import feature_dir, features_dir, require_feature_root, run_dir, runs_dir
 from ai_dev.promote import (
@@ -787,6 +789,24 @@ def _args_project_github(sub: argparse.ArgumentParser) -> None:
         help="A PR number to comment the final-report on (ADR-0006 D3). Stored "
         "as feature -> PR on first projection; without it projection is "
         "issues-only. The orchestrator never creates the PR - a human does.",
+    )
+
+
+def _args_project_lane_pr(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("feature_id", help="The FEATURE-NNN owning the lane.")
+    sub.add_argument("lane_id", help="The LANE-NNN to project (must have passed its gate).")
+    sub.add_argument(
+        "--base",
+        default=None,
+        metavar="BRANCH",
+        help="Base branch for the PR. Omit to auto-detect the repo default "
+        "branch via `gh repo view` (a network call, run in pre-flight).",
+    )
+    sub.add_argument(
+        "--remote",
+        default="origin",
+        metavar="NAME",
+        help="Git remote to push the lane branch to (default: origin).",
     )
 
 
@@ -1593,6 +1613,46 @@ def _run_project_github(
     return 0
 
 
+def _run_project_lane_pr(
+    repo_root: Path, feature_id: str, lane_id: str, base: str | None, remote: str
+) -> int:
+    """``project-lane-pr``: push a lane branch + create/update its PR (v0.7 ticket 05).
+
+    Delegates to ``project_lane_pr`` (gate-pass -> pre-flight -> push -> create
+    or edit, idempotent via ``projections/github/lane-prs.json``). Returns ``0``
+    on a complete projection, ``1`` on a §24.2 precondition failure (missing
+    feature/lane/worktree, gate not passed, corrupt mapping) or a mid-stream
+    push/PR failure (D6: the push is kept and the mapping entry for any created
+    PR is recorded; re-running resumes - the branch is re-pushed and the stored
+    PR is edited). Projection never mutates ``feature.status`` / ``verdict`` /
+    ``gate_verdict`` (one-way projection, invariant #10).
+    """
+    try:
+        result: LanePrProjectionResult = project_lane_pr(
+            repo_root, feature_id, lane_id, base_branch=base, remote=remote
+        )
+    except ValueError as exc:
+        return _exit_value_error(repo_root, feature_id, exc)
+    if result.failure_reason is not None:
+        _render_error(
+            ValueError(result.failure_reason),
+            hint=(
+                "re-run `ai-dev project-lane-pr` to resume from the mapping "
+                "(the branch is re-pushed and the stored PR is edited, "
+                "not re-created)"
+            ),
+        )
+        return 1
+    print(
+        f"PROJECT-LANE-PR - feature={result.feature_id} lane={result.lane_id} "
+        f"pr={result.pr_number} url={result.pr_url} "
+        f"action={result.pr_action} branch={result.head_branch} "
+        f"base={result.base_branch} remote={result.remote} "
+        f"mapping={result.mapping_path}"
+    )
+    return 0
+
+
 def _run_fix_run(
     repo_root: Path,
     feature_id: str,
@@ -2306,6 +2366,20 @@ COMMANDS: list[Command] = [
         add_args=_args_project_github,
         run=lambda a: _run_project_github(Path(a.repo_root), a.feature_id, a.pr),
         plan=lambda a: plan_project_github(Path(a.repo_root), a.feature_id, a.pr),
+    ),
+    Command(
+        "project-lane-pr",
+        help_text="Push a lane branch and create/update its GitHub PR after the lane "
+        "gate passes (v0.7 ticket 05, ADR-0009 D5/D6). One-way projection - never "
+        "writes back to lane/feature verdicts. Idempotent via "
+        "projections/github/lane-prs.json.",
+        add_args=_args_project_lane_pr,
+        run=lambda a: _run_project_lane_pr(
+            Path(a.repo_root), a.feature_id, a.lane_id, a.base, a.remote
+        ),
+        plan=lambda a: plan_lane_pr_projection(
+            Path(a.repo_root), a.feature_id, a.lane_id
+        ),
     ),
 ]
 
