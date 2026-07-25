@@ -4,11 +4,11 @@
 
 **Blocked by:** none — can start immediately.
 
-**Status:** open
+**Status:** done
 
-- [ ] multiple lanes can be represented in `04-lane-graph.yml` with tasks, dependencies, expected/exclusive files, provides/consumes, verification scope, and merge policy fields preserved
-- [ ] `lane-status.yml` initializes and updates more than one lane without assuming `LANE-001`
-- [ ] `task-status.yml` records task→lane mapping and rejects tasks assigned to missing lanes
-- [ ] read/status commands render all lanes clearly while preserving current single-lane output compatibility where practical
-- [ ] feature/coherence helpers stop assuming there is exactly one lane
-- [ ] unit tests cover two-lane and single-lane compatibility cases; `uv run mypy` + `uv run pytest` green
+- [x] multiple lanes can be represented in `04-lane-graph.yml` with tasks, dependencies, expected/exclusive files, provides/consumes, verification scope, and merge policy fields preserved
+- [x] `lane-status.yml` initializes and updates more than one lane without assuming `LANE-001`
+- [x] `task-status.yml` records task→lane mapping and rejects tasks assigned to missing lanes
+- [x] read/status commands render all lanes clearly while preserving current single-lane output compatibility where practical
+- [x] feature/coherence helpers stop assuming there is exactly one lane
+- [x] unit tests cover two-lane and single-lane compatibility cases; `uv run mypy` + `uv run pytest` green
