@@ -48,10 +48,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NamedTuple
 
 from ai_dev.json_artifact import read_json_object
-from ai_dev.paths import OUTPUT_DIR, RESULT_JSON, feature_dir, run_dir
+from ai_dev.paths import OUTPUT_DIR, RESULT_JSON, feature_dir, require_feature_root, run_dir
 from ai_dev.promote import (
     PromoteResult,
     promote_design,
@@ -192,6 +192,62 @@ def _planner_task_text(
     return "\n".join(blocks)
 
 
+class PlannerInputs(NamedTuple):
+    """The read-only Planner precondition sequence output (seam helper, ADR-0004 D5).
+
+    Carries the two things both the real leg (``prepare_run``) and the dry-run
+    planner (``_render_temp_package``) consume: the assembled ``task_text`` and
+    the role-aware §14.1 ``schema``. The intent + frozen-upstream reads (the
+    gating preconditions, ADR-0008 D2) happen inside ``compute_planner_inputs``
+    so the seam's two sides gate identically — lockstep by construction.
+    """
+
+    task_text: str
+    schema: Mapping[str, Any]
+
+
+def compute_planner_inputs(
+    feature_root: Path, feature_id: str, stage: str, feedback: str | None
+) -> PlannerInputs:
+    """Run the Planner precondition sequence and return the assembled inputs.
+
+    The read-only orchestration shared by ``build_*_input_package`` (the real
+    leg, which then calls ``prepare_run``) and ``dry_run.plan_generate_*`` (which
+    renders a temp package). Centralising it here means the precondition
+    sequence — intent -> frozen-upstream (gate) -> summary -> task_text ->
+    schema — is written once, not on both sides of the dry-run seam
+    (ADR-0004 D5: dry-run reuses pure helpers, not orchestration).
+
+    The frozen-upstream reads are the gate: ``read_frozen_requirements_doc`` /
+    ``read_frozen_design_doc`` raise ``ValueError`` when the upstream is not
+    frozen (ADR-0008 D2 — design/tasks stitch only against frozen upstreams),
+    so a not-frozen rejection fires here for both callers before any allocation
+    or temp-dir write.
+    """
+    intent = read_intent(feature_root)
+    if stage == _STAGE_REQUIREMENTS:
+        task_text = _planner_task_text(feature_id, intent, feedback)
+    elif stage == _STAGE_DESIGN:
+        req_summary = _render_frozen_requirements_summary(
+            read_frozen_requirements_doc(feature_root)
+        )
+        task_text = _design_task_text(feature_id, intent, req_summary, feedback)
+    elif stage == _STAGE_TASKS:
+        req_summary = _render_frozen_requirements_summary(
+            read_frozen_requirements_doc(feature_root)
+        )
+        des_summary = _render_frozen_design_summary(
+            read_frozen_design_doc(feature_root)
+        )
+        task_text = _tasks_task_text(
+            feature_id, intent, req_summary, des_summary, feedback
+        )
+    else:
+        raise ValueError(f"unknown planner stage: {stage}")
+    schema = output_schema_for_role(PLANNER_ROLE, stage=stage)
+    return PlannerInputs(task_text, schema)
+
+
 def build_requirements_input_package(
     repo_root: Path,
     feature_id: str,
@@ -216,20 +272,17 @@ def build_requirements_input_package(
     happens before any allocation so a missing-intent rejection leaves no
     partial run behind.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
-    intent = read_intent(feature_root)
-    task_text = _planner_task_text(feature_id, intent, feedback)
+    feature_root = require_feature_root(repo_root, feature_id)
+    inputs = compute_planner_inputs(feature_root, feature_id, _STAGE_REQUIREMENTS, feedback)
     return prepare_run(
         repo_root,
         feature_id,
         PLANNER_ROLE,
-        task_text,
+        inputs.task_text,
         # No task-specific allowed files: the Planner writes only the mandatory
         # result.{json,md} (the ``prepare_run`` seed). The proposal schema is the
         # role-aware §14.1 contract (ticket 01).
-        output_schema=output_schema_for_role(PLANNER_ROLE, stage=_STAGE_REQUIREMENTS),
+        output_schema=inputs.schema,
         origin=origin,
     )
 
@@ -522,22 +575,17 @@ def build_design_input_package(
     missing-intent or not-frozen-requirements rejection leaves no partial run
     behind (mirrors ``build_requirements_input_package``).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
-    intent = read_intent(feature_root)
-    req_doc = read_frozen_requirements_doc(feature_root)
-    req_summary = _render_frozen_requirements_summary(req_doc)
-    task_text = _design_task_text(feature_id, intent, req_summary, feedback)
+    feature_root = require_feature_root(repo_root, feature_id)
+    inputs = compute_planner_inputs(feature_root, feature_id, _STAGE_DESIGN, feedback)
     return prepare_run(
         repo_root,
         feature_id,
         PLANNER_ROLE,
-        task_text,
+        inputs.task_text,
         # No task-specific allowed files: the Planner writes only the mandatory
         # result.{json,md} (the prepare_run seed). The design proposal schema is
         # the role-aware §14.1 contract (ticket 03).
-        output_schema=output_schema_for_role(PLANNER_ROLE, stage=_STAGE_DESIGN),
+        output_schema=inputs.schema,
         origin=origin,
     )
 
@@ -756,26 +804,17 @@ def build_tasks_input_package(
     missing-intent or not-frozen-upstream rejection leaves no partial run behind
     (mirrors ``build_design_input_package``).
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(f"feature run {feature_id} not found under {repo_root}")
-    intent = read_intent(feature_root)
-    req_doc = read_frozen_requirements_doc(feature_root)
-    des_doc = read_frozen_design_doc(feature_root)
-    req_summary = _render_frozen_requirements_summary(req_doc)
-    des_summary = _render_frozen_design_summary(des_doc)
-    task_text = _tasks_task_text(
-        feature_id, intent, req_summary, des_summary, feedback
-    )
+    feature_root = require_feature_root(repo_root, feature_id)
+    inputs = compute_planner_inputs(feature_root, feature_id, _STAGE_TASKS, feedback)
     return prepare_run(
         repo_root,
         feature_id,
         PLANNER_ROLE,
-        task_text,
+        inputs.task_text,
         # No task-specific allowed files: the Planner writes only the mandatory
         # result.{json,md} (the prepare_run seed). The tasks proposal schema is
         # the role-aware §14.1 contract (ticket 04).
-        output_schema=output_schema_for_role(PLANNER_ROLE, stage=_STAGE_TASKS),
+        output_schema=inputs.schema,
         origin=origin,
     )
 

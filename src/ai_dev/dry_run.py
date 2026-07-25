@@ -61,6 +61,7 @@ from ai_dev.implement_leg import (
     lane_allowed_files,
     read_lane_entry,
     read_task_text,
+    require_frozen_tasks_and_lane_graph,
 )
 from ai_dev.lane_gate import (
     LANE_DECISION_JSON,
@@ -74,27 +75,19 @@ from ai_dev.paths import (
     require_feature_root,
     run_dir,
 )
-from ai_dev.planner_leg import (
-    _design_task_text,
-    _planner_task_text,
-    _render_frozen_design_summary,
-    _render_frozen_requirements_summary,
-    _tasks_task_text,
-    read_intent,
-)
+from ai_dev.planner_leg import compute_planner_inputs
 # The model-role token lives in planner_schemas (planner_leg only re-exports it);
 # import from its home rather than through the leg (avoid a Middle Man hop).
 from ai_dev.planner_schemas import PLANNER_ROLE as _PLANNER_ROLE
-# The frozen-requirements precondition the design leg stitches against lives in
-# promote (the canonical reader); the freeze-gate coverage precheck lives in
-# coverage. Both are pure read/compute helpers - no canonical write - so importing
-# them here keeps dry-run free of side effects (ADR-0004).
+# The promote import (RENDERABLE_ARTIFACTS, artifact_*_file) and the coverage
+# precheck (freeze_gate_coverage) are pure read/compute helpers with no
+# canonical write, so importing them here keeps dry-run free of side effects
+# (ADR-0004). The frozen-upstream reads the Planner legs gate on happen in
+# ``compute_planner_inputs`` (planner_leg), not imported here.
 from ai_dev.promote import (
     RENDERABLE_ARTIFACTS,
     artifact_json_file,
     artifact_md_file,
-    read_frozen_design_doc,
-    read_frozen_requirements_doc,
 )
 from ai_dev.coverage import freeze_gate_coverage
 from ai_dev.profile_comparison import (
@@ -106,7 +99,6 @@ from ai_dev.profiles import AgentProfile, token_source_var
 from ai_dev.run_prepare import (
     ALLOWED_FILES_FILE,
     TASK_PACKAGE_FILE,
-    output_schema_for_role,
     write_input_package_to,
 )
 from ai_dev.run_wrapper import (
@@ -363,12 +355,7 @@ def plan_implement(
     run + the lane rollup paths.
     """
     feature_root = require_feature_root(repo_root, feature_id)
-    frozen = frozen_artifacts_status(feature_root)
-    if not (frozen.get("tasks") and frozen.get("lane_graph")):
-        raise ValueError(
-            "implementer leg requires frozen tasks + lane_graph (§4.2); "
-            "freeze them at the task gate first"
-        )
+    require_frozen_tasks_and_lane_graph(feature_root)
     task_text = read_task_text(feature_root)
     lane = read_lane_entry(feature_root, lane_id)
     allowed = lane_allowed_files(lane)
@@ -420,25 +407,23 @@ def plan_generate_requirements(
 
     Reuses the Planner leg's precondition reads (feature exists, intent present
     in ``00-intent.md``) and renders the would-be Planner input package into a
-    temp dir instead of minting ``RUN-NNN``. The proposal schema
-    (``output_schema_for_role("Planner", stage="requirements")``) is the §14.1
-    contract the real run writes; the plan reports it as the would-be output
+    temp dir instead of minting ``RUN-NNN``. The proposal schema (the §14.1
+    requirements contract, via ``compute_planner_inputs``) is what the real run
+    writes; the plan reports it as the would-be output
     schema. Reports the would-be run + the promote targets
     (``01-requirements.{json,md}``) so the operator sees the full generate→
     promote slice before committing to a real run. ``feedback`` (when given) is
     surfaced in the plan so the refinement channel is visible.
     """
     feature_root = require_feature_root(repo_root, feature_id)
-    # Precondition: the intent must exist (the Planner elaborates from it). Reads
-    # the same helper the real leg uses, so a missing/empty intent fails loud
-    # here exactly as it would at run time.
-    intent = read_intent(feature_root)
-    task_text = _planner_task_text(feature_id, intent, feedback)
-    schema = output_schema_for_role(_PLANNER_ROLE, stage="requirements")
+    # Precondition: the intent must exist (the Planner elaborates from it).
+    # ``compute_planner_inputs`` reads it via the same helper the real leg uses,
+    # so a missing/empty intent fails loud here exactly as it would at run time.
+    inputs = compute_planner_inputs(feature_root, feature_id, "requirements", feedback)
     _require_token_source(profile)
 
     temp_root, input_dir = _render_temp_package(
-        feature_id, _PLANNER_ROLE, task_text, [], schema
+        feature_id, _PLANNER_ROLE, inputs.task_text, [], inputs.schema
     )
     details = _agent_invocation_details(
         profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode
@@ -490,9 +475,9 @@ def plan_generate_design(
     stitch against a frozen upstream, ADR-0008 D2). Reuses the Planner leg's
     precondition reads (feature exists, intent present, requirements frozen) and
     renders the would-be Planner design input package into a temp dir instead of
-    minting ``RUN-NNN``. The design proposal schema
-    (``output_schema_for_role("Planner", stage="design")``) is the §14.1 contract
-    the real run writes; the plan reports it as the would-be output schema.
+    minting ``RUN-NNN``. The design proposal schema (the §14.1 design contract,
+    via ``compute_planner_inputs``) is what the real run writes; the plan reports
+    it as the would-be output schema.
     Reports the would-be run + the promote targets (``02-design.{json,md}``) so
     the operator sees the full generate->promote slice before committing to a
     real run. ``feedback`` (when given) is surfaced in the plan so the refinement
@@ -501,17 +486,14 @@ def plan_generate_design(
     feature_root = require_feature_root(repo_root, feature_id)
     # Preconditions mirror the real leg exactly (so a missing intent or an
     # unfrozen-requirements rejection fails loud here as it would at run time).
-    # ``read_frozen_requirements_doc`` raises ValueError when requirements is not
-    # frozen - the design gate's gating precondition (ADR-0008 D2).
-    intent = read_intent(feature_root)
-    req_doc = read_frozen_requirements_doc(feature_root)
-    req_summary = _render_frozen_requirements_summary(req_doc)
-    task_text = _design_task_text(feature_id, intent, req_summary, feedback)
-    schema = output_schema_for_role(_PLANNER_ROLE, stage="design")
+    # ``compute_planner_inputs`` calls ``read_frozen_requirements_doc``, which
+    # raises ValueError when requirements is not frozen: the design gate's
+    # gating precondition (ADR-0008 D2).
+    inputs = compute_planner_inputs(feature_root, feature_id, "design", feedback)
     _require_token_source(profile)
 
     temp_root, input_dir = _render_temp_package(
-        feature_id, _PLANNER_ROLE, task_text, [], schema
+        feature_id, _PLANNER_ROLE, inputs.task_text, [], inputs.schema
     )
     details = _agent_invocation_details(
         profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode
@@ -565,8 +547,8 @@ def plan_generate_tasks(
     two). Reuses the Planner leg's precondition reads (feature exists, intent
     present, requirements frozen, design frozen) and renders the would-be Planner
     tasks input package into a temp dir instead of minting ``RUN-NNN``. The tasks
-    proposal schema (``output_schema_for_role("Planner", stage="tasks")``) is the
-    §14.1 contract the real run writes; the plan reports it as the would-be output
+    proposal schema (the §14.1 tasks contract, via ``compute_planner_inputs``) is
+    what the real run writes; the plan reports it as the would-be output
     schema. Reports the would-be run + the promote targets (``03-tasks.{json,md}``
     + the seeded ``task-status.yml`` + the populated ``04-lane-graph.yml``) so the
     operator sees the full generate->promote slice (the four-file write) before
@@ -575,20 +557,15 @@ def plan_generate_tasks(
     """
     feature_root = require_feature_root(repo_root, feature_id)
     # Preconditions mirror the real leg exactly: tasks stitches against TWO frozen
-    # upstreams (REQ + DES), so both must be frozen (ADR-0008 D2). The
-    # ``read_frozen_*_doc`` helpers raise ValueError when either is not frozen -
-    # the task gate's gating precondition.
-    intent = read_intent(feature_root)
-    req_doc = read_frozen_requirements_doc(feature_root)
-    des_doc = read_frozen_design_doc(feature_root)
-    req_summary = _render_frozen_requirements_summary(req_doc)
-    des_summary = _render_frozen_design_summary(des_doc)
-    task_text = _tasks_task_text(feature_id, intent, req_summary, des_summary, feedback)
-    schema = output_schema_for_role(_PLANNER_ROLE, stage="tasks")
+    # upstreams (REQ + DES), so both must be frozen (ADR-0008 D2).
+    # ``compute_planner_inputs`` calls the ``read_frozen_*_doc`` helpers, which
+    # raise ValueError when either is not frozen: the task gate's gating
+    # precondition.
+    inputs = compute_planner_inputs(feature_root, feature_id, "tasks", feedback)
     _require_token_source(profile)
 
     temp_root, input_dir = _render_temp_package(
-        feature_id, _PLANNER_ROLE, task_text, [], schema
+        feature_id, _PLANNER_ROLE, inputs.task_text, [], inputs.schema
     )
     details = _agent_invocation_details(
         profile, temp_root, _read_allowed_files(input_dir), max_turns, permission_mode

@@ -46,6 +46,7 @@ from ai_dev.paths import (
     OUTPUT_DIR,
     RESULT_JSON,
     feature_dir,
+    require_feature_root,
     run_dir,
 )
 from ai_dev.profiles import AgentProfile
@@ -273,6 +274,23 @@ def lane_allowed_files(lane: LaneEntry) -> list[str]:
     return sorted(combined)
 
 
+def require_frozen_tasks_and_lane_graph(feature_root: Path) -> None:
+    """§4.2: the implementer leg consumes frozen tasks + lane-graph.
+
+    Rejects before any read or allocation so an unfrozen precondition leaves no
+    partial run behind. Shared by ``build_implementer_input_package`` (the real
+    leg) and ``dry_run.plan_implement`` (the seam's other side) so the frozen
+    gate is one check, not a byte-identical copy on each side (ADR-0004 D5).
+    Raises ``ValueError`` if either artifact is unfrozen.
+    """
+    frozen = frozen_artifacts_status(feature_root)
+    if not (frozen.get("tasks") and frozen.get("lane_graph")):
+        raise ValueError(
+            "implementer leg requires frozen tasks + lane_graph (§4.2); "
+            "freeze them at the task gate first"
+        )
+
+
 def build_implementer_input_package(
     repo_root: Path,
     feature_id: str,
@@ -299,19 +317,10 @@ def build_implementer_input_package(
     audit record. The frozen check happens before any allocation so a rejected
     precondition leaves no partial run behind.
     """
-    feature_root = feature_dir(repo_root, feature_id)
-    if not feature_root.is_dir():
-        raise ValueError(
-            f"feature run {feature_id} not found under {repo_root}"
-        )
+    feature_root = require_feature_root(repo_root, feature_id)
     # §4.2: the implementer leg consumes frozen tasks + lane-graph. An unfrozen
     # precondition is rejected before reading anything or allocating a run.
-    frozen = frozen_artifacts_status(feature_root)
-    if not (frozen.get("tasks") and frozen.get("lane_graph")):
-        raise ValueError(
-            "implementer leg requires frozen tasks + lane_graph (§4.2); "
-            "freeze them at the task gate first"
-        )
+    require_frozen_tasks_and_lane_graph(feature_root)
     task_text = read_task_text(feature_root)
     # ADR-0007 D2: the implementer must declare its addressed REQs/ACs. The
     # instruction is appended to the (frozen) task text so it reaches the
