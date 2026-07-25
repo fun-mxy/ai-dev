@@ -70,6 +70,7 @@ import yaml
 from ai_dev.audit import append_audit_event
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.templates import LANE_GRAPH_YML
+from ai_dev.timeutil import utc_now_iso
 
 # §6 / §8.2: worktree metadata lives at the per-lane artifact home, flat
 # alongside ``implement-result.json`` / ``lane-decision.json``. The double
@@ -129,6 +130,18 @@ def lane_worktree_path(repo_root: Path, feature_id: str, lane_id: str) -> Path:
     if not lane_id:
         raise ValueError("lane_id must be a non-empty string")
     return repo_root / ".ai-dev" / _WORKTREES_PARENT / feature_id / lane_id
+
+
+def _lane_feature_root(repo_root: Path, feature_id: str) -> Path:
+    """Return ``<repo_root>/.ai-dev/features/<feature_id>`` (§6 skeleton).
+
+    Centralised so the worktree mutators share one path derivation —
+    the literal ``.ai-dev/features/`` join would otherwise be repeated
+    in every public function and in the lane-status helper.
+    """
+    if not feature_id:
+        raise ValueError("feature_id must be a non-empty string")
+    return repo_root / ".ai-dev" / "features" / feature_id
 
 
 def _lane_branch_name(feature_id: str, lane_id: str) -> str:
@@ -393,14 +406,34 @@ def create_lane_worktree(
         raise ValueError("base_ref must be a non-empty string")
     _require_lane_registered(repo_root, feature_id, lane_id)
 
-    feature_root = repo_root / ".ai-dev" / "features" / feature_id
+    feature_root = _lane_feature_root(repo_root, feature_id)
     metadata = load_lane_worktree(feature_root, lane_id)
-    if metadata is not None and metadata.get("lifecycle") == WORKTREE_LIFECYCLE_ACTIVE:
-        raise ValueError(
-            f"lane {lane_id!r} already has an active worktree at "
-            f"{metadata.get('path')!r}; keep or remove it before creating again "
-            f"(lane_worktree D2 — fail loud on unsafe states)"
-        )
+    if metadata is not None:
+        existing = metadata.get("lifecycle")
+        if existing == WORKTREE_LIFECYCLE_ACTIVE:
+            raise ValueError(
+                f"lane {lane_id!r} already has an active worktree at "
+                f"{metadata.get('path')!r}; keep or remove it before creating again "
+                f"(lane_worktree D2 — fail loud on unsafe states)"
+            )
+        if existing == WORKTREE_LIFECYCLE_KEPT:
+            # A kept lane still has a live worktree on disk, so a
+            # blind ``path.exists()`` check would later surface a
+            # misleading "refusing to overwrite an existing unrelated
+            # worktree" error. Refuse here with a message that names
+            # the actual lifecycle state instead.
+            raise ValueError(
+                f"lane {lane_id!r} worktree is in lifecycle=kept at "
+                f"{metadata.get('path')!r}; remove it explicitly before "
+                f"creating again (lane_worktree D2 — fail loud on unsafe states)"
+            )
+        if existing == WORKTREE_LIFECYCLE_REMOVED:
+            # A previous explicit removal clears the on-disk branch and
+            # directory; the metadata's ``removed`` lifecycle is the
+            # signal that a re-create is legitimate. The
+            # ``path.exists()`` / branch-exists checks below catch the
+            # remaining precondition violations.
+            pass
 
     branch = _lane_branch_name(feature_id, lane_id)
     path = lane_worktree_path(repo_root, feature_id, lane_id)
@@ -423,7 +456,7 @@ def create_lane_worktree(
         result, context=f"worktree add -b {branch} {path} {base_ref}"
     )
 
-    stamp = timestamp if timestamp is not None else _utc_now_iso()
+    stamp = timestamp if timestamp is not None else utc_now_iso()
     payload: dict[str, Any] = {
         "lane_id": lane_id,
         "feature_id": feature_id,
@@ -504,14 +537,15 @@ def keep_lane_worktree(
     this lane" the same way silently deleting would hide "I trashed
     someone's worktree".
     """
-    feature_root = repo_root / ".ai-dev" / "features" / feature_id
+    _require_lane_registered(repo_root, feature_id, lane_id)
+    feature_root = _lane_feature_root(repo_root, feature_id)
     metadata = load_lane_worktree(feature_root, lane_id)
     if metadata is None:
         raise ValueError(
             f"no lane worktree record for {lane_id!r} in {feature_root}; "
             f"create one first (lane_worktree D2)"
         )
-    stamp = timestamp if timestamp is not None else _utc_now_iso()
+    stamp = timestamp if timestamp is not None else utc_now_iso()
     clean = is_worktree_clean(Path(metadata["path"]))
     metadata["lifecycle"] = WORKTREE_LIFECYCLE_KEPT
     metadata["updated_at"] = stamp
@@ -545,16 +579,23 @@ def remove_lane_worktree(
     works cleanly), the lane-status ``worktree`` pointer is cleared,
     and a ``lane_worktree_remove`` audit event is recorded.
     """
-    feature_root = repo_root / ".ai-dev" / "features" / feature_id
+    _require_lane_registered(repo_root, feature_id, lane_id)
+    feature_root = _lane_feature_root(repo_root, feature_id)
     metadata = load_lane_worktree(feature_root, lane_id)
-    if metadata is None:
+    if metadata is None or metadata.get("lifecycle") == WORKTREE_LIFECYCLE_REMOVED:
+        # Treating the post-removal terminal state as "no worktree
+        # here" gives the caller a single, stable error message
+        # regardless of whether the on-disk directory was reaped —
+        # the alternative (the directory is gone, so ``is_worktree_clean``
+        # raises "not a directory") would surface a different exception
+        # for the same conceptual state.
         raise ValueError(
             f"no lane worktree record for {lane_id!r} in {feature_root}; "
             f"create one first (lane_worktree D2)"
         )
     path = Path(metadata["path"])
     clean = is_worktree_clean(path)
-    stamp = timestamp if timestamp is not None else _utc_now_iso()
+    stamp = timestamp if timestamp is not None else utc_now_iso()
     # Always refresh the ``clean`` snapshot in the metadata record so
     # the canonical file reflects the last known state — even when the
     # remove is refused (the next operator deserves to know the worktree
@@ -627,18 +668,3 @@ def remove_lane_worktree(
         timestamp=stamp,
         origin=origin,
     )
-
-
-# ---------------------------------------------------------------------------
-# Local time import — kept at module bottom to keep the public top-of-file
-# import block tight (the rest of the package uses timeutil for ISO stamps,
-# but lane_worktree needs it only inside the mutating functions, so a
-# function-local import lets readers see the dependency without it being
-# part of the module's import surface).
-# ---------------------------------------------------------------------------
-
-
-def _utc_now_iso() -> str:
-    from ai_dev.timeutil import utc_now_iso
-
-    return utc_now_iso()

@@ -545,6 +545,39 @@ class TestWorktreeLifecycleComposition:
         # Force-remove frees the path; the next create should succeed.
         create_lane_worktree(git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t3")
 
+    def test_recreate_after_keep_surfaces_lifecycle_message(self, git_repo: Path) -> None:
+        """The kept lifecycle refuses re-create with a message that names
+        ``lifecycle=kept`` rather than the misleading "unrelated worktree"
+        error the on-disk path check would otherwise raise."""
+        feature_id, lane_id, _ = _seed_two_lane_feature(git_repo)
+        create_lane_worktree(git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t1")
+        keep_lane_worktree(git_repo, feature_id, lane_id, timestamp="t2")
+        with pytest.raises(ValueError, match="lifecycle=kept"):
+            create_lane_worktree(
+                git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t3"
+            )
+
+    def test_remove_after_remove_surfaces_consistent_error(self, git_repo: Path) -> None:
+        """Removing an already-removed lane raises the same "no lane
+        worktree record" error a missing record would, not the
+        "not a directory" exception that ``is_worktree_clean`` would
+        otherwise raise on a reaped path."""
+        feature_id, lane_id, _ = _seed_two_lane_feature(git_repo)
+        create_lane_worktree(git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t1")
+        remove_lane_worktree(git_repo, feature_id, lane_id, force=True, timestamp="t2")
+        with pytest.raises(ValueError, match="no lane worktree"):
+            remove_lane_worktree(git_repo, feature_id, lane_id, timestamp="t3")
+
+    def test_keep_and_remove_refuse_unknown_lane(self, git_repo: Path) -> None:
+        """The lane-registration precondition is symmetric: ``create``,
+        ``keep``, and ``remove`` all refuse lanes that the lane graph
+        does not declare (ADR-0009 D2 — lane registry owns the lane set)."""
+        feature_id, _, _ = _seed_two_lane_feature(git_repo)
+        with pytest.raises(ValueError, match="LANE-999"):
+            keep_lane_worktree(git_repo, feature_id, "LANE-999", timestamp="t")
+        with pytest.raises(ValueError, match="LANE-999"):
+            remove_lane_worktree(git_repo, feature_id, "LANE-999", timestamp="t")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
