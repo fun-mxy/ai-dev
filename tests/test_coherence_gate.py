@@ -329,6 +329,25 @@ class TestCoherenceGateFailLoud:
         feature_root = _feature_root(repo_root, feature_id)
         assert not (feature_root / COHERENCE_DECISION_JSON).exists()
 
+    def test_missing_decision_for_one_declared_lane_fails_loud(self, repo_root: Path) -> None:
+        feature_id, lane_id = _stage_coherence_inputs(repo_root)
+        feature_root = _feature_root(repo_root, feature_id)
+        status_path = feature_root / "status" / "lane-status.yml"
+        graph_path = feature_root / "04-lane-graph.yml"
+        graph = yaml.safe_load(graph_path.read_text())
+        lane2 = dict(graph["lanes"][0])
+        lane2["id"] = "LANE-002"
+        graph["lanes"].append(lane2)
+        graph_path.write_text(yaml.safe_dump(graph, sort_keys=False))
+        status = yaml.safe_load(status_path.read_text())
+        status["lanes"]["LANE-002"] = dict(status["lanes"][lane_id])
+        status_path.write_text(yaml.safe_dump(status, sort_keys=False))
+
+        with pytest.raises(ValueError, match="LANE-002"):
+            evaluate_coherence_gate(repo_root, feature_id)
+
+        assert _feature_status(repo_root, feature_id)["verdict"] is None
+
     def test_status_inconsistent_fails_loud(self, repo_root: Path) -> None:
         # Corrupt the status field so it no longer matches the derived
         # projection. Condition 1 is a corruption guard (§24.2), not a verdict

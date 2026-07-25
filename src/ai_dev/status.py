@@ -34,11 +34,12 @@ coherence evaluator's sole ``verdict`` writer, advancing
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
 from ai_dev.audit import append_audit_event
+from ai_dev.templates import LANE_GRAPH_YML
 
 FEATURE_STATUS_FILE = "feature-status.yml"
 LANE_STATUS_FILE = "lane-status.yml"
@@ -72,6 +73,7 @@ _FREEZE_ADVANCE_TARGET: Mapping[str, str] = {
 _FREEZE_EVENT = "freeze"
 _ADVANCE_GATE_EVENT = "advance_gate"
 _MARK_TASK_PROPOSED_DONE_EVENT = "mark_task_proposed_done"
+_LANE_STATUS_EVENT = "lane_status"
 _FIX_LOOP_BUDGET_EVENT = "fix_loop_budget"
 _FIX_LOOP_BUDGET_USED = "used"
 _FIX_LOOP_BUDGET_MAX = "max"
@@ -649,33 +651,92 @@ def agent_profiles(feature_root: Path) -> Mapping[str, str]:
     return {str(k): str(v) for k, v in slots.items()}
 
 
+def _initial_lane_row() -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "current_phase": "not_started",
+        "worktree": None,
+        "implement_run": None,
+        "review_run": None,
+        "spec_gap_run": None,
+        "verification_run": None,
+        "gate_verdict": None,
+    }
+
+
+def write_initial_lane_statuses(status_dir: Path, lane_ids: Sequence[str]) -> Path:
+    """Write §8.2 ``lane-status.yml`` for one or more lanes.
+
+    v0.7 makes the lane registry genuinely multi-lane: callers pass the complete
+    lane id set, and every lane starts with the same pending/not_started runtime
+    shape. Duplicate or blank lane ids are structural corruption and fail loud.
+    """
+    if not lane_ids:
+        raise ValueError("lane_ids must contain at least one lane id")
+    seen: set[str] = set()
+    lanes: dict[str, Any] = {}
+    for lane_id in lane_ids:
+        if not isinstance(lane_id, str) or not lane_id:
+            raise ValueError("lane_ids must contain only non-empty string ids")
+        if lane_id in seen:
+            raise ValueError(f"duplicate lane id {lane_id!r} in lane_ids")
+        seen.add(lane_id)
+        lanes[lane_id] = _initial_lane_row()
+    status_dir.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = {"lanes": lanes}
+    path = status_dir / LANE_STATUS_FILE
+    _dump_yaml(path, doc)
+    return path
+
+
 def write_initial_lane_status(status_dir: Path, lane_id: str) -> Path:
     """Write the minimal §8.2 ``lane-status.yml`` with one lane, ``lane_id``.
 
-    The single lane starts ``pending`` / ``not_started`` with every run slot
-    null — a schema-correct initial state. v0 is single-lane (§5.3), so one lane
-    is the whole document; the mapping keeps the structure for the multi-lane
-    future. ``lane_id`` is expected to come from the ticket-03 allocator
-    (``allocate_id(feature_root, "LANE")``) at the call site, not a hardcoded
-    string, so the seeded lane references a real allocated id.
+    The single-lane writer remains the degenerate compatibility wrapper around
+    the v0.7 multi-lane registry writer.
     """
+    return write_initial_lane_statuses(status_dir, [lane_id])
+
+
+def sync_lane_statuses(status_dir: Path, lane_ids: Sequence[str]) -> Path:
+    """Ensure ``lane-status.yml`` has exactly the declared lanes, preserving rows.
+
+    Promote owns the canonical lane graph, while lane-status owns runtime state.
+    When the graph grows to multiple lanes, this writer adds missing lane rows
+    with the initial §8.2 shape and keeps existing per-lane runtime fields intact.
+    """
+    if not lane_ids:
+        raise ValueError("lane_ids must contain at least one lane id")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for lane_id in lane_ids:
+        if not isinstance(lane_id, str) or not lane_id:
+            raise ValueError("lane_ids must contain only non-empty string ids")
+        if lane_id in seen:
+            raise ValueError(f"duplicate lane id {lane_id!r} in lane_ids")
+        seen.add(lane_id)
+        ordered.append(lane_id)
+
     status_dir.mkdir(parents=True, exist_ok=True)
-    doc: dict[str, Any] = {
-        "lanes": {
-            lane_id: {
-                "status": "pending",
-                "current_phase": "not_started",
-                "worktree": None,
-                "implement_run": None,
-                "review_run": None,
-                "spec_gap_run": None,
-                "verification_run": None,
-                "gate_verdict": None,
-            }
-        }
-    }
     path = status_dir / LANE_STATUS_FILE
-    _dump_yaml(path, doc)
+    existing: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            doc = yaml.safe_load(path.read_text())
+        except yaml.YAMLError as exc:
+            raise ValueError(
+                f"lane-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+            ) from exc
+        lanes = doc.get("lanes") if isinstance(doc, dict) else None
+        if not isinstance(lanes, dict):
+            raise ValueError(f"lane-status.yml at {path} has no 'lanes' mapping (§24.2)")
+        existing = lanes
+
+    synced = {
+        lane_id: existing.get(lane_id) if isinstance(existing.get(lane_id), dict) else _initial_lane_row()
+        for lane_id in ordered
+    }
+    _dump_yaml(path, {"lanes": synced})
     return path
 
 
@@ -692,6 +753,173 @@ def write_initial_task_status(status_dir: Path) -> Path:
     path = status_dir / TASK_STATUS_FILE
     _dump_yaml(path, doc)
     return path
+
+
+def _lane_status_path(feature_root: Path) -> Path:
+    return feature_root / "status" / LANE_STATUS_FILE
+
+
+def _load_lane_ids(feature_root: Path) -> set[str]:
+    path = _lane_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"lane-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"lane-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    lanes = doc.get("lanes") if isinstance(doc, dict) else None
+    if not isinstance(lanes, dict):
+        raise ValueError(f"lane-status.yml at {path} has no 'lanes' mapping (§24.2)")
+    return {str(lane_id) for lane_id in lanes if isinstance(lane_id, str)}
+
+
+def lane_graph_ids(feature_root: Path) -> list[str]:
+    """Return the lane ids declared by canonical ``04-lane-graph.yml`` (§7.5)."""
+    path = feature_root / LANE_GRAPH_YML
+    if not path.is_file():
+        raise ValueError(f"{LANE_GRAPH_YML} missing at {path} (§7.5)")
+    try:
+        graph = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"{LANE_GRAPH_YML} at {path} is not valid YAML: {exc} (§7.5)"
+        ) from exc
+    lanes = graph.get("lanes") if isinstance(graph, dict) else None
+    if not isinstance(lanes, list) or not lanes:
+        raise ValueError(f"{LANE_GRAPH_YML} at {path} has no 'lanes' list (§7.5)")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for i, lane in enumerate(lanes):
+        if not isinstance(lane, Mapping):
+            raise ValueError(f"{LANE_GRAPH_YML} lane[{i}] is not a mapping (§7.5)")
+        lane_id = lane.get("id")
+        if not isinstance(lane_id, str) or not lane_id:
+            raise ValueError(f"{LANE_GRAPH_YML} lane[{i}] has no string id (§7.5)")
+        if lane_id in seen:
+            raise ValueError(f"{LANE_GRAPH_YML} duplicate lane id {lane_id!r} (§7.5)")
+        seen.add(lane_id)
+        ids.append(lane_id)
+    return ids
+
+
+def lane_status_ids(feature_root: Path) -> list[str]:
+    """Return lane ids in ``status/lane-status.yml`` in file order (§8.2)."""
+    path = _lane_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"lane-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"lane-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    lanes = doc.get("lanes") if isinstance(doc, dict) else None
+    if not isinstance(lanes, dict):
+        raise ValueError(f"lane-status.yml at {path} has no 'lanes' mapping (§24.2)")
+    return [lane_id for lane_id in lanes if isinstance(lane_id, str)]
+
+
+def declared_lane_ids(feature_root: Path) -> list[str]:
+    """Return canonical lane ids, failing if graph and status disagree.
+
+    ``04-lane-graph.yml`` owns lane structure; ``lane-status.yml`` owns runtime
+    state. Read-side feature helpers need both to agree before treating a lane set
+    as declared, otherwise a stale runtime row could mask a missing graph lane (or
+    vice versa).
+    """
+    graph_ids = lane_graph_ids(feature_root)
+    status_ids = lane_status_ids(feature_root)
+    if set(graph_ids) != set(status_ids):
+        raise ValueError(
+            f"lane registry mismatch: {LANE_GRAPH_YML} declares {graph_ids}, "
+            f"status/lane-status.yml declares {status_ids} (§24.2)"
+        )
+    return graph_ids
+
+
+def update_lane_status(
+    feature_root: Path,
+    lane_id: str,
+    *,
+    status: str | None = None,
+    current_phase: str | None = None,
+    worktree: str | None = None,
+    implement_run: str | None = None,
+    review_run: str | None = None,
+    spec_gap_run: str | None = None,
+    verification_run: str | None = None,
+    gate_verdict: str | None = None,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> None:
+    """Update one registered lane's §8.2 runtime row, preserving every other lane.
+
+    v0.7 makes ``lane-status.yml`` a true multi-lane runtime registry. Callers name
+    the lane they are advancing; this writer refuses missing lanes and leaves sibling
+    lane rows untouched, so runtime phases/runs can progress independently without a
+    hidden ``LANE-001`` assumption.
+    """
+    if not lane_id:
+        raise ValueError("lane_id must be a non-empty string")
+    _require_existing_lane(feature_root, lane_id)
+    path = _lane_status_path(feature_root)
+    if not path.is_file():
+        raise ValueError(
+            f"lane-status.yml missing at {path} (broken feature run, §24.2)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"lane-status.yml at {path} is not valid YAML: {exc} (§24.2)"
+        ) from exc
+    lanes = doc.get("lanes") if isinstance(doc, dict) else None
+    if not isinstance(lanes, dict):
+        raise ValueError(f"lane-status.yml at {path} has no 'lanes' mapping (§24.2)")
+    row = lanes.get(lane_id)
+    if not isinstance(row, dict):
+        raise ValueError(
+            f"lane {lane_id!r} is not registered in status/lane-status.yml; "
+            f"known lanes: {sorted(str(lane) for lane in lanes)} (§24.2)"
+        )
+
+    updates = {
+        "status": status,
+        "current_phase": current_phase,
+        "worktree": worktree,
+        "implement_run": implement_run,
+        "review_run": review_run,
+        "spec_gap_run": spec_gap_run,
+        "verification_run": verification_run,
+        "gate_verdict": gate_verdict,
+    }
+    changed = {key: value for key, value in updates.items() if value is not None}
+    if not changed:
+        raise ValueError("at least one lane status field must be provided")
+    row.update(changed)
+    _dump_yaml(path, doc)
+    append_audit_event(
+        feature_root,
+        event=_LANE_STATUS_EVENT,
+        payload={"lane": lane_id, "updates": changed},
+        timestamp=timestamp,
+        origin=origin,
+    )
+
+
+def _require_existing_lane(feature_root: Path, lane_id: str) -> None:
+    lanes = set(declared_lane_ids(feature_root))
+    if lane_id not in lanes:
+        raise ValueError(
+            f"lane {lane_id!r} is not registered in status/lane-status.yml; "
+            f"known lanes: {sorted(lanes)} (§24.2)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +957,18 @@ def _load_task_status(feature_root: Path) -> dict[str, Any]:
         raise ValueError(
             f"task-status.yml at {path} has no 'tasks' mapping (§24.2)"
         )
+    lanes = set(declared_lane_ids(feature_root))
+    for task_id, row in tasks.items():
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"task-status.yml row {task_id!r} is not a mapping (§24.2)"
+            )
+        lane_id = row.get("lane")
+        if not isinstance(lane_id, str) or lane_id not in lanes:
+            raise ValueError(
+                f"task-status.yml row {task_id!r} references missing lane {lane_id!r}; "
+                f"known lanes: {sorted(lanes)} (§24.2)"
+            )
     return doc
 
 
@@ -768,6 +1008,12 @@ def mark_task_proposed_done(
         raise ValueError("run_id must be a non-empty string")
 
     doc = _load_task_status(feature_root)
+    try:
+        _require_existing_lane(feature_root, lane_id)
+    except ValueError as exc:
+        raise ValueError(
+            f"task {task_id!r} cannot be marked from lane {lane_id!r}: {exc}"
+        ) from exc
     tasks: dict[str, Any] = doc["tasks"]
     if task_id not in tasks:
         # §8.1 row shape, seeded pending. The runtime flips it to proposed_done
@@ -785,6 +1031,12 @@ def mark_task_proposed_done(
     if not isinstance(row, dict):
         raise ValueError(
             f"task-status.yml row {task_id!r} is not a mapping (§24.2)"
+        )
+    existing_lane = row.get("lane")
+    if existing_lane != lane_id:
+        raise ValueError(
+            f"task {task_id!r} belongs to lane {existing_lane!r}; cannot mark it "
+            f"proposed_done from lane {lane_id!r} (§9.2 lane scoping)"
         )
     row["status"] = "proposed_done"
     row["proposed_done_by"] = run_id

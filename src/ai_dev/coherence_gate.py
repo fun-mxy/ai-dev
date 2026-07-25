@@ -46,7 +46,7 @@ from ai_dev.issue_status import STATUS_RESOLVED
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.lane_gate import LANE_DECISION_JSON
 from ai_dev.paths import feature_dir
-from ai_dev.status import derive_feature_status, load_feature_status, record_coherence_verdict
+from ai_dev.status import declared_lane_ids, derive_feature_status, load_feature_status, record_coherence_verdict
 from ai_dev.timeutil import elapsed_ms_between, utc_now_iso
 from ai_dev.triage import DECISIONS_DIR
 
@@ -219,18 +219,21 @@ def _status_consistent_condition(feature: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _load_lane_decisions(feature_root: Path) -> list[dict[str, Any]]:
-    """Read every ``lane-decision.json`` under ``lanes/``; fail-loud if none.
+    """Read every declared lane's ``lane-decision.json``; fail-loud if any missing.
 
-    The coherence gate runs after the lane gate (§23.5 step 20 follows §18.4),
-    so at least one lane decision must exist. v0.3 is single-lane; the list
-    shape keeps the multi-lane future honest (every lane gate must have passed).
+    In v0.7 the canonical lane set is ``04-lane-graph.yml`` and runtime
+    ``lane-status.yml`` must agree with it. Coherence therefore requires every
+    canonical lane to have reached a lane gate verdict, not only whichever
+    lane-decision files happen to exist under ``lanes/``.
     """
     decisions: list[dict[str, Any]] = []
-    for path in sorted((feature_root / "lanes").glob(f"*/{LANE_DECISION_JSON}")):
+    declared = declared_lane_ids(feature_root)
+    paths = [(lane_id, feature_root / "lanes" / lane_id / LANE_DECISION_JSON) for lane_id in declared]
+    for lane_id, path in paths:
         decision = read_json_object(path)
         if decision is None:
             raise ValueError(
-                f"lane-decision.json at {path} is missing or invalid (§24.2)"
+                f"lane-decision.json for lane {lane_id} at {path} is missing or invalid (§24.2)"
             )
         decisions.append(decision)
     if not decisions:

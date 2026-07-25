@@ -29,13 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from ai_dev.audit import AUDIT_LOG_JSON
 from ai_dev.json_artifact import read_json_object
 from ai_dev.lane_gate import LANE_DECISION_JSON
 from ai_dev.paths import feature_dir, features_dir, lane_dir
-from ai_dev.status import LANE_STATUS_FILE, load_feature_status
+from ai_dev.status import declared_lane_ids, load_feature_status
 
 
 @dataclass(frozen=True)
@@ -168,24 +166,8 @@ def list_features(repo_root: Path) -> list[FeatureSummary]:
 
 
 def _lane_ids(repo_root: Path, feature_id: str) -> list[str]:
-    """Sorted lane ids from the canonical ``lane-status.yml`` registry.
-
-    Lanes are allocated at feature-run creation and recorded in
-    ``status/lane-status.yml``; a ``lanes/<LANE-NNN>/`` directory is only
-    materialised when the implement leg runs. So the lane list must come from
-    the status registry (the source of truth for "which lanes exist"), not from
-    the ``lanes/`` dir — otherwise a freshly-created feature reports zero lanes.
-    Returns ``[]`` when the file is absent (defensive; ``create_feature_run``
-    always writes it).
-    """
-    path = feature_dir(repo_root, feature_id) / "status" / LANE_STATUS_FILE
-    if not path.is_file():
-        return []
-    doc = yaml.safe_load(path.read_text())
-    lanes = doc.get("lanes") if isinstance(doc, dict) else None
-    if not isinstance(lanes, dict):
-        return []
-    return sorted(lane_id for lane_id in lanes if isinstance(lane_id, str))
+    """Lane ids from the canonical lane graph/status registry."""
+    return declared_lane_ids(feature_dir(repo_root, feature_id))
 
 
 def _lane_summaries(repo_root: Path, feature_id: str) -> list[LaneDecisionSummary]:

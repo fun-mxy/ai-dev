@@ -44,14 +44,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import yaml
 
 from ai_dev.audit import append_audit_event
 from ai_dev.feature_ids import allocate_id
 from ai_dev.json_artifact import read_json_object, write_json
-from ai_dev.status import TASK_STATUS_FILE, frozen_artifacts_status
+from ai_dev.status import (
+    TASK_STATUS_FILE,
+    frozen_artifacts_status,
+    lane_graph_ids,
+    sync_lane_statuses,
+)
 from ai_dev.templates import (
     DESIGN_JSON,
     DESIGN_MD,
@@ -997,6 +1002,60 @@ def _seeded_lane_id(feature_root: Path) -> str:
     return first["id"]
 
 
+def _lane_ids_from_graph(feature_root: Path) -> list[str]:
+    return lane_graph_ids(feature_root)
+
+
+def _proposal_lanes(
+    proposal: Mapping[str, Any], seeded_lane_ids: Sequence[str], lane_purpose: str
+) -> tuple[dict[str, str], dict[str, list[dict[str, str]]] | list[dict[str, str]]]:
+    raw = proposal.get("lanes")
+    if raw is None:
+        return {seeded_lane_ids[0]: lane_purpose}, _normalize_verify_commands(
+            proposal.get("verification_commands")
+        )
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("proposal 'lanes' must be a non-empty list (§24.2)")
+    known = set(seeded_lane_ids)
+    purposes: dict[str, str] = {}
+    verify: dict[str, list[dict[str, str]]] = {}
+    for i, lane in enumerate(raw):
+        if not isinstance(lane, Mapping):
+            raise ValueError(f"proposal 'lanes'[{i}] must be an object (§24.2)")
+        lane_id = lane.get("id")
+        if not isinstance(lane_id, str) or not lane_id:
+            raise ValueError(f"proposal 'lanes'[{i}] has no non-empty 'id' (§24.2)")
+        if lane_id not in known:
+            raise ValueError(
+                f"proposal references lane {lane_id!r}, not present in {LANE_GRAPH_YML}; "
+                f"known lanes: {sorted(known)} (§24.2)"
+            )
+        if lane_id in purposes:
+            raise ValueError(f"proposal duplicate lane id {lane_id!r} (§24.2)")
+        purpose = lane.get("purpose")
+        if not isinstance(purpose, str) or not purpose:
+            raise ValueError(
+                f"proposal 'lanes'[{i}] needs a non-empty string 'purpose' (§24.2)"
+            )
+        purposes[lane_id] = purpose
+        verify[lane_id] = _normalize_verify_commands(lane.get("verification_commands"))
+    for lane_id in seeded_lane_ids:
+        verify.setdefault(lane_id, [])
+    return purposes, verify
+
+
+def _task_lane(entry: Mapping[str, Any], lane_purposes: Mapping[str, str], fallback: str) -> str:
+    raw = entry.get("lane", fallback)
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("task lane must be a non-empty string (§24.2)")
+    if raw not in lane_purposes:
+        raise ValueError(
+            f"task references lane {raw!r}, not declared in proposal lanes "
+            f"{sorted(lane_purposes)} (§24.2)"
+        )
+    return raw
+
+
 def build_canonical_tasks(
     feature_root: Path,
     feature_id: str,
@@ -1004,7 +1063,7 @@ def build_canonical_tasks(
     *,
     origin: str | None,
     timestamp: str | None = None,
-) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]], dict[str, list[dict[str, str]]] | list[dict[str, str]]]:
     """Allocate TASK ids + stitch REQ/DES refs -> canonical tasks doc + status rows.
 
     The pure allocation/stitch core of ``promote_tasks`` (split out for the same
@@ -1072,7 +1131,9 @@ def build_canonical_tasks(
         raise ValueError(
             "proposal needs a non-empty string 'lane_purpose' (§24.2)"
         )
-    lane_id = _seeded_lane_id(feature_root)
+    lane_ids = _lane_ids_from_graph(feature_root)
+    lane_purposes, verification_commands = _proposal_lanes(proposal, lane_ids, lane_purpose)
+    fallback_lane_id = lane_ids[0]
 
     tasks: list[dict[str, Any]] = []
     task_status_rows: dict[str, dict[str, Any]] = {}
@@ -1094,6 +1155,7 @@ def build_canonical_tasks(
         exclusive_files = _str_list(
             entry.get("exclusive_files"), "exclusive_files", i, what="tasks"
         )
+        lane_id = _task_lane(entry, lane_purposes, fallback_lane_id)
         task: dict[str, Any] = {
             "id": task_id,
             "key": key,
@@ -1137,12 +1199,9 @@ def build_canonical_tasks(
         # a frozen tasks/lane_graph outright, so this is always false here.
         "frozen": False,
         "lane_purpose": lane_purpose,
+        "lane_purposes": dict(lane_purposes),
         "tasks": tasks,
     }
-    # v0.6 capstone (ticket 05): the optional lane verify command set travels out
-    # of band to the lane-graph writer (it is a lane-level concern, not task
-    # content), so it is NOT stored on the doc that becomes 03-tasks.json.
-    verification_commands = _normalize_verify_commands(proposal.get("verification_commands"))
     return doc, allocated, task_status_rows, verification_commands
 
 
@@ -1236,7 +1295,7 @@ def _populate_lane_graph_from_doc(
     feature_root: Path,
     doc: Mapping[str, Any],
     *,
-    verification_commands: list[dict[str, str]] | None = None,
+    verification_commands: Mapping[str, list[dict[str, str]]] | list[dict[str, str]] | None = None,
 ) -> None:
     """Populate the single lane's purpose/tasks/files (+ verify commands) in
     ``04-lane-graph.yml``.
@@ -1257,38 +1316,63 @@ def _populate_lane_graph_from_doc(
     empty/None the lane entry's existing ``verification_commands`` is left
     untouched (backward compatible with proposals that omit it).
     """
-    graph, lane = _read_lane_graph(feature_root)
+    graph, _ = _read_lane_graph(feature_root)
 
     tasks = doc.get("tasks") or []
-    expected: set[str] = set()
-    exclusive: set[str] = set()
-    task_ids: list[str] = []
+    lane_tasks: dict[str, list[str]] = {}
+    lane_expected: dict[str, set[str]] = {}
+    lane_exclusive: dict[str, set[str]] = {}
     for t in tasks:
         if not isinstance(t, Mapping):
             continue
+        lane_id = t.get("lane")
         tid = t.get("id")
+        if not isinstance(lane_id, str) or not lane_id:
+            continue
         if isinstance(tid, str) and tid:
-            task_ids.append(tid)
+            lane_tasks.setdefault(lane_id, []).append(tid)
         for f in t.get("expected_files", []) or []:
             if isinstance(f, str) and f:
-                expected.add(f)
+                lane_expected.setdefault(lane_id, set()).add(f)
         for f in t.get("exclusive_files", []) or []:
             if isinstance(f, str) and f:
-                exclusive.add(f)
+                lane_exclusive.setdefault(lane_id, set()).add(f)
 
-    lane["purpose"] = doc.get("lane_purpose")
-    lane["tasks"] = task_ids
-    lane["expected_files"] = sorted(expected)
-    lane["exclusive_files"] = sorted(exclusive)
-    if verification_commands:
-        lane["verification_commands"] = verification_commands
-        # ``verification_scope`` is the human label set (§7.5) - the names of the
-        # commands above, derived so the two never drift.
-        lane["verification_scope"] = [vc["name"] for vc in verification_commands]
+    raw_purposes = doc.get("lane_purposes")
+    purpose_by_lane = raw_purposes if isinstance(raw_purposes, Mapping) else {}
+    if isinstance(verification_commands, Mapping):
+        verify_by_lane = verification_commands
+    else:
+        first_id = graph["lanes"][0]["id"]
+        verify_by_lane = {first_id: verification_commands or []}
+
+    for lane in graph["lanes"]:
+        if not isinstance(lane, dict):
+            continue
+        lane_id = lane.get("id")
+        if not isinstance(lane_id, str) or not lane_id:
+            continue
+        if lane_id in purpose_by_lane:
+            lane["purpose"] = purpose_by_lane[lane_id]
+        lane["tasks"] = lane_tasks.get(lane_id, [])
+        lane["expected_files"] = sorted(
+            set(lane.get("expected_files", []) or []) | lane_expected.get(lane_id, set())
+        )
+        lane["exclusive_files"] = sorted(
+            set(lane.get("exclusive_files", []) or []) | lane_exclusive.get(lane_id, set())
+        )
+        lane_verify = verify_by_lane.get(lane_id, [])
+        if lane_verify:
+            lane["verification_commands"] = list(lane_verify)
+            lane["verification_scope"] = [vc["name"] for vc in lane_verify]
     with (feature_root / LANE_GRAPH_YML).open("w") as f:
         yaml.safe_dump(
             graph, f, sort_keys=False, default_flow_style=False, allow_unicode=True
         )
+    sync_lane_statuses(
+        feature_root / "status",
+        [lane["id"] for lane in graph["lanes"] if isinstance(lane, Mapping) and isinstance(lane.get("id"), str)],
+    )
 
 
 def promote_tasks(

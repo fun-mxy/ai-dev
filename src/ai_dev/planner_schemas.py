@@ -248,6 +248,7 @@ _TASK_ITEM_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
         },
+        "lane": {"type": "string", "minLength": 1},
         "description": {"type": "string"},
         "verification": {"type": "array", "items": {"type": "string", "minLength": 1}},
     },
@@ -283,6 +284,20 @@ _VERIFY_COMMAND_ITEM_SCHEMA: dict[str, Any] = {
     },
 }
 
+_LANE_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["id", "purpose"],
+    "additionalProperties": True,
+    "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string", "minLength": 1},
+        "verification_commands": {
+            "type": "array",
+            "items": _VERIFY_COMMAND_ITEM_SCHEMA,
+        },
+    },
+}
+
 # ADR-0008 D2: the tasks proposal - id-free structured JSON. ``lane_purpose`` is
 # the purpose the model assigns to the single MVP lane (promote writes it into
 # 04-lane-graph.yml); ``tasks`` is the required array of TASK slots (the
@@ -314,6 +329,10 @@ TASKS_PROPOSAL_SCHEMA: dict[str, Any] = {
         "verification_commands": {
             "type": "array",
             "items": _VERIFY_COMMAND_ITEM_SCHEMA,
+        },
+        "lanes": {
+            "type": "array",
+            "items": _LANE_ITEM_SCHEMA,
         },
     },
 }
