@@ -4,11 +4,11 @@
 
 **Blocked by:** 01.
 
-**Status:** open
+**Status:** done
 
-- [ ] command/helper creates one git worktree per lane with a deterministic branch naming scheme
-- [ ] lane `worktree.json` records lane id, branch, base ref, path, created/updated timestamps, and lifecycle status
-- [ ] clean/dirty detection is available and used before destructive lifecycle operations
-- [ ] remove/keep behavior is explicit; dirty or unknown worktrees are preserved unless a human explicitly chooses otherwise
-- [ ] repeated create/run attempts are idempotent or fail loud with an actionable message
-- [ ] tests cover create, existing worktree, dirty refusal, clean removal/keep, and non-git/precondition errors; `uv run mypy` + `uv run pytest` green
+- [x] command/helper creates one git worktree per lane with a deterministic branch naming scheme
+- [x] lane `worktree.json` records lane id, branch, base ref, path, created/updated timestamps, and lifecycle status
+- [x] clean/dirty detection is available and used before destructive lifecycle operations
+- [x] remove/keep behavior is explicit; dirty or unknown worktrees are preserved unless a human explicitly chooses otherwise
+- [x] repeated create/run attempts are idempotent or fail loud with an actionable message
+- [x] tests cover create, existing worktree, dirty refusal, clean removal/keep, and non-git/precondition errors; `uv run mypy` + `uv run pytest` green
