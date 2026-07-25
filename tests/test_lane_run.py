@@ -65,32 +65,9 @@ from ai_dev.templates import LANE_GRAPH_YML, TASKS_MD
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def git_repo(tmp_path: Path) -> Path:
-    """Throwaway git repo at ``tmp_path`` with an initial commit + identity."""
-    subprocess.run(
-        ["git", "init", "--initial-branch=main", str(tmp_path)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "user.email", "t@example.com"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "user.name", "tester"],
-        check=True, capture_output=True,
-    )
-    (tmp_path / "README.md").write_text("init\n")
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "add", "README.md"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "commit", "-m", "init"],
-        check=True, capture_output=True,
-    )
-    return tmp_path
+# `git_repo` fixture is hoisted to tests/conftest.py so all
+# tests share one source of truth.
+
 
 
 _FAKE_CLAUDE_TEMPLATE = """\
