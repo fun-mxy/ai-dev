@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NamedTuple
 
 import yaml
 
@@ -533,48 +533,13 @@ def promote_requirements(
     the seam apart from the deterministic writes (id counter, canonical json/md,
     audit) — no subprocess, no model.
     """
-    if not feature_id:
-        raise ValueError("feature_id must be a non-empty string")
-
-    # §4.2 guard: promote targets the canonical-*unfrozen* artifact (D1). A frozen
-    # artifact is immutable; only a Change Proposal may change it. Read the frozen
-    # map (fail loud if status is corrupt, like every status reader).
-    frozen = frozen_artifacts_status(feature_root)
-    if frozen.get(REQUIREMENTS_ARTIFACT):
-        raise FrozenArtifactWriteError(
-            f"artifact {REQUIREMENTS_ARTIFACT!r} is frozen; promote may only "
-            f"overwrite an unfrozen artifact (use a Change Proposal to change a "
-            f"frozen one, §4.2/§17)"
-        )
-
-    doc, allocated = build_canonical_requirements(
-        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
-    )
-
-    json_path = feature_root / REQUIREMENTS_JSON
-    md_path = feature_root / REQUIREMENTS_MD
-    write_json(json_path, doc)
-    md_path.write_text(render_requirements_md(feature_id, doc))
-
-    append_audit_event(
+    return _promote_artifact(
         feature_root,
-        event=_PROMOTE_EVENT,
-        payload={
-            "stage": "requirements",
-            "artifact": REQUIREMENTS_ARTIFACT,
-            "feature": feature_id,
-            "allocated": allocated,
-        },
+        feature_id,
+        REQUIREMENTS_ARTIFACT,
+        proposal,
         timestamp=timestamp,
         origin=origin,
-    )
-
-    return PromoteResult(
-        stage="requirements",
-        artifact=REQUIREMENTS_ARTIFACT,
-        json_path=json_path,
-        md_path=md_path,
-        allocated={k: tuple(v) for k, v in allocated.items()},
     )
 
 
@@ -857,46 +822,13 @@ def promote_design(
     seam apart from the deterministic writes (id counter, canonical json/md,
     audit) - no subprocess, no model.
     """
-    if not feature_id:
-        raise ValueError("feature_id must be a non-empty string")
-
-    # §4.2 guard: promote targets the canonical-*unfrozen* design artifact (D1).
-    frozen = frozen_artifacts_status(feature_root)
-    if frozen.get(DESIGN_ARTIFACT):
-        raise FrozenArtifactWriteError(
-            f"artifact {DESIGN_ARTIFACT!r} is frozen; promote may only "
-            f"overwrite an unfrozen artifact (use a Change Proposal to change a "
-            f"frozen one, §4.2/§17)"
-        )
-
-    doc, allocated = build_canonical_design(
-        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
-    )
-
-    json_path = feature_root / DESIGN_JSON
-    md_path = feature_root / DESIGN_MD
-    write_json(json_path, doc)
-    md_path.write_text(render_design_md(feature_id, doc))
-
-    append_audit_event(
+    return _promote_artifact(
         feature_root,
-        event=_PROMOTE_EVENT,
-        payload={
-            "stage": "design",
-            "artifact": DESIGN_ARTIFACT,
-            "feature": feature_id,
-            "allocated": allocated,
-        },
+        feature_id,
+        DESIGN_ARTIFACT,
+        proposal,
         timestamp=timestamp,
         origin=origin,
-    )
-
-    return PromoteResult(
-        stage="design",
-        artifact=DESIGN_ARTIFACT,
-        json_path=json_path,
-        md_path=md_path,
-        allocated={k: tuple(v) for k, v in allocated.items()},
     )
 
 
@@ -1388,56 +1320,13 @@ def promote_tasks(
     seam apart from the deterministic writes (id counter, canonical json/md,
     task-status, lane-graph, audit) - no subprocess, no model.
     """
-    if not feature_id:
-        raise ValueError("feature_id must be a non-empty string")
-
-    # §4.2 guard: promote writes 03-tasks AND 04-lane-graph together (the §18.3
-    # task-gate freezes both), so refuse if EITHER is already frozen. A frozen
-    # artifact is immutable; only a Change Proposal may change it.
-    frozen = frozen_artifacts_status(feature_root)
-    if frozen.get(TASKS_ARTIFACT) or frozen.get(LANE_GRAPH_ARTIFACT):
-        raise FrozenArtifactWriteError(
-            f"artifact {TASKS_ARTIFACT!r}/{LANE_GRAPH_ARTIFACT!r} is frozen; "
-            f"promote may only overwrite unfrozen artifacts (use a Change "
-            f"Proposal to change a frozen one, §4.2/§17)"
-        )
-
-    doc, allocated, task_status_rows, verification_commands = build_canonical_tasks(
-        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
-    )
-
-    json_path = feature_root / TASKS_JSON
-    md_path = feature_root / TASKS_MD
-    write_json(json_path, doc)
-    md_path.write_text(render_tasks_md(feature_id, doc))
-    # Seed task-status.yml (runtime state, all pending) + populate the single
-    # lane in 04-lane-graph.yml. Both are deterministic writes, no model. The
-    # Planner-generated verification_commands (ticket 05) ride along onto the
-    # lane entry so the Verifier runs model-generated commands.
-    _seed_task_status(feature_root, task_status_rows)
-    _populate_lane_graph_from_doc(
-        feature_root, doc, verification_commands=verification_commands
-    )
-
-    append_audit_event(
+    return _promote_artifact(
         feature_root,
-        event=_PROMOTE_EVENT,
-        payload={
-            "stage": "tasks",
-            "artifact": TASKS_ARTIFACT,
-            "feature": feature_id,
-            "allocated": allocated,
-        },
+        feature_id,
+        TASKS_ARTIFACT,
+        proposal,
         timestamp=timestamp,
         origin=origin,
-    )
-
-    return PromoteResult(
-        stage="tasks",
-        artifact=TASKS_ARTIFACT,
-        json_path=json_path,
-        md_path=md_path,
-        allocated={k: tuple(v) for k, v in allocated.items()},
     )
 
 
@@ -1771,3 +1660,202 @@ _ARTIFACT_RENDERER: Mapping[str, Callable[[str, Mapping[str, Any]], str]] = {
     DESIGN_ARTIFACT: render_design_md,
     TASKS_ARTIFACT: render_tasks_md,
 }
+
+
+# ---------------------------------------------------------------------------
+# Table-driven promote dispatch (mirrors render_artifact's table-driven shape).
+#
+# The three ``promote_*`` shells above differ only in (a) the build core, (b)
+# which §4.2 artifacts the frozen guard checks, and (c) an optional post-build
+# write (tasks seeds task-status + populates the lane-graph). ``_ARTIFACT_BUILDER``
+# is the per-stage table carrying exactly those three varying bits - the json/md
+# filenames and the renderer come from the existing render-shared tables
+# (``artifact_json_file`` / ``artifact_md_file`` / ``_ARTIFACT_RENDERER``), so the
+# builder carries no duplicated metadata. ``_promote_artifact`` is the single
+# write/render/audit shell each public ``promote_*`` delegates to - the
+# promote-leg analogue of ``render_artifact``'s table-driven dispatch.
+# ---------------------------------------------------------------------------
+
+
+class _ArtifactBuilder(NamedTuple):
+    """Per-stage promote descriptor (the table-driven core, mirrors render_artifact).
+
+    Each renderable planning stage (requirements / design / tasks) is one row:
+    the build core (id-allocate + stitch, wrapped to a uniform ``(doc, allocated,
+    ctx)`` 3-tuple so the 2-tuple req/design cores and the 4-tuple tasks core
+    share one shell), the §4.2 artifacts the frozen guard checks (tasks guards
+    ``tasks`` and ``lane_graph`` together - they freeze at the same gate), and
+    the optional post-build writes (tasks only: seed ``task-status.yml`` +
+    populate ``04-lane-graph.yml``; req/design have ``None``). Adding a planning
+    stage is one row here + one delegator, not a copy-pasted shell.
+    """
+
+    build: Callable[..., tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]]
+    frozen_artifacts: tuple[str, ...]
+    post_write: Callable[[Path, Mapping[str, Any], Mapping[str, Any]], None] | None
+
+
+def _build_requirements_artifact(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    origin: str | None,
+    timestamp: str | None,
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]:
+    doc, allocated = build_canonical_requirements(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+    return doc, allocated, {}
+
+
+def _build_design_artifact(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    origin: str | None,
+    timestamp: str | None,
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]:
+    doc, allocated = build_canonical_design(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+    return doc, allocated, {}
+
+
+def _build_tasks_artifact(
+    feature_root: Path,
+    feature_id: str,
+    proposal: Mapping[str, Any],
+    *,
+    origin: str | None,
+    timestamp: str | None,
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]:
+    doc, allocated, task_status_rows, verification_commands = build_canonical_tasks(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+    return doc, allocated, {
+        "task_status_rows": task_status_rows,
+        "verification_commands": verification_commands,
+    }
+
+
+def _write_tasks_extras(
+    feature_root: Path, doc: Mapping[str, Any], ctx: Mapping[str, Any]
+) -> None:
+    """Tasks-only post-build writes: seed task-status + populate the lane-graph.
+
+    The two deterministic writes ``promote_tasks`` does beyond the shared
+    json+md+audit shell (ADR-0008 D2): seed ``status/task-status.yml`` (every
+    task ``pending``) and populate the single lane in ``04-lane-graph.yml``
+    (purpose/tasks/files + the Planner-generated verify commands). Both run
+    after the canonical json+md write and before the audit record, matching the
+    pre-refactor ordering byte-for-byte.
+    """
+    _seed_task_status(feature_root, ctx["task_status_rows"])
+    _populate_lane_graph_from_doc(
+        feature_root, doc, verification_commands=ctx["verification_commands"]
+    )
+
+
+def _frozen_promote_message(frozen_artifacts: tuple[str, ...]) -> str:
+    """The §4.2 frozen-guard message for a stage's guarded artifacts.
+
+    Reproduces the two pre-refactor messages byte-for-byte: a single-artifact
+    stage (requirements / design) says ``artifact 'requirements' is frozen;
+    promote may only overwrite an unfrozen artifact (...)``; tasks (which guards
+    ``tasks`` and ``lane_graph`` together) says ``artifact 'tasks'/'lane_graph'
+    is frozen; promote may only overwrite unfrozen artifacts (...)``.
+    """
+    names = "/".join(repr(a) for a in frozen_artifacts)
+    tail = (
+        "promote may only overwrite unfrozen artifacts"
+        if len(frozen_artifacts) > 1
+        else "promote may only overwrite an unfrozen artifact"
+    )
+    return (
+        f"artifact {names} is frozen; {tail} (use a Change Proposal to change a "
+        f"frozen one, §4.2/§17)"
+    )
+
+
+_ARTIFACT_BUILDER: Mapping[str, _ArtifactBuilder] = {
+    REQUIREMENTS_ARTIFACT: _ArtifactBuilder(
+        build=_build_requirements_artifact,
+        frozen_artifacts=(REQUIREMENTS_ARTIFACT,),
+        post_write=None,
+    ),
+    DESIGN_ARTIFACT: _ArtifactBuilder(
+        build=_build_design_artifact,
+        frozen_artifacts=(DESIGN_ARTIFACT,),
+        post_write=None,
+    ),
+    TASKS_ARTIFACT: _ArtifactBuilder(
+        build=_build_tasks_artifact,
+        frozen_artifacts=(TASKS_ARTIFACT, LANE_GRAPH_ARTIFACT),
+        post_write=_write_tasks_extras,
+    ),
+}
+
+
+def _promote_artifact(
+    feature_root: Path,
+    feature_id: str,
+    artifact: str,
+    proposal: Mapping[str, Any],
+    *,
+    timestamp: str | None = None,
+    origin: str | None = None,
+) -> PromoteResult:
+    """The shared write/render/audit shell over a build core (table-driven).
+
+    The promote-leg analogue of :func:`render_artifact`: one shell dispatched by
+    the ``_ARTIFACT_BUILDER`` table, so the three public ``promote_*`` functions
+    are thin delegators (signatures unchanged) rather than three copy-pasted
+    shells. Runs the §4.2 frozen guard (refuses a frozen artifact - the canonical
+    state is the human gate's to freeze), calls the stage's build core to
+    id-allocate + stitch (reference-integrity, D3 - fails loud, writes nothing),
+    writes the canonical ``.json`` + renders the ``.md`` mirror (the sole md
+    renderer), runs the optional post-build writes (tasks), and appends one
+    ``promote`` audit record carrying the allocated ids. ``artifact`` is always a
+    known key (the delegators pass the stage's constant), so the table lookup is
+    direct.
+    """
+    if not feature_id:
+        raise ValueError("feature_id must be a non-empty string")
+
+    builder = _ARTIFACT_BUILDER[artifact]
+    frozen = frozen_artifacts_status(feature_root)
+    if any(frozen.get(a) for a in builder.frozen_artifacts):
+        raise FrozenArtifactWriteError(_frozen_promote_message(builder.frozen_artifacts))
+
+    doc, allocated, ctx = builder.build(
+        feature_root, feature_id, proposal, origin=origin, timestamp=timestamp
+    )
+
+    json_path = feature_root / artifact_json_file(artifact)
+    md_path = feature_root / artifact_md_file(artifact)
+    write_json(json_path, doc)
+    md_path.write_text(_ARTIFACT_RENDERER[artifact](feature_id, doc))
+    if builder.post_write is not None:
+        builder.post_write(feature_root, doc, ctx)
+
+    append_audit_event(
+        feature_root,
+        event=_PROMOTE_EVENT,
+        payload={
+            "stage": artifact,
+            "artifact": artifact,
+            "feature": feature_id,
+            "allocated": allocated,
+        },
+        timestamp=timestamp,
+        origin=origin,
+    )
+    return PromoteResult(
+        stage=artifact,
+        artifact=artifact,
+        json_path=json_path,
+        md_path=md_path,
+        allocated={k: tuple(v) for k, v in allocated.items()},
+    )
