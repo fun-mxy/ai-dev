@@ -14,10 +14,12 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from ai_dev.cli import main
 from ai_dev.lane_gate import LANE_DECISION_JSON, evaluate_lane_gate
 from ai_dev.paths import lane_dir
+from ai_dev.templates import LANE_GRAPH_YML
 
 from test_lane_gate import _stage_lane_gate_inputs  # noqa: E402
 
@@ -130,6 +132,56 @@ class TestShowStatus:
                 "blocking_issue_count": None,
             }
         ]
+
+    def test_json_output_renders_all_lanes_from_lane_status(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        capsys.readouterr()
+        feature_root = repo_root / ".ai-dev" / "features" / "FEATURE-001"
+        graph_path = feature_root / LANE_GRAPH_YML
+        graph = yaml.safe_load(graph_path.read_text())
+        lane2 = dict(graph["lanes"][0])
+        lane2["id"] = "LANE-002"
+        graph["lanes"].append(lane2)
+        graph_path.write_text(yaml.safe_dump(graph, sort_keys=False))
+        status_path = feature_root / "status" / "lane-status.yml"
+        status = yaml.safe_load(status_path.read_text())
+        status["lanes"]["LANE-002"] = dict(status["lanes"]["LANE-001"])
+        status_path.write_text(yaml.safe_dump(status, sort_keys=False))
+
+        code = main(
+            ["show-status", "FEATURE-001", "--repo-root", str(repo_root), "--json"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [lane["lane_id"] for lane in payload["lanes"]] == ["LANE-001", "LANE-002"]
+        assert all(lane["decision"] is None for lane in payload["lanes"])
+
+    def test_human_output_renders_all_lanes_from_lane_status(
+        self, repo_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["create-feature-run", INTENT, "--repo-root", str(repo_root)])
+        capsys.readouterr()
+        feature_root = repo_root / ".ai-dev" / "features" / "FEATURE-001"
+        graph_path = feature_root / LANE_GRAPH_YML
+        graph = yaml.safe_load(graph_path.read_text())
+        lane2 = dict(graph["lanes"][0])
+        lane2["id"] = "LANE-002"
+        graph["lanes"].append(lane2)
+        graph_path.write_text(yaml.safe_dump(graph, sort_keys=False))
+        status_path = feature_root / "status" / "lane-status.yml"
+        status = yaml.safe_load(status_path.read_text())
+        status["lanes"]["LANE-002"] = dict(status["lanes"]["LANE-001"])
+        status_path.write_text(yaml.safe_dump(status, sort_keys=False))
+
+        code = main(["show-status", "FEATURE-001", "--repo-root", str(repo_root)])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "LANE-001: (no lane-decision yet)" in out
+        assert "LANE-002: (no lane-decision yet)" in out
 
     def test_reflects_lane_decision(
         self, repo_root: Path, capsys: pytest.CaptureFixture[str]

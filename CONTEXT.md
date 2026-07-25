@@ -108,3 +108,60 @@ done → freeze (runs coverage-completeness) → advance current_gate
      re-renders the `.md` mirror; new items go through an `allocate-id` helper
      so ids stay in the counter. Allowed because §4.3 reserves only
      ids/status/gate-verdict for scripts — unfrozen *content* is editable.
+
+## Multi-lane worktree execution (v0.7)
+
+A **lane** is an independently executable implementation slice of a feature run.
+Multi-lane support means multiple lanes can be developed, checked, and gated
+independently; it does **not** mean the orchestrator automatically integrates
+their branches into one coherent codebase.
+
+### Lane execution vs feature integration
+
+- **lane execution** — implement/review/spec-gap/verify/triage/lane-gate for one
+  lane, performed against that lane's isolated checkout and recorded in the
+  feature's canonical artifacts.
+- **feature integration** — combining completed lane branches into the final
+  product branch and resolving merge or semantic conflicts. This remains
+  human-owned until the Merge Coordinator milestone.
+
+v0.7 promises lane execution, not feature integration. A feature may have every
+lane gate pass while still requiring human integration work before the product
+branch is coherent.
+
+### Worktree isolation
+
+A **lane worktree** is a git worktree dedicated to one lane's execution. It
+solves worktree-level interference: two agents do not edit the same checkout and
+cannot accidentally overwrite each other's uncommitted working-tree state.
+
+A lane worktree does **not** solve:
+
+- Git merge conflicts between lane branches;
+- semantic conflicts between independently passing lanes;
+- product-branch coherence after several lane PRs are merged.
+
+Those belong to human integration now and to the future Merge Coordinator later.
+
+### Lane PR projection
+
+A **lane PR projection** is a GitHub PR created or updated from a lane branch
+after the lane gate passes. It is an integration handoff: reviewers get the
+branch, lane summary, verification evidence, and links/paths back to canonical
+artifacts.
+
+The PR is a projection, not source of truth. GitHub state never writes back into
+canonical lane status, task status, issue status, gate verdicts, or feature
+verdict. The only canonical record of projection is the mapping/metadata that
+says where the lane was projected.
+
+### Lane completion states
+
+- **lane proposed done** — the Implementer claims its lane tasks are done.
+- **lane gate pass** — review, spec-gap, verification, and triage allow the lane
+  through the orchestrator's lane gate.
+- **lane PR projected** — after lane gate pass, the lane branch has been pushed
+  and represented as a GitHub PR projection.
+
+Only **lane gate pass** may trigger automatic lane PR projection. Model output or
+`proposed_done` alone is not enough.

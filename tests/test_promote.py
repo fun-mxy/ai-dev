@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from ai_dev.feature_ids import allocate_id
 from ai_dev.feature_run import create_feature_run
 from ai_dev.promote import (
     FrozenArtifactWriteError,
@@ -947,6 +948,75 @@ class TestBuildCanonicalTasks:
         for t in doc["tasks"]:
             assert all(d.startswith("DES-") for d in t["related_design"])
 
+    def test_assigns_tasks_to_declared_lanes(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        lane_2 = allocate_id(root, "LANE", origin="test")
+        graph_path = root / LANE_GRAPH_YML
+        graph = yaml.safe_load(graph_path.read_text())
+        first = graph["lanes"][0]
+        second = dict(first)
+        second.update(
+            {
+                "id": lane_2,
+                "purpose": None,
+                "tasks": [],
+                "depends_on": ["LANE-001"],
+                "expected_files": ["preexisting.py"],
+                "exclusive_files": ["preexisting.py"],
+                "provides": ["formatter-api"],
+                "consumes": ["core-model"],
+                "verification_scope": ["preexisting"],
+                "merge_policy": {
+                    "auto_merge": False,
+                    "allowed_mechanical_resolutions": ["format-only"],
+                    "semantic_conflict_policy": "human_triage",
+                },
+            }
+        )
+        graph["lanes"].append(second)
+        graph_path.write_text(yaml.safe_dump(graph, sort_keys=False))
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["lanes"] = [
+            {
+                "id": "LANE-001",
+                "purpose": "Implement the formatter.",
+                "verification_commands": [
+                    {"name": "pytest-a", "command": "python -m pytest tests/a"}
+                ],
+            },
+            {"id": lane_2, "purpose": "Wire the CLI."},
+        ]
+        proposal["tasks"][0]["lane"] = "LANE-001"
+        proposal["tasks"][1]["lane"] = lane_2
+
+        doc, _, rows, verify_commands = build_canonical_tasks(
+            root, FEATURE_ID, proposal, origin=None
+        )
+
+        assert {t["key"]: t["lane"] for t in doc["tasks"]} == {
+            "t1": "LANE-001",
+            "t2": "LANE-002",
+        }
+        assert rows["TASK-001"]["lane"] == "LANE-001"
+        assert rows["TASK-002"]["lane"] == "LANE-002"
+        assert doc["lane_purposes"] == {
+            "LANE-001": "Implement the formatter.",
+            "LANE-002": "Wire the CLI.",
+        }
+        assert verify_commands == {
+            "LANE-001": [{"name": "pytest-a", "command": "python -m pytest tests/a"}],
+            "LANE-002": [],
+        }
+
+    def test_rejects_task_assigned_to_missing_lane(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["lanes"] = [{"id": "LANE-001", "purpose": "Only seeded lane."}]
+        proposal["tasks"][0]["lane"] = "LANE-999"
+
+        with pytest.raises(ValueError, match="LANE-999"):
+            build_canonical_tasks(root, FEATURE_ID, proposal, origin=None)
+
     def test_assigns_single_seeded_lane_to_each_task(self, tmp_path: Path) -> None:
         # The lane is structural (allocated at feature-run creation, seeded into
         # 04-lane-graph.yml); promote assigns every task to that one lane (§5.3).
@@ -1161,6 +1231,52 @@ class TestPromoteTasks:
         assert lane["id"] == "LANE-001"
         assert "merge_policy" in lane
         assert lane["depends_on"] == []
+
+    def test_populates_each_lane_in_lane_graph_and_preserves_lane_fields(self, tmp_path: Path) -> None:
+        root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)
+        lane_2 = allocate_id(root, "LANE", origin="test")
+        graph_path = root / LANE_GRAPH_YML
+        graph = yaml.safe_load(graph_path.read_text())
+        lane2 = dict(graph["lanes"][0])
+        lane2.update(
+            {
+                "id": lane_2,
+                "depends_on": ["LANE-001"],
+                "provides": ["cli"],
+                "consumes": ["formatter"],
+                "verification_scope": ["manual-smoke"],
+                "merge_policy": {"auto_merge": False, "semantic_conflict_policy": "human_triage"},
+                "expected_files": ["docs/manual.md"],
+                "exclusive_files": ["docs/manual.md"],
+            }
+        )
+        graph["lanes"].append(lane2)
+        graph_path.write_text(yaml.safe_dump(graph, sort_keys=False))
+        proposal = _tasks_proposal(req_ids, des_ids)
+        proposal["lanes"] = [
+            {"id": "LANE-001", "purpose": "Formatter lane."},
+            {"id": lane_2, "purpose": "CLI lane."},
+        ]
+        proposal["tasks"][0]["lane"] = "LANE-001"
+        proposal["tasks"][1]["lane"] = lane_2
+
+        promote_tasks(root, FEATURE_ID, proposal, origin="cli")
+
+        lanes = {lane["id"]: lane for lane in yaml.safe_load(graph_path.read_text())["lanes"]}
+        assert lanes["LANE-001"]["tasks"] == ["TASK-001"]
+        assert lanes["LANE-001"]["purpose"] == "Formatter lane."
+        assert lanes["LANE-001"]["expected_files"] == ["src/greet.py"]
+        assert lanes[lane_2]["tasks"] == ["TASK-002"]
+        assert lanes[lane_2]["purpose"] == "CLI lane."
+        assert lanes[lane_2]["expected_files"] == ["docs/manual.md", "src/cli.py"]
+        assert lanes[lane_2]["exclusive_files"] == ["docs/manual.md", "src/cli.py"]
+        assert lanes[lane_2]["depends_on"] == ["LANE-001"]
+        assert lanes[lane_2]["provides"] == ["cli"]
+        assert lanes[lane_2]["consumes"] == ["formatter"]
+        assert lanes[lane_2]["merge_policy"] == {
+            "auto_merge": False,
+            "semantic_conflict_policy": "human_triage",
+        }
 
     def test_allocates_from_counter_and_persists_it(self, tmp_path: Path) -> None:
         root, req_ids, des_ids = _feature_with_frozen_requirements_and_design(tmp_path)

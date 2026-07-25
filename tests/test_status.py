@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from ai_dev.audit import AUDIT_LOG_JSON, AUDIT_LOG_MD
+from ai_dev.templates import LANE_GRAPH_YML
 from ai_dev.status import (
     FEATURE_STATUS_FILE,
     FROZEN_ARTIFACTS,
@@ -33,11 +34,14 @@ from ai_dev.status import (
     agent_profiles,
     derive_feature_status,
     freeze_artifact,
+    mark_task_proposed_done,
     record_agent_profile,
     record_coherence_verdict,
     set_current_gate,
+    update_lane_status,
     write_initial_feature_status,
     write_initial_lane_status,
+    write_initial_lane_statuses,
     write_initial_task_status,
 )
 
@@ -66,6 +70,29 @@ def _feature_doc(feature_root: Path) -> dict:
 
 def _audit_records(feature_root: Path) -> list[dict]:
     return json.loads((feature_root / AUDIT_LOG_JSON).read_text())
+
+
+def _seed_lane_graph(feature_root: Path, lane_ids: list[str]) -> None:
+    feature_root.mkdir(parents=True, exist_ok=True)
+    lanes = [
+        {
+            "id": lane_id,
+            "purpose": None,
+            "tasks": [],
+            "depends_on": [],
+            "expected_files": [],
+            "exclusive_files": [],
+            "provides": [],
+            "consumes": [],
+            "verification_scope": [],
+            "merge_policy": {
+                "auto_merge": False,
+                "semantic_conflict_policy": "human_triage",
+            },
+        }
+        for lane_id in lane_ids
+    ]
+    (feature_root / LANE_GRAPH_YML).write_text(yaml.safe_dump({"lanes": lanes}, sort_keys=False))
 
 
 class TestWriteInitialFeatureStatus:
@@ -856,6 +883,189 @@ class TestWriteInitialLaneStatus:
         assert "current_phase: not_started" in text
         # Nulls render as literal null, not the Python string "None".
         assert "gate_verdict: null" in text
+
+
+class TestWriteInitialLaneStatuses:
+    """status.write_initial_lane_statuses — v0.7 multi-lane §8.2 seed."""
+
+    def test_writes_more_than_one_lane_with_same_initial_shape(self, tmp_path: Path) -> None:
+        write_initial_lane_statuses(tmp_path, ["LANE-001", "LANE-002"])
+
+        doc = yaml.safe_load((tmp_path / LANE_STATUS_FILE).read_text())
+        assert list(doc["lanes"]) == ["LANE-001", "LANE-002"]
+        assert doc["lanes"]["LANE-001"] == doc["lanes"]["LANE-002"] == {
+            "status": "pending",
+            "current_phase": "not_started",
+            "worktree": None,
+            "implement_run": None,
+            "review_run": None,
+            "spec_gap_run": None,
+            "verification_run": None,
+            "gate_verdict": None,
+        }
+
+    def test_single_lane_wrapper_preserves_existing_output(self, tmp_path: Path) -> None:
+        write_initial_lane_status(tmp_path, "LANE-007")
+        single = (tmp_path / LANE_STATUS_FILE).read_text()
+
+        other = tmp_path / "other"
+        write_initial_lane_statuses(other, ["LANE-007"])
+
+        assert (other / LANE_STATUS_FILE).read_text() == single
+
+    def test_rejects_empty_or_duplicate_lane_ids(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="lane_ids"):
+            write_initial_lane_statuses(tmp_path, [])
+        with pytest.raises(ValueError, match="non-empty string"):
+            write_initial_lane_statuses(tmp_path, ["LANE-001", ""])
+        with pytest.raises(ValueError, match="duplicate"):
+            write_initial_lane_statuses(tmp_path, ["LANE-001", "LANE-001"])
+
+
+class TestUpdateLaneStatus:
+    def test_updates_one_lane_without_touching_siblings(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        status_dir = feature_root / "status"
+        _seed_lane_graph(feature_root, ["LANE-001", "LANE-002"])
+        write_initial_lane_statuses(status_dir, ["LANE-001", "LANE-002"])
+
+        update_lane_status(
+            feature_root,
+            "LANE-002",
+            status="running",
+            current_phase="implement",
+            implement_run="RUN-002",
+            timestamp="2026-07-25T10:00:00Z",
+            origin="orchestrator",
+        )
+
+        doc = yaml.safe_load((status_dir / LANE_STATUS_FILE).read_text())
+        assert doc["lanes"]["LANE-001"] == {
+            "status": "pending",
+            "current_phase": "not_started",
+            "worktree": None,
+            "implement_run": None,
+            "review_run": None,
+            "spec_gap_run": None,
+            "verification_run": None,
+            "gate_verdict": None,
+        }
+        assert doc["lanes"]["LANE-002"]["status"] == "running"
+        assert doc["lanes"]["LANE-002"]["current_phase"] == "implement"
+        assert doc["lanes"]["LANE-002"]["implement_run"] == "RUN-002"
+        record = _audit_records(feature_root)[-1]
+        assert record["event"] == "lane_status"
+        assert record["origin"] == "orchestrator"
+        assert record["payload"] == {
+            "lane": "LANE-002",
+            "updates": {
+                "status": "running",
+                "current_phase": "implement",
+                "implement_run": "RUN-002",
+            },
+        }
+
+    def test_rejects_missing_lane(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        _seed_lane_graph(feature_root, ["LANE-001"])
+        write_initial_lane_statuses(feature_root / "status", ["LANE-001"])
+
+        with pytest.raises(ValueError, match="LANE-099"):
+            update_lane_status(feature_root, "LANE-099", status="running")
+
+    def test_rejects_empty_update(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        _seed_lane_graph(feature_root, ["LANE-001"])
+        write_initial_lane_statuses(feature_root / "status", ["LANE-001"])
+
+        with pytest.raises(ValueError, match="at least one"):
+            update_lane_status(feature_root, "LANE-001")
+
+
+class TestMarkTaskProposedDoneLaneValidation:
+    def test_existing_task_cannot_move_to_a_missing_lane(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        status_dir = feature_root / "status"
+        _seed_lane_graph(feature_root, ["LANE-001", "LANE-002"])
+        write_initial_lane_statuses(status_dir, ["LANE-001", "LANE-002"])
+        write_initial_task_status(status_dir)
+        path = status_dir / TASK_STATUS_FILE
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "tasks": {
+                        "TASK-001": {
+                            "status": "pending",
+                            "lane": "LANE-001",
+                            "owner_run": None,
+                            "proposed_done_by": None,
+                            "accepted_done": False,
+                            "related_requirements": [],
+                            "related_acceptance_criteria": [],
+                        }
+                    }
+                },
+                sort_keys=False,
+            )
+        )
+
+        with pytest.raises(ValueError, match="TASK-001.*LANE-003"):
+            mark_task_proposed_done(
+                feature_root,
+                "TASK-001",
+                lane_id="LANE-003",
+                run_id="RUN-001",
+            )
+
+    def test_new_task_cannot_be_registered_on_a_missing_lane(self, tmp_path: Path) -> None:
+        feature_root = tmp_path
+        status_dir = feature_root / "status"
+        _seed_lane_graph(feature_root, ["LANE-001"])
+        write_initial_lane_statuses(status_dir, ["LANE-001"])
+        write_initial_task_status(status_dir)
+
+        with pytest.raises(ValueError, match="LANE-099"):
+            mark_task_proposed_done(
+                feature_root,
+                "TASK-001",
+                lane_id="LANE-099",
+                run_id="RUN-001",
+            )
+
+    def test_existing_task_cannot_reference_a_missing_registered_lane(
+        self, tmp_path: Path
+    ) -> None:
+        feature_root = tmp_path
+        status_dir = feature_root / "status"
+        _seed_lane_graph(feature_root, ["LANE-001"])
+        write_initial_lane_statuses(status_dir, ["LANE-001"])
+        write_initial_task_status(status_dir)
+        (status_dir / TASK_STATUS_FILE).write_text(
+            yaml.safe_dump(
+                {
+                    "tasks": {
+                        "TASK-001": {
+                            "status": "pending",
+                            "lane": "LANE-099",
+                            "owner_run": None,
+                            "proposed_done_by": None,
+                            "accepted_done": False,
+                            "related_requirements": [],
+                            "related_acceptance_criteria": [],
+                        }
+                    }
+                },
+                sort_keys=False,
+            )
+        )
+
+        with pytest.raises(ValueError, match="TASK-001.*LANE-099"):
+            mark_task_proposed_done(
+                feature_root,
+                "TASK-001",
+                lane_id="LANE-001",
+                run_id="RUN-001",
+            )
 
 
 class TestWriteInitialTaskStatus:

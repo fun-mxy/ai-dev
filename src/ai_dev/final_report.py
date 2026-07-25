@@ -48,7 +48,7 @@ from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, ISSUES_DIR
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.lane_gate import LANE_DECISION_JSON
 from ai_dev.paths import METADATA_JSON, feature_dir
-from ai_dev.status import load_feature_status
+from ai_dev.status import declared_lane_ids, load_feature_status
 from ai_dev.templates import REQUIREMENTS_JSON
 from ai_dev.triage import DECISIONS_DIR
 
@@ -150,10 +150,19 @@ def _load_all_issues(feature_root: Path) -> list[dict[str, Any]]:
 
 
 def _load_lane_decisions(feature_root: Path) -> list[dict[str, Any]]:
-    """Read every lane-decision.json under lanes/ sorted by path (D6: required)."""
+    """Read every declared lane's lane-decision.json (D6: required)."""
     decisions: list[dict[str, Any]] = []
-    for path in sorted((feature_root / "lanes").glob(f"*/{LANE_DECISION_JSON}")):
-        decisions.append(_load_required_json(path, "lane-decision.json"))
+    paths = [
+        (lane_id, feature_root / "lanes" / lane_id / LANE_DECISION_JSON)
+        for lane_id in declared_lane_ids(feature_root)
+    ]
+    for lane_id, path in paths:
+        try:
+            decisions.append(_load_required_json(path, f"lane-decision.json for lane {lane_id}"))
+        except ValueError as exc:
+            raise ValueError(
+                f"lane-decision.json for lane {lane_id} at {path} is missing or invalid (§24.2)"
+            ) from exc
     if not decisions:
         raise ValueError(
             f"no lane-decision.json found under {feature_root}/lanes/; run "
