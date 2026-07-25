@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 02.
 
-**Status:** open
+**Status:** done
 
-- [ ] lane run commands resolve the target lane and require/prepare its worktree before executing file-mutating legs
-- [ ] Implementer/fix runs execute in the lane worktree and collect `result.md/json`, `diff.patch`, `commits.log`, and `metadata.json` into the canonical lane directory
-- [ ] reviewer/spec-gap/verifier legs use the lane worktree diff/files as their evidence surface
-- [ ] allowed-files and frozen-artifact validation work against lane worktree changes, excluding out-of-band harness state as before
-- [ ] metadata records lane id, worktree path, branch, base ref, profile, cli/backend/model, changed files, commands, and exit code
-- [ ] tests cover two lanes changing different files without sharing one checkout; `uv run mypy` + `uv run pytest` green
+- [x] lane run commands resolve the target lane and require/prepare its worktree before executing file-mutating legs
+- [x] Implementer/fix runs execute in the lane worktree and collect `result.md/json`, `diff.patch`, `commits.log`, and `metadata.json` into the canonical lane directory
+- [x] reviewer/spec-gap/verifier legs use the lane worktree diff/files as their evidence surface
+- [x] allowed-files and frozen-artifact validation work against lane worktree changes, excluding out-of-band harness state as before
+- [x] metadata records lane id, worktree path, branch, base ref, profile, cli/backend/model, changed files, commands, and exit code
+- [x] tests cover two lanes changing different files without sharing one checkout; `uv run mypy` + `uv run pytest` green
