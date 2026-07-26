@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 03, 04, 05.
 
-**Status:** open
+**Status:** done
 
-- [ ] final report lists all lanes and their independent lane gate verdicts
-- [ ] report includes worktree branch/path/base-ref metadata and changed-files/commits per lane
-- [ ] report aggregates reviewer/spec-gap/verifier outcomes and unresolved P0/P1/P2/P3 issues per lane
-- [ ] report includes lane PR projection URLs/mapping where present and labels them as projection metadata, not canonical state
-- [ ] feature verdict aggregation fails/blocks if any lane gate has blocking unresolved state, but does not claim branches are merged or semantically integrated
-- [ ] tests cover all-pass, one-lane-fail, projection-present, projection-missing, and dependency-blocked cases; `uv run mypy` + `uv run pytest` green
+- [x] final report lists all lanes and their independent lane gate verdicts
+- [x] report includes worktree branch/path/base-ref metadata and changed-files/commits per lane
+- [x] report aggregates reviewer/spec-gap/verifier outcomes and unresolved P0/P1/P2/P3 issues per lane
+- [x] report includes lane PR projection URLs/mapping where present and labels them as projection metadata, not canonical state
+- [x] feature verdict aggregation fails/blocks if any lane gate has blocking unresolved state, but does not claim branches are merged or semantically integrated
+- [x] tests cover all-pass, one-lane-fail, projection-present, projection-missing, and dependency-blocked cases; `uv run mypy` + `uv run pytest` green
