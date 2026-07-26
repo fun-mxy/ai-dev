@@ -657,6 +657,7 @@ def run_implementer_leg(
         claude_path=claude_path,
         timestamp=started_at,
         origin=origin,
+        commit_deliverables=True,
     )
     run_id = lane_result.run_id
     validation = validate_run(repo_root, feature_id, run_id, origin=origin)

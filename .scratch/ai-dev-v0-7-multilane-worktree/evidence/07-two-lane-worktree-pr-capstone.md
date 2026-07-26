@@ -80,10 +80,11 @@ Triage rationale (both spec-gap findings are cross-lane / design false positives
 | spec-gap      | `ai-dev spec-gap FEATURE-001 LANE-002 --profile cc-glm52 --max-turns 30`  | RUN-012        | PASS, 1 issue |
 | verify        | `ai-dev verify FEATURE-001 LANE-002`                                      | deterministic  | PASS, 2/2 commands |
 | collect-issues| `ai-dev collect-issues FEATURE-001 LANE-002`                              | deterministic  | PASS, 2 issues bundled |
-| triage        | (not required — both issues P2/P3, non-blocking)                          | —              | n/a |
+| triage        | `ai-dev triage FEATURE-001 --issue ISSUE-003 --disposition defer --reason ...` (P3) ; `... --issue ISSUE-004 --disposition accept --reason ...` (P2) | issues/ISSUE-003.json, ISSUE-004.json | PASS, both triaged |
+| collect-issues (refresh) | `ai-dev collect-issues FEATURE-001 LANE-002` (re-run after triage to refresh the bundle with live triage state) | deterministic | PASS, 2 issues |
 | lane-gate     | `ai-dev lane-gate FEATURE-001 LANE-002`                                   | lane-decision.json | **PASS, 5/5 conditions** |
 
-LANE-002's collected issues: ISSUE-003 (code_review, P3, opaque AttributeError on None/non-string input) and ISSUE-004 (spec_gap, P2, shared tests/ dir — same design choice as LANE-001's ISSUE-002). Both are P2/P3, outside `_BLOCKING_SEVERITIES = {P0, P1}`, so the lane gate passes without triage. The triage step is part of the lane flow and was exercised on LANE-001; LANE-002 had no blocking issues to triage.
+LANE-002's collected issues: ISSUE-003 (code_review, P3, opaque AttributeError on None/non-string input) and ISSUE-004 (spec_gap, P2, shared tests/ dir — same design choice as LANE-001's ISSUE-002). Both are P2/P3, outside `_BLOCKING_SEVERITIES = {P0, P1}`, so the lane gate passes regardless of triage; the triage step was still performed on both lanes (not just LANE-001) to literally complete the lane flow. ISSUE-003 -> `defer` (P3 minor robustness; str contract sufficient for AC-004/AC-005; input-validation hardening deferred to a future iteration; `requires_change_proposal=false`). ISSUE-004 -> `accept` (mirrors LANE-001's ISSUE-002: the frozen 04-lane-graph.yml `verification_commands` expect a shared `workspace/tests/` dir; AC-007 is satisfied by the dedicated `test_word_count.py` module; placement intentional and consistent across both lanes). `collect-issues` re-run after triage refreshed the bundle with the live triage state; `lane-gate` re-run still PASS 5/5, `blocking_issue_count=0`.
 
 Lane gate conditions (both lanes, 5/5): `proposed_done`, `verification_passed`, `review_no_blocking_issues`, `spec_gap_no_blocking_issues`, `issue_bundle_generated`.
 

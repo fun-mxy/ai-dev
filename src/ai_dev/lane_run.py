@@ -177,25 +177,28 @@ def ensure_lane_worktree(
     commits captures downstream compare against the lane's *original* base
     (e.g. ``HEAD`` at create time, before any lane commits), not the
     worktree's current ``HEAD`` (which has moved on by the time the lane
-    has committed). The SHA lands in ``worktree.json``'s ``base_ref`` field
-    and is what ``LaneRunContext.base_ref`` carries. Fails loud
-    (``ValueError``, §24.2) when the lane is not registered in
-    ``04-lane-graph.yml`` or the repo is not a git working tree - these are
-    the same preconditions ``create_lane_worktree`` enforces; this function
-    is a thin policy on top, not a new precondition set.
+    has committed). The SHA is passed to ``create_lane_worktree`` and lands
+    in ``worktree.json``'s ``base_ref`` field (ADR-0009 D3 - the base ref is
+    a durable record, not a symbolic ref that drifts if ``main`` advances
+    between create and a later reuse); ``LaneRunContext.base_ref`` carries
+    the same SHA. Fails loud (``ValueError``, §24.2) when the lane is not
+    registered in ``04-lane-graph.yml`` or the repo is not a git working
+    tree - these are the same preconditions ``create_lane_worktree``
+    enforces; this function is a thin policy on top, not a new precondition
+    set.
     """
     if not base_ref:
         raise ValueError("base_ref must be a non-empty string")
     feature_root = repo_root / ".ai-dev" / "features" / feature_id
     metadata = load_lane_worktree(feature_root, lane_id)
     if metadata is not None and metadata.get("lifecycle") == WORKTREE_LIFECYCLE_ACTIVE:
-        # v0.7 capstone: ``worktree.json`` stores the caller-supplied symbolic
-        # base_ref (e.g. ``HEAD``); resolve it to a SHA here so the downstream
-        # ``git diff <base>..HEAD`` / ``git log <base>..HEAD`` captures compare
-        # against the lane's original base, not ``HEAD..HEAD`` (which is always
-        # empty). The create path resolves the same way; ``_resolve_base_ref_sha``
-        # is idempotent on an already-pinned SHA, so this is safe whether the
-        # stored value is symbolic or a SHA.
+        # ``worktree.json`` was written with a pinned SHA at create time
+        # (see the create path below), so the stored ``base_ref`` is already
+        # a SHA. ``_resolve_base_ref_sha`` is idempotent on a SHA, so this
+        # is a no-op for records the create path wrote; it also covers a
+        # legacy symbolic record by resolving it against the main checkout
+        # (the reuse path never re-writes, so a legacy record that pre-dates
+        # SHA pinning keeps whatever its create-time ref resolved to).
         base_ref_sha = _resolve_base_ref_sha(
             repo_root, str(metadata["base_ref"])
         )
@@ -209,16 +212,22 @@ def ensure_lane_worktree(
     # surface its ValueError as-is. Creation is idempotent across calls
     # *only* when the worktree was previously removed (``lifecycle=removed``)
     # - a kept / active worktree is a precondition violation upstream.
+    # Resolve the caller-supplied symbolic base_ref to a SHA BEFORE create so
+    # ``worktree.json`` durably records the pinned SHA (ADR-0009 D3): the
+    # lane's base is fixed at create time and won't drift if ``main`` later
+    # advances between this create and a later reuse. Idempotent on an
+    # already-pinned SHA, so a caller passing a SHA is safe too.
+    base_ref_sha = _resolve_base_ref_sha(repo_root, base_ref)
     create_lane_worktree(
         repo_root,
         feature_id,
         lane_id,
-        base_ref=base_ref,
+        base_ref=base_ref_sha,
         timestamp=timestamp,
         origin=origin,
     )
     # Re-read so the context reflects the canonical ``worktree.json`` shape
-    # (created_at, lifecycle, etc.) rather than the function's return value.
+    # (created_at, lifecycle, etc.); ``base_ref`` is the SHA we just pinned.
     refreshed = load_lane_worktree(feature_root, lane_id)
     if refreshed is None:
         # The create-side write is deterministic and audited, so a missing
@@ -228,17 +237,10 @@ def ensure_lane_worktree(
             f"worktree.json missing after create_lane_worktree for lane "
             f"{lane_id!r} in {feature_root} (§24.2)"
         )
-    # Resolve the stored base ref to a SHA so downstream diff / commits
-    # captures are stable across the lane's own commits. ``worktree.json``
-    # records the caller-supplied symbolic ref; we resolve it now against
-    # the *main* checkout (the worktree's HEAD has not yet moved - the
-    # create just happened - and the base ref is a main-checkout ref).
-    base_ref_stored = str(refreshed["base_ref"])
-    base_ref_sha = _resolve_base_ref_sha(repo_root, base_ref_stored)
     return LaneRunContext(
         worktree_path=Path(refreshed["path"]),
         branch=str(refreshed["branch"]),
-        base_ref=base_ref_sha,
+        base_ref=str(refreshed["base_ref"]),
     )
 
 
@@ -629,6 +631,7 @@ def run_in_lane_worktree(
     claude_path: str | None = None,
     timestamp: str | None = None,
     origin: str | None = None,
+    commit_deliverables: bool = False,
 ) -> LaneRunResult:
     """Run a lane leg with ``cwd`` rooted at the lane's worktree (ADR-0009 D2).
 
@@ -760,12 +763,17 @@ def run_in_lane_worktree(
     # v0.7 capstone: commit the synced workspace/ deliverables to the lane
     # branch BEFORE capturing the diff/commits, so the lane branch carries
     # the implemented files (for PR projection) and the capture below is
-    # non-empty. No-op for legs that wrote no workspace files (reviewer /
-    # spec-gap) or a re-run with byte-identical files. See
+    # non-empty. No-op for a re-run with byte-identical files. Only the
+    # implementer leg sets ``commit_deliverables=True`` - a stray
+    # reviewer / spec-gap ``workspace/`` write must NOT be committed to the
+    # lane branch (let alone under a reviewer commit message); those legs
+    # leave the lane branch as the implementer left it. See
     # ``commit_lane_deliverables`` for the full rationale.
-    committed_files = commit_lane_deliverables(
-        context.worktree_path, lane_id, run_id, role
-    )
+    committed_files: list[str] = []
+    if commit_deliverables:
+        committed_files = commit_lane_deliverables(
+            context.worktree_path, lane_id, run_id, role
+        )
 
     # Capture the lane-level diff + commits from the worktree. The capture
     # is read-only against the worktree (it does not modify the lane's

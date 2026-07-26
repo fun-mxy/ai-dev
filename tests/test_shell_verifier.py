@@ -31,7 +31,7 @@ import yaml
 from ai_dev.audit import AUDIT_LOG_JSON
 from ai_dev.cli import main
 from ai_dev.feature_run import create_feature_run
-from ai_dev.paths import lane_dir, run_dir
+from ai_dev.paths import WORKSPACE_DIR, lane_dir, run_dir
 from ai_dev.run_prepare import prepare_run
 from ai_dev.shell_verifier import (
     DEFAULT_TIMEOUT,
@@ -40,7 +40,6 @@ from ai_dev.shell_verifier import (
     VERIFICATION_REPORT_MD,
     CommandResult,
     VerifyCommand,
-    _lane_worktree_root,
     read_implement_run_id,
     read_verification_commands,
     run_verify_command,
@@ -864,50 +863,41 @@ class TestVerifyLaneWorktreeCwd:
         assert result.verdict == "pass"
         assert result.command_results[0].passed is True
 
-    def test_lane_worktree_root_returns_workspace_when_present(
+    def test_cwd_is_bare_worktree_when_no_workspace_subdir(
         self, git_repo: Path
     ) -> None:
-        # An active worktree that the implementer populated with a workspace/
-        # subdir resolves to <worktree>/workspace/ (the cwd the Planner's
-        # workspace-relative verify commands assume).
+        # An active worktree the implementer has not yet populated with a
+        # workspace/ subdir -> the verifier runs in the bare worktree root
+        # (the else-branch). Observed through the public run_verifier seam
+        # (`pwd` reports the resolved cwd), not by reaching into the
+        # underscore-private resolver.
         feature_id, lane_id, _ = _stage_implement_run_with_verify(
             git_repo,
-            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+            verification_commands=[{"name": "pwd", "command": "pwd"}],
         )
         worktree = create_lane_worktree(
             git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t"
         )
-        (worktree / "workspace").mkdir(parents=True, exist_ok=True)
+        # Deliberately no workspace/ subdir: the bare worktree root is the cwd.
 
-        resolved = _lane_worktree_root(git_repo, feature_id, lane_id)
-        assert resolved == worktree / "workspace"
+        result = run_verifier(git_repo, feature_id, lane_id)
+        out = result.command_results[0].stdout.strip()
+        assert Path(out).resolve() == worktree.resolve()
 
-    def test_lane_worktree_root_falls_back_to_worktree_when_no_workspace(
-        self, git_repo: Path
-    ) -> None:
-        # An active worktree with no workspace/ subdir yet resolves to the bare
-        # worktree root (the else-branch; e.g. a worktree created but not yet
-        # populated by the implementer).
-        feature_id, lane_id, _ = _stage_implement_run_with_verify(
-            git_repo,
-            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
-        )
-        worktree = create_lane_worktree(
-            git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t"
-        )
-
-        resolved = _lane_worktree_root(git_repo, feature_id, lane_id)
-        assert resolved == worktree
-
-    def test_lane_worktree_root_none_without_active_worktree(
+    def test_cwd_is_implement_run_workspace_when_no_worktree(
         self, repo_root: Path
     ) -> None:
-        # No worktree.json -> None, so run_verifier falls back to the implement
-        # run's workspace/ (the v0.1-v0.6 cwd). This is the non-worktree path
-        # the v0.2 tests exercise.
-        feature_id, lane_id, _ = _stage_implement_run_with_verify(
+        # No active worktree -> the verifier falls back to the implement run's
+        # workspace/ (the v0.1-v0.6 cwd). Observed through run_verifier (`pwd`),
+        # not the internal resolver - this is the non-worktree path the v0.2
+        # tests exercise, now covered behaviourally rather than by poking the
+        # resolver's None return.
+        feature_id, lane_id, impl_run_id = _stage_implement_run_with_verify(
             repo_root,
-            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+            verification_commands=[{"name": "pwd", "command": "pwd"}],
         )
+        expected = run_dir(repo_root, feature_id, impl_run_id) / WORKSPACE_DIR
 
-        assert _lane_worktree_root(repo_root, feature_id, lane_id) is None
+        result = run_verifier(repo_root, feature_id, lane_id)
+        out = result.command_results[0].stdout.strip()
+        assert Path(out).resolve() == expected.resolve()

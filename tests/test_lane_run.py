@@ -45,6 +45,7 @@ from ai_dev.lane_run import (
     LaneRunContext,
     capture_worktree_commits,
     capture_worktree_diff,
+    commit_lane_deliverables,
     ensure_lane_worktree,
     run_in_lane_worktree,
     write_lane_commits_log,
@@ -329,6 +330,11 @@ class TestEnsureLaneWorktree:
         )
         assert first.worktree_path == second.worktree_path
         assert first.branch == second.branch
+        # The reuse path returns the same pinned SHA the create path wrote
+        # (ADR-0009 D3 - base_ref is a durable SHA, not a symbolic ref that
+        # could drift if main advances between create and reuse).
+        assert len(second.base_ref) == 40
+        assert second.base_ref == first.base_ref
 
     def test_records_worktree_json(self, git_repo: Path) -> None:
         feature_id, lane1, _ = _seed_frozen_two_lane_feature(
@@ -340,6 +346,12 @@ class TestEnsureLaneWorktree:
         record = load_lane_worktree(_feature_root(git_repo, feature_id), lane1)
         assert record is not None
         assert record["lifecycle"] == "active"
+        # ADR-0009 D3: ``worktree.json`` durably records the pinned base_ref
+        # SHA (not the symbolic ``"HEAD"`` the caller passed), so the lane's
+        # base is fixed at create time and won't drift if main later moves.
+        assert record["base_ref"] != "HEAD"
+        assert len(record["base_ref"]) == 40
+        assert all(c in "0123456789abcdef" for c in record["base_ref"].lower())
 
     def test_refuses_unknown_lane(self, git_repo: Path) -> None:
         feature_id, _, _ = _seed_frozen_two_lane_feature(
@@ -1051,3 +1063,230 @@ class TestVerifierRunsInLaneWorktree:
         cmd = result.command_results[0]
         assert cmd.passed
         assert "present" in cmd.stdout
+
+
+# ---------------------------------------------------------------------------
+# commit_lane_deliverables (v0.7 capstone: stage + commit workspace/ on the
+# lane branch so PR projection pushes real content)
+# ---------------------------------------------------------------------------
+
+
+class TestCommitLaneDeliverables:
+    """``commit_lane_deliverables`` stages ``workspace/`` and commits it to the
+    lane branch; a no-op (returns ``[]``) when nothing is new.
+
+    Direct tests of the public helper (the run-home->worktree sync that feeds
+    it is covered through the ``run_in_lane_worktree`` seam below).
+    """
+
+    def test_commits_staged_workspace_files(self, git_repo: Path) -> None:
+        feature_id, lane1, _ = _seed_frozen_two_lane_feature(
+            git_repo, lane1_files=["workspace/lane1.py"]
+        )
+        ctx = ensure_lane_worktree(
+            git_repo, feature_id, lane1, base_ref="HEAD", timestamp="t"
+        )
+        # A deliverable the (synced) agent wrote into the worktree workspace/.
+        deliverable = ctx.worktree_path / "workspace" / "lane1.py"
+        deliverable.parent.mkdir(parents=True, exist_ok=True)
+        deliverable.write_text("# implementer deliverable\n")
+
+        committed = commit_lane_deliverables(
+            ctx.worktree_path, lane1, "RUN-001", "Implementer"
+        )
+        # The worktree-relative path of the staged file is returned.
+        assert committed == ["workspace/lane1.py"]
+        # The lane branch now carries one commit beyond the pinned base.
+        log = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "log",
+             "--pretty=%s", f"{ctx.base_ref}..HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert "ai-dev Implementer LANE-001 (run RUN-001): workspace deliverables" in log
+
+    def test_noop_when_nothing_new_is_staged(self, git_repo: Path) -> None:
+        feature_id, lane1, _ = _seed_frozen_two_lane_feature(
+            git_repo, lane1_files=["workspace/lane1.py"]
+        )
+        ctx = ensure_lane_worktree(
+            git_repo, feature_id, lane1, base_ref="HEAD", timestamp="t"
+        )
+        deliverable = ctx.worktree_path / "workspace" / "lane1.py"
+        deliverable.parent.mkdir(parents=True, exist_ok=True)
+        deliverable.write_text("# implementer deliverable\n")
+        # First call commits the file.
+        assert commit_lane_deliverables(
+            ctx.worktree_path, lane1, "RUN-001", "Implementer"
+        ) == ["workspace/lane1.py"]
+        head_before = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Second call stages nothing new (byte-identical) -> no-op.
+        assert commit_lane_deliverables(
+            ctx.worktree_path, lane1, "RUN-002", "Implementer"
+        ) == []
+        head_after = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_before == head_after
+
+
+# ---------------------------------------------------------------------------
+# run-home -> worktree sync (v0.7 capstone: the real claude CLI writes
+# workspace/ deliverables to the run-home, not the worktree)
+# ---------------------------------------------------------------------------
+
+
+_FAKE_CLAUDE_RUN_HOME_TEMPLATE = """\
+#!__PY__
+import json, os, re, sys
+# Reproduce the real claude CLI: resolve the working directory stated in the
+# prompt (the run-home) and write the deliverable there with an absolute path
+# - NOT to the process cwd (the worktree). The relative-to-cwd fake hits the
+# worktree directly and never exercises the run-home->worktree sync; this one
+# does, so the sync + commit fix is covered through the public seam.
+argv = " ".join(sys.argv[1:])
+m = re.search(r"Your working directory is: (\\S+)", argv)
+run_dir = m.group(1) if m else os.getcwd()
+target = os.path.join(run_dir, "workspace", "__DELIVERABLE__")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+with open(target, "w") as f:
+    f.write("# written to run-home by fake claude\\n")
+# output/result.{json,md} relative to cwd (worktree) - the normal path the
+# wrapper's _copy_agent_outputs collects from the agent cwd.
+os.makedirs("output", exist_ok=True)
+with open("output/result.md", "w") as f:
+    f.write("Wrote __DELIVERABLE__.\\n")
+with open("output/result.json", "w") as f:
+    json.dump(
+        {
+            "status": "proposed_done",
+            "summary": "Wrote __DELIVERABLE__.",
+            "tasks": [
+                {"id": "TASK-001", "status": "proposed_done",
+                 "evidence": ["workspace/__DELIVERABLE__"]}
+            ],
+            "related_requirements": ["REQ-001"],
+            "related_acceptance_criteria": ["AC-001"],
+            "known_issues": [],
+            "change_proposals": [],
+        },
+        f,
+    )
+sys.stdout.write('{"type":"result","subtype":"success","is_error":false}\\n')
+sys.exit(0)
+"""
+
+
+def _write_fake_claude_run_home(bin_dir: Path, *, deliverable: str) -> Path:
+    """A fake ``claude`` that writes ``deliverable`` to the run-home
+    ``workspace/`` (absolute, parsed from the prompt), mirroring the real
+    agent. Used to exercise the run-home->worktree sync through the
+    ``run_in_lane_worktree`` public seam."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "claude-run-home"
+    script.write_text(
+        _FAKE_CLAUDE_RUN_HOME_TEMPLATE
+        .replace("__PY__", sys.executable)
+        .replace("__DELIVERABLE__", deliverable)
+    )
+    os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+class TestSyncRunHomeWorkspaceToWorktree:
+    """The real claude CLI writes ``workspace/`` deliverables to the run-home
+    (the working directory ``build_prompt`` states), not the lane worktree;
+    ``run_in_lane_worktree`` syncs them into the worktree and (for the
+    implementer) commits them to the lane branch. A non-implementer leg must
+    NOT commit a stray ``workspace/`` write.
+
+    Covered through the public ``run_in_lane_worktree`` seam (DEVELOPMENT.md:
+    tests at public seams, never internals) using a fake that reproduces the
+    real agent's run-home writes.
+    """
+
+    def test_syncs_run_home_deliverable_to_worktree_and_commits(
+        self,
+        git_repo: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(git_repo)
+        profile = load_profile(git_repo, "cc-glm52")
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok-sync")
+        # The fake writes workspace/synced.py to the RUN-HOME (absolute), so
+        # the only way it reaches the worktree is the sync.
+        fake = _write_fake_claude_run_home(tmp_path / "bin", deliverable="synced.py")
+        feature_id, lane1, _ = _seed_frozen_two_lane_feature(
+            git_repo, lane1_files=["workspace/lane1.py"], tasks1=["TASK-001"]
+        )
+
+        result = run_in_lane_worktree(
+            git_repo,
+            feature_id,
+            lane1,
+            role="Implementer",
+            task="Write workspace/synced.py.",
+            profile=profile,
+            allowed_files=["workspace/synced.py"],
+            claude_path=str(fake),
+            commit_deliverables=True,
+        )
+
+        wt = _lane_path(git_repo, feature_id, lane1)
+        # The deliverable reached the worktree workspace/ via the sync.
+        assert (wt / "workspace" / "synced.py").is_file()
+        # ...and was committed to the lane branch (implementer commits).
+        lane_root = _feature_root(git_repo, feature_id) / "lanes" / lane1
+        commits_log = (lane_root / LANE_COMMITS_LOG_FILE).read_text()
+        assert "workspace deliverables" in commits_log
+        # changed_files (the worktree snapshot diff) saw the synced file.
+        meta = json.loads((lane_root / LANE_METADATA_FILE).read_text())
+        assert "workspace/synced.py" in meta["changed_files"]
+        assert result.run_id  # the run was recorded
+
+    def test_non_implementer_role_does_not_commit(
+        self,
+        git_repo: Path,
+        write_profiles: Callable[..., Path],
+        clean_token_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        write_profiles(git_repo)
+        profile = load_profile(git_repo, "cc-glm52")
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok-review-nocommit")
+        # Standard relative-to-cwd fake: the reviewer writes a stray
+        # workspace/ file into the worktree.
+        fake = _write_fake_claude(
+            tmp_path / "bin", writes_file="workspace/review.txt", monkeypatch=monkeypatch
+        )
+        feature_id, lane1, _ = _seed_frozen_two_lane_feature(
+            git_repo, lane1_files=["workspace/lane1.py"], tasks1=["TASK-001"]
+        )
+
+        run_in_lane_worktree(
+            git_repo,
+            feature_id,
+            lane1,
+            role="Code Reviewer",
+            task="Review the lane.",
+            profile=profile,
+            allowed_files=["workspace/review.txt"],
+            claude_path=str(fake),
+            # commit_deliverables defaults to False: a reviewer leg must not
+            # commit a stray workspace/ write to the lane branch.
+        )
+
+        wt = _lane_path(git_repo, feature_id, lane1)
+        # The reviewer's file is on disk in the worktree (uncommitted)...
+        assert (wt / "workspace" / "review.txt").is_file()
+        # ...but the lane branch carries NO commit beyond the pinned base.
+        lane_root = _feature_root(git_repo, feature_id) / "lanes" / lane1
+        commits_log = (lane_root / LANE_COMMITS_LOG_FILE).read_text()
+        assert commits_log == ""

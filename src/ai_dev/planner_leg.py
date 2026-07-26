@@ -724,8 +724,21 @@ def _tasks_lane_verify_rules(lane_ids: Sequence[str]) -> list[str]:
     each command with the lane worktree's ``workspace/`` as cwd, where the
     lane's package + ``tests/`` live (v0.7 capstone).
     """
+    # ``where`` is the only per-branch phrase; the rest of the bullet
+    # (including the JSON examples) is identical, so it is inlined via an
+    # f-string on the first line only - the body stays a plain string so its
+    # literal ``{``/``}`` need no escaping.
+    if len(lane_ids) <= 1:
+        where = "the lane's top-level"
+        extra: list[str] = []
+    else:
+        where = "per-lane (inside each `lanes` entry)"
+        extra = [
+            "- Every `lanes` entry must carry its own `verification_commands` so each "
+            "lane is independently verifiable in its own worktree.",
+        ]
     head = (
-        "- Declare the __WHERE__ `verification_commands`: the shell commands the "
+        f"- Declare the {where} `verification_commands`: the shell commands the "
         "Verifier (§9.5) runs to prove the lane works. Each entry is "
         "`{\"name\": <label>, \"command\": <shell string>}`. The commands run "
         "with the implementer run's `workspace/` as the working directory, where "
@@ -739,13 +752,7 @@ def _tasks_lane_verify_rules(lane_ids: Sequence[str]) -> list[str]:
         "`verification_commands` the Verifier fails loud (no verify command set "
         "declared), so always emit them."
     )
-    if len(lane_ids) <= 1:
-        return [head.replace("__WHERE__", "lane's top-level")]
-    return [
-        head.replace("__WHERE__", "per-lane (inside each `lanes` entry)"),
-        "- Every `lanes` entry must carry its own `verification_commands` so each "
-        "lane is independently verifiable in its own worktree.",
-    ]
+    return [head, *extra]
 
 
 def _tasks_task_text(

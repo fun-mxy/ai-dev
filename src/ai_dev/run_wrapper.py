@@ -607,7 +607,7 @@ _WORKSPACE_CACHE_DIRS: frozenset[str] = frozenset(
 
 def _sync_run_workspace_to_worktree(
     run_workspace: Path, worktree_workspace: Path
-) -> list[str]:
+) -> None:
     """Copy the run-home ``workspace/`` deliverables into the lane worktree.
 
     v0.7 capstone (ADR-0009 D2): the real claude CLI agent resolves the
@@ -627,15 +627,15 @@ def _sync_run_workspace_to_worktree(
     * the verifier's worktree-cwd commands find the package + ``tests/``.
 
     Build-tool cache dirs (``__pycache__`` / ``.mypy_cache`` /
-    ``.pytest_cache`` / ``.ruff_cache``) are skipped. Returns the sorted list
-    of worktree-relative paths synced (empty when the agent wrote no
-    ``workspace/`` files - e.g. reviewer / spec-gap / a failed run), so the
-    caller can decide whether to commit. Idempotent: re-running overwrites
-    in place, so a re-run that wrote identical files stages nothing new.
+    ``.pytest_cache`` / ``.ruff_cache``) are skipped. A no-op when the agent
+    wrote no ``workspace/`` files (e.g. reviewer / spec-gap / a failed run);
+    the commit decision is made independently by ``commit_lane_deliverables``
+    via ``git diff --cached --quiet``, so this function does not return a
+    file list. Idempotent: re-running overwrites in place, so a re-run that
+    wrote identical files stages nothing new.
     """
     if not run_workspace.is_dir():
-        return []
-    synced: list[str] = []
+        return
     for src in run_workspace.rglob("*"):
         if not src.is_file():
             continue
@@ -646,8 +646,6 @@ def _sync_run_workspace_to_worktree(
         dst = worktree_workspace / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst)
-        synced.append(str(rel))
-    return sorted(synced)
 
 
 # ---------------------------------------------------------------------------
