@@ -59,12 +59,15 @@ gates enforce coverage completeness. The milestone closes with a zero-hand-autho
 capstone reaching `verdict=pass` on real cc-glm52/Ark. Evidence of record:
 `.scratch/ai-dev-v0-6-planner/evidence/`.
 
-v0.7 — multi-lane worktree execution + lane PR projection (ADR-0009) planned/open: true
+v0.7 — multi-lane worktree execution + lane PR projection (ADR-0009) complete: true
 multi-lane lane graph/status, one git worktree + branch per lane, lane legs executed inside their
 worktrees, dependency prechecks and independent lane gates, automatic lane-level PR projection
 after lane gate pass, and multi-lane final-report aggregation. Scope boundary: v0.7 makes lanes
 independently executable/auditable and projectable as PRs; it does **not** implement automatic merge,
-semantic conflict resolution, or the Merge Coordinator. Tickets live under
+semantic conflict resolution, or the Merge Coordinator. The milestone closes with a two-lane worktree
+capstone on real cc-glm52/Ark: both lanes run implement->review->spec-gap->verify->triage->lane-gate
+PASS (5/5) and are projected to real GitHub PRs, coherence-gate pass, final-report aggregating both
+lanes. Evidence of record: `.scratch/ai-dev-v0-7-multilane-worktree/evidence/`. Tickets live under
 `.scratch/ai-dev-v0-7-multilane-worktree/issues/`.
 
 ## Test coverage
