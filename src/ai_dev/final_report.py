@@ -41,13 +41,21 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ai_dev.audit import AUDIT_LOG_JSON
-from ai_dev.checking_legs import REVIEW_REPORT_JSON, SPEC_GAP_REPORT_JSON
+from ai_dev.checking_legs import (
+    REVIEW_DIR,
+    REVIEW_REPORT_JSON,
+    SPEC_GAP_DIR,
+    SPEC_GAP_REPORT_JSON,
+)
 from ai_dev.coherence_gate import COHERENCE_DECISION_JSON
-from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON
+from ai_dev.implement_leg import IMPLEMENT_RESULT_JSON, read_lane_entry
 from ai_dev.issue_bundle import ISSUE_BUNDLE_JSON, ISSUES_DIR
 from ai_dev.json_artifact import read_json_object, write_json
 from ai_dev.lane_gate import LANE_DECISION_JSON
+from ai_dev.lane_run import LANE_COMMITS_LOG_FILE
+from ai_dev.lane_worktree import LANE_WORKTREE_FILE
 from ai_dev.paths import METADATA_JSON, feature_dir
+from ai_dev.shell_verifier import VERIFICATION_DIR, VERIFICATION_REPORT_JSON
 from ai_dev.status import declared_lane_ids, load_feature_status
 from ai_dev.templates import REQUIREMENTS_JSON
 from ai_dev.triage import DECISIONS_DIR
@@ -74,6 +82,32 @@ _DISARMING_ACTIONS = {
 }
 _RECOVERABLE = "recoverable"
 _TERMINAL = "terminal"
+
+# v0.7 ADR-0009 D6: the four issue severities the per-lane issue summary always
+# enumerates (keys always present, values may be 0) so a validator can
+# distinguish "no P0 issues" from "P0 not reported". Extra severities present
+# in the data are added alongside these.
+SEVERITIES: tuple[str, ...] = ("P0", "P1", "P2", "P3")
+
+# ADR-0009 D1/D6/D7: v0.7 executes lanes in isolated worktrees and projects a
+# PR per gate-passed lane, but does NOT integrate them. A passing feature
+# verdict means every declared lane gate passed - it does NOT mean the lane
+# branches are merged or semantically coherent on a product branch. Lane PRs
+# are a one-way GitHub projection (D6), not canonical state. Merge /
+# conflict-resolution / Merge Coordination are out of scope (D1/D7). Stamped
+# verbatim into ``meta`` and the MD note so the report can never be misread as
+# "merged" - the same wording in both places so the JSON and the MD cannot
+# drift on the integration boundary.
+INTEGRATION_DISCLAIMER = (
+    "v0.7 multi-lane: a passing feature verdict means every declared lane gate "
+    "passed; it does NOT mean the lane branches are merged or semantically "
+    "integrated on a product branch. Lane PRs are a one-way GitHub projection "
+    "(ADR-0009 D6), not canonical state - GitHub never writes back to lane/"
+    "task/feature status or verdicts. v0.7 does NOT perform automatic merge, "
+    "semantic conflict resolution, or Merge Coordination (ADR-0009 D1/D7); "
+    "human integration (or a future Merge Coordinator) is required before the "
+    "product branch is coherent."
+)
 
 
 @dataclass(frozen=True)
@@ -606,6 +640,20 @@ def _issue_level_blocking_reasons(
     return reasons
 
 
+def _failed_condition_names(decision: Mapping[str, Any]) -> list[str]:
+    """The §18.4 condition names that did not pass (non-empty, stable order).
+
+    Shared by the feature-level blocking reason (``lane_gate_not_passed``) and
+    the per-lane gate summary so the two never drift on what "failed" means.
+    """
+    failed = [
+        _str(c.get("name"))
+        for c in decision.get("conditions", [])
+        if isinstance(c, Mapping) and not c.get("passed")
+    ]
+    return [name for name in failed if name]
+
+
 def _lane_level_blocking_reasons(
     lane_decisions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -616,11 +664,7 @@ def _lane_level_blocking_reasons(
         if _str(decision.get("decision")) == "pass":
             continue
         lane = _str(decision.get("lane")) or _str(decision.get("feature")) or "lane"
-        failed = [
-            str(c.get("name"))
-            for c in decision.get("conditions", [])
-            if isinstance(c, Mapping) and not c.get("passed")
-        ]
+        failed = _failed_condition_names(decision)
         reasons.append(
             _blocking_reason(
                 None,
@@ -685,6 +729,425 @@ def _failure_shape(
 
 
 # ---------------------------------------------------------------------------
+# v0.7 multi-lane per-lane aggregation (ADR-0009 D1/D6/D7, ticket 06).
+#
+# The final report aggregates every declared lane: its independent lane-gate
+# verdict, worktree metadata (branch/path/base-ref), run/profile metadata +
+# changed_files, reviewer/spec-gap/verifier outcomes, unresolved P0-P3 issues,
+# dependency state, and lane PR projection. Every per-lane artifact is read
+# defensively (optional -> None/empty; the lane gate / coherence gate are the
+# authoritative fail-loud readers upstream) so a single unreadable optional
+# artifact degrades one lane's field rather than aborting the whole report.
+# Lane PR projection metadata is labelled as projection, never canonical/merged
+# state (D6) - the disclaimer in ``meta.integration_disclaimer`` carries the
+# integration boundary in prose.
+# ---------------------------------------------------------------------------
+
+
+def _safe_lane_entry(feature_root: Path, lane_id: str) -> Any:
+    """Read the lane graph entry, returning ``None`` if unreadable.
+
+    ``read_lane_entry`` raises on a missing/malformed lane graph; the report is
+    a projection and must not abort over a missing purpose string, so degrade
+    to ``None`` (``purpose`` / ``dependency_state`` read as ``None`` / empty).
+    The lane gate already required the graph upstream, so this only fires on
+    genuine corruption - and the report's job is to project, not to re-enforce.
+    """
+    try:
+        return read_lane_entry(feature_root, lane_id)
+    except ValueError:
+        return None
+
+
+def _lane_gate_summary(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """The lane's independent gate verdict + failed condition names (§18.4).
+
+    ``verdict`` is the lane-decision's ``decision`` (``pass`` / ``fail``);
+    ``failed_conditions`` are the §18.4 condition names that did not pass (e.g.
+    ``verification_passed``). The lane gate is independent per lane (ADR-0009
+    D1) - a failing lane does not fail another lane's gate, only the feature
+    verdict aggregates them.
+    """
+    blocking_count = decision.get("blocking_issue_count")
+    return {
+        "verdict": _str(decision.get("decision")),
+        "failed_conditions": _failed_condition_names(decision),
+        "blocking_issue_count": blocking_count
+        if isinstance(blocking_count, int)
+        else 0,
+    }
+
+
+def _lane_run_summary(
+    feature_root: Path, lane_id: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Run/profile metadata + changed_files from the lane's implement-result.
+
+    Returns ``(run, changed_files)``. Both degrade to empty when the
+    implement-result is absent (a lane with no implement run yet - its lane
+    gate would already have failed, but the report still generates).
+    """
+    impl = read_json_object(
+        feature_root / "lanes" / lane_id / IMPLEMENT_RESULT_JSON
+    )
+    if not isinstance(impl, Mapping):
+        return {}, []
+    meta = impl.get("run_metadata")
+    meta = meta if isinstance(meta, Mapping) else {}
+    exit_code = meta.get("exit_code")
+    run = {
+        "run_id": _str(meta.get("run_id")) or _str(impl.get("run")),
+        "profile": _str(meta.get("profile")),
+        "cli": _str(meta.get("cli")),
+        "backend": _str(meta.get("backend")),
+        "model": _str(meta.get("model")),
+        "started_at": _str(meta.get("started_at")),
+        "ended_at": _str(meta.get("ended_at")),
+        "exit_code": exit_code if isinstance(exit_code, int) else None,
+    }
+    return run, _str_list(meta.get("changed_files"))
+
+
+def _checking_summary(
+    feature_root: Path,
+    lane_id: str,
+    *,
+    subdir: str,
+    filename: str,
+) -> dict[str, Any]:
+    """One checking report's run_id + issue_count (defensive: None/0 when absent).
+
+    The reviewer (``review/``) and spec-gap (``spec-gap/``) reports each carry
+    a top-level ``run`` id and an ``issues[]`` list; the summary projects the
+    run id + the issue count so the report answers "which run reviewed this
+    lane and how many issues did it raise".
+    """
+    report = read_json_object(feature_root / "lanes" / lane_id / subdir / filename)
+    if not isinstance(report, Mapping):
+        return {"run_id": None, "issue_count": 0}
+    issues = report.get("issues")
+    issue_count = len(issues) if isinstance(issues, list) else 0
+    return {"run_id": _str(report.get("run")), "issue_count": issue_count}
+
+
+def _lane_verification_summary(
+    feature_root: Path, lane_id: str
+) -> dict[str, Any]:
+    """The lane's shell-verifier verdict + passed/command counts (defensive)."""
+    report = read_json_object(
+        feature_root / "lanes" / lane_id / VERIFICATION_DIR / VERIFICATION_REPORT_JSON
+    )
+    if not isinstance(report, Mapping):
+        return {"verdict": None, "passed_count": 0, "command_count": 0}
+    passed = report.get("passed_count")
+    total = report.get("command_count")
+    return {
+        "verdict": _str(report.get("verdict")),
+        "passed_count": passed if isinstance(passed, int) else 0,
+        "command_count": total if isinstance(total, int) else 0,
+    }
+
+
+def _lane_worktree_summary(
+    feature_root: Path, lane_id: str
+) -> dict[str, Any] | None:
+    """The lane's worktree metadata (defensive: ``None`` when absent/corrupt).
+
+    ``worktree.json`` is optional (a lane may not have a worktree in v0.2-style
+    runs or before worktree creation); ``None`` is legitimate, not corruption.
+    Read via ``read_json_object`` so a present-but-malformed record also degrades
+    to ``None`` rather than aborting the report (the report is a projection;
+    ``lane_worktree.load_lane_worktree``'s fail-loud is the authoritative read).
+    """
+    wt = read_json_object(feature_root / "lanes" / lane_id / LANE_WORKTREE_FILE)
+    if not isinstance(wt, Mapping):
+        return None
+    return {
+        "branch": _str(wt.get("branch")),
+        "base_ref": _str(wt.get("base_ref")),
+        "path": _str(wt.get("path")),
+        "lifecycle": _str(wt.get("lifecycle")),
+        "clean": wt.get("clean"),
+    }
+
+
+def _lane_commits(
+    feature_root: Path, lane_id: str
+) -> list[dict[str, Any]] | None:
+    """The lane's commits (``commits.log``), one ``{sha, subject}`` per commit.
+
+    ``commits.log`` is the lane's ``git log <base>..HEAD`` capture (one line per
+    commit, ``sha\\tauthor\\tdate\\tsubject``). ``None`` signals "no commits.log"
+    (the lane has no worktree / no captured commits); ``[]`` would mean the file
+    exists but the lane committed nothing - the distinction matters for "was
+    this lane's work captured?". A line without the tab format (e.g. a
+    subject-only fixture) degrades to ``sha=None, subject=<line>``.
+    """
+    path = feature_root / "lanes" / lane_id / LANE_COMMITS_LOG_FILE
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    commits: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        sha = parts[0] if len(parts) >= 2 else None
+        subject = parts[-1] if len(parts) >= 2 else line
+        commits.append({"sha": sha, "subject": subject})
+    return commits
+
+
+def _lane_dependency_state(
+    lane_entry: Any,
+    decision_by_lane: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """The lane's dependency state (ADR-0009 D4): which deps must gate-pass first.
+
+    ``depends_on`` is read from the lane graph; ``blocked_by`` is the subset
+    whose lane-decision is not ``pass``; ``satisfied`` is True iff no
+    dependency blocks. A lane with no dependencies is vacuously satisfied. The
+    lane gate itself does not check dependencies (that is the start precheck,
+    ticket 04); the report surfaces the state for visibility, it does not gate
+    on it. A dependency whose decision is missing is treated as blocking
+    (conservative: we cannot confirm it passed).
+    """
+    depends_on = list(lane_entry.depends_on) if lane_entry is not None else []
+    blocked_by = [
+        dep
+        for dep in depends_on
+        if _str(decision_by_lane.get(dep, {}).get("decision")) != "pass"
+    ]
+    return {
+        "depends_on": depends_on,
+        "satisfied": not blocked_by,
+        "blocked_by": blocked_by,
+    }
+
+
+def _lane_issue_summary(
+    feature_root: Path,
+    lane_id: str,
+    issues_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Per-lane issue counts by severity + unresolved counts (ADR-0009 D6).
+
+    Reads the lane's issue-bundle (the lane's issue set) and cross-references
+    the feature SoT ``issues/ISSUE-NNN.json`` for the *current* status (the
+    bundle is a point-in-time projection; the SoT is live - a triage applied
+    after the last collect must be reflected). ``by_severity`` and
+    ``unresolved_by_severity`` always carry the P0-P3 keys (stable enumeration,
+    values may be 0) plus any extra severities; ``unresolved`` = status !=
+    ``resolved`` (raw lifecycle, not blocking/disarming - those semantics are
+    owned by the failure-shape / coherence gate, not this summary).
+    """
+    bundle = read_json_object(
+        feature_root / "lanes" / lane_id / ISSUE_BUNDLE_JSON
+    )
+    raw_issues = bundle.get("issues") if isinstance(bundle, Mapping) else None
+    bundle_issues = (
+        [i for i in raw_issues if isinstance(i, Mapping)]
+        if isinstance(raw_issues, list)
+        else []
+    )
+
+    by_severity: dict[str, int] = {sev: 0 for sev in SEVERITIES}
+    unresolved_by_severity: dict[str, int] = {sev: 0 for sev in SEVERITIES}
+    unresolved_ids: list[str] = []
+
+    for issue in bundle_issues:
+        severity = _str(issue.get("severity")) or "unspecified"
+        issue_id = _str(issue.get("id"))
+        # Current status from the SoT (live); fall back to the bundle's status
+        # if the SoT record is missing (corruption - the bundle still carries
+        # the collector's last projection of the status).
+        status = _str(issue.get("status"))
+        if issue_id and issue_id in issues_by_id:
+            live = _str(issues_by_id[issue_id].get("status"))
+            if live is not None:
+                status = live
+        by_severity[severity] = by_severity.get(severity, 0) + 1
+        if status != "resolved":
+            unresolved_by_severity[severity] = (
+                unresolved_by_severity.get(severity, 0) + 1
+            )
+            if issue_id:
+                unresolved_ids.append(issue_id)
+
+    return {
+        "total": len(bundle_issues),
+        "by_severity": by_severity,
+        "unresolved_by_severity": unresolved_by_severity,
+        "unresolved_ids": sorted(unresolved_ids),
+    }
+
+
+def _lane_pr_mapping(feature_root: Path) -> tuple[dict[str, Any], list[str]]:
+    """Read the lane-PR mapping (``projections/github/lane-prs.json``).
+
+    Defensive (D6): a *missing* mapping is legitimate (projection has not run)
+    -> empty mapping, no gap. A *present-but-corrupt* mapping degrades to empty
+    too (the report is a read-only projection and cannot create duplicate PRs,
+    so it need not fail loud the way the projection writer does) - but the
+    corruption is recorded as a ``known_gap`` so it is not hidden. Returns the
+    mapping dict (with a ``lanes`` sub-dict) and the gap list.
+
+    The ``lane_pr_projection`` constants are imported lazily here (not at module
+    top) because ``lane_pr_projection`` -> ``github_projection`` ->
+    ``final_report`` would otherwise form a circular import at load time; by
+    runtime (when this helper is called) every module is fully initialized.
+    """
+    from ai_dev.lane_pr_projection import (
+        GITHUB_PROJECTION_DIR,
+        LANE_PR_MAPPING_JSON,
+    )
+
+    path = (
+        feature_root / "projections" / GITHUB_PROJECTION_DIR / LANE_PR_MAPPING_JSON
+    )
+    if not path.is_file():
+        return {"lanes": {}}, []
+    data = read_json_object(path)
+    if data is None:
+        return {"lanes": {}}, [
+            f"lane_pr_mapping: {LANE_PR_MAPPING_JSON} is present but corrupt; "
+            f"PR projection metadata was not read (inspect or delete it, "
+            f"ADR-0009 D6)"
+        ]
+    lanes = data.get("lanes")
+    if not isinstance(lanes, dict):
+        return {"lanes": {}}, [
+            f"lane_pr_mapping: {LANE_PR_MAPPING_JSON} has no 'lanes' object; "
+            f"PR projection metadata was not read (ADR-0009 D6)"
+        ]
+    return data, []
+
+
+def _lane_pr_projection(
+    mapping: Mapping[str, Any], lane_id: str
+) -> dict[str, Any]:
+    """One lane's PR projection summary (ADR-0009 D5/D6).
+
+    ``projected`` is True iff the mapping carries a real PR number (an int that
+    is not a bool) for this lane - mirroring
+    ``lane_pr_projection._lane_pr_entry``'s "is this a real projection" test.
+    A present entry without a number is a half-state from a prior failed
+    create; it reads as not-projected (the resume path retries). The summary
+    carries the projection metadata verbatim; it is projection metadata, never
+    canonical/merged state (D6).
+    """
+    lanes = mapping.get("lanes")
+    entry = lanes.get(lane_id) if isinstance(lanes, Mapping) else None
+    if not isinstance(entry, Mapping):
+        entry = {}
+    pr_number = entry.get("pr_number")
+    projected = isinstance(pr_number, int) and not isinstance(pr_number, bool)
+    if not projected:
+        return {
+            "projected": False,
+            "pr_number": None,
+            "pr_url": None,
+            "head_branch": None,
+            "base_branch": None,
+            "remote": None,
+            "projected_at": None,
+        }
+    return {
+        "projected": True,
+        "pr_number": pr_number,
+        "pr_url": _str(entry.get("pr_url")),
+        "head_branch": _str(entry.get("head_branch")),
+        "base_branch": _str(entry.get("base_branch")),
+        "remote": _str(entry.get("remote")),
+        "projected_at": _str(entry.get("projected_at")),
+    }
+
+
+def _lane_summary(
+    feature_root: Path,
+    lane_id: str,
+    decision: Mapping[str, Any],
+    issues_by_id: Mapping[str, Mapping[str, Any]],
+    decision_by_lane: Mapping[str, Mapping[str, Any]],
+    pr_mapping: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assemble one lane's full aggregation (ADR-0009 D1/D6/D7, ticket 06)."""
+    lane_entry = _safe_lane_entry(feature_root, lane_id)
+    run, changed_files = _lane_run_summary(feature_root, lane_id)
+    commits = _lane_commits(feature_root, lane_id)
+    return {
+        "lane_id": lane_id,
+        "purpose": lane_entry.purpose if lane_entry is not None else None,
+        "gate": _lane_gate_summary(decision),
+        "run": run,
+        "changed_files": changed_files,
+        "review": _checking_summary(
+            feature_root,
+            lane_id,
+            subdir=REVIEW_DIR,
+            filename=REVIEW_REPORT_JSON,
+        ),
+        "spec_gap": _checking_summary(
+            feature_root,
+            lane_id,
+            subdir=SPEC_GAP_DIR,
+            filename=SPEC_GAP_REPORT_JSON,
+        ),
+        "verification": _lane_verification_summary(feature_root, lane_id),
+        "issues": _lane_issue_summary(feature_root, lane_id, issues_by_id),
+        "worktree": _lane_worktree_summary(feature_root, lane_id),
+        "commits": commits,
+        "dependency_state": _lane_dependency_state(lane_entry, decision_by_lane),
+        "pr_projection": _lane_pr_projection(pr_mapping, lane_id),
+    }
+
+
+def _lane_summaries(
+    feature_root: Path,
+    lane_decisions: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Aggregate every declared lane (ADR-0009 D1/D6/D7, ticket 06).
+
+    Returns the ordered ``lanes`` list (one entry per declared lane, in
+    ``declared_lane_ids`` order) and the PR-mapping known-gaps. Each lane
+    carries its independent gate verdict, worktree metadata, run/profile
+    metadata, reviewer/spec-gap/verifier outcomes, unresolved issue counts,
+    dependency state, and lane PR projection - all labelled as projection
+    metadata, never canonical/merged state.
+    """
+    issues_by_id: dict[str, Mapping[str, Any]] = {}
+    for issue in issues:
+        issue_id = _str(issue.get("id"))
+        if issue_id:
+            issues_by_id[issue_id] = issue
+
+    decision_by_lane: dict[str, Mapping[str, Any]] = {}
+    for decision in lane_decisions:
+        lane = _str(decision.get("lane"))
+        if lane:
+            decision_by_lane[lane] = decision
+
+    pr_mapping, pr_gaps = _lane_pr_mapping(feature_root)
+
+    lanes = [
+        _lane_summary(
+            feature_root,
+            lane_id,
+            decision_by_lane.get(lane_id, {}),
+            issues_by_id,
+            decision_by_lane,
+            pr_mapping,
+        )
+        for lane_id in declared_lane_ids(feature_root)
+    ]
+    return lanes, pr_gaps
+
+
+# ---------------------------------------------------------------------------
 # meta + top-level assembly.
 # ---------------------------------------------------------------------------
 
@@ -716,6 +1179,7 @@ def _meta(
     audit_count: int,
     latest_event_ts: str | None,
     known_gaps: list[str],
+    lane_count: int,
 ) -> dict[str, Any]:
     conditions = coherence_decision.get("conditions", [])
     return {
@@ -732,6 +1196,11 @@ def _meta(
         ],
         "audit_event_count": audit_count,
         "latest_event_timestamp": latest_event_ts,
+        # v0.7 ADR-0009 D1/D6/D7: the number of declared lanes aggregated and
+        # the integration boundary in prose. ``integration_disclaimer`` is a
+        # constant so the JSON and the MD note can never drift on it.
+        "lane_count": lane_count,
+        "integration_disclaimer": INTEGRATION_DISCLAIMER,
         "known_gaps": sorted(set(known_gaps)),
     }
 
@@ -751,6 +1220,8 @@ def _final_report_json(
     blocking_reasons: list[dict[str, Any]],
     audit_count: int,
     latest_event_ts: str | None,
+    lanes: list[dict[str, Any]],
+    lane_pr_gaps: list[str],
 ) -> dict[str, Any]:
     known_gaps: list[str] = []
     if code_to_requirement_gap:
@@ -775,6 +1246,9 @@ def _final_report_json(
             "self-attested (ADR-0007) and the Spec Gap Analyst cross-checks "
             "honesty"
         )
+    # v0.7: a corrupt lane-PR mapping degrades to empty (D6 defensive read);
+    # the corruption is surfaced here rather than hidden.
+    known_gaps.extend(lane_pr_gaps)
 
     report: dict[str, Any] = {
         "meta": _meta(
@@ -784,6 +1258,7 @@ def _final_report_json(
             audit_count,
             latest_event_ts,
             known_gaps,
+            len(lanes),
         ),
         "verdict": verdict,
         FIVE_QUESTION_KEYS[0]: code_to_requirement,
@@ -793,6 +1268,10 @@ def _final_report_json(
         FIVE_QUESTION_KEYS[4]: agent_timeline,
         "failure_class": failure_class,
         "blocking_reasons": blocking_reasons,
+        # v0.7 ADR-0009 D1/D6/D7: the per-lane aggregation. Each entry is a
+        # projection of one declared lane's artifacts; lane PRs are labelled as
+        # projection metadata, never canonical/merged state.
+        "lanes": lanes,
     }
     return report
 
@@ -812,6 +1291,38 @@ def _render_list(items: list[Mapping[str, Any]], formatter: Any) -> list[str]:
     return lines
 
 
+def _lane_md_line(lane: Mapping[str, Any]) -> str:
+    """One compact lane row for the MD ``## Lanes`` section.
+
+    Renders the lane id, its independent gate verdict, and the v0.7-specific
+    projection fields (run / changed_files / worktree branch / commit count /
+    PR number) so a reader can scan every lane's state at a glance. The PR
+    number is shown as ``none`` when not projected - the section never claims a
+    branch is merged (the disclaimer above carries that boundary).
+    """
+    gate = lane.get("gate", {}) if isinstance(lane.get("gate"), Mapping) else {}
+    run = lane.get("run", {}) if isinstance(lane.get("run"), Mapping) else {}
+    worktree = lane.get("worktree")
+    wt_branch = (
+        worktree.get("branch") if isinstance(worktree, Mapping) else None
+    )
+    pr = lane.get("pr_projection", {}) if isinstance(
+        lane.get("pr_projection"), Mapping
+    ) else {}
+    pr_number = pr.get("pr_number")
+    commits = lane.get("commits")
+    commit_count = len(commits) if isinstance(commits, list) else None
+    return (
+        f"`{lane.get('lane_id')}` gate={gate.get('verdict')} "
+        f"purpose={lane.get('purpose') or '_(unspecified)_'} "
+        f"run={run.get('run_id') or '_none_'} "
+        f"changed_files={len(lane.get('changed_files') or [])} "
+        f"worktree={wt_branch or '_none_'} "
+        f"commits={commit_count if commit_count is not None else '_none_'} "
+        f"pr={pr_number if pr_number is not None else 'none'}"
+    )
+
+
 def _final_report_md(report: Mapping[str, Any]) -> str:
     meta = report.get("meta", {}) if isinstance(report.get("meta"), Mapping) else {}
     lines: list[str] = [
@@ -829,6 +1340,10 @@ def _final_report_md(report: Mapping[str, Any]) -> str:
         "> audit fact projected from the feature-run artifacts. Future",
         "> model-generated narrative lands in a separate, clearly-marked",
         "> non-canonical section (spec/model isolation).",
+        "",
+        "## Multi-lane & Projection Note",
+        "",
+        INTEGRATION_DISCLAIMER,
         "",
         "## Code -> Requirement (Q1)",
         "",
@@ -886,6 +1401,10 @@ def _final_report_md(report: Mapping[str, Any]) -> str:
                 f"exit={e.get('exit_code')} changed_files={len(e.get('changed_files') or [])}"
             ),
         )
+    )
+    lines += ["", "## Lanes", ""]
+    lines.extend(
+        _render_list(report.get("lanes", []), _lane_md_line)
     )
     lines += ["", "## Failure Shape", ""]
     lines.append(f"- failure_class: {report.get('failure_class')}")
@@ -979,6 +1498,10 @@ def compute_final_report(feature_root: Path) -> FinalReportCompute:
         verdict, issues, lane_decisions, coherence_decision, feature_root
     )
     audit_count, latest_event_ts = _audit_tail(feature_root)
+    # v0.7: aggregate every declared lane (ADR-0009 D1/D6/D7, ticket 06). Reads
+    # only feature_root artifacts (per-lane artifacts + the lane-PR mapping) so
+    # the pure compute seam stays feature-root-scoped.
+    lanes, lane_pr_gaps = _lane_summaries(feature_root, lane_decisions, issues)
 
     report = _final_report_json(
         feature_id,
@@ -995,6 +1518,8 @@ def compute_final_report(feature_root: Path) -> FinalReportCompute:
         blocking_reasons,
         audit_count,
         latest_event_ts,
+        lanes,
+        lane_pr_gaps,
     )
     return FinalReportCompute(
         verdict=verdict, failure_class=failure_class, report=report
