@@ -986,9 +986,14 @@ class TestReviewerReadsLaneWorktree:
 
 
 class TestVerifierRunsInLaneWorktree:
-    """The Verifier executes its commands in the lane's worktree cwd, not the
-    implement run's workspace/ copy. A file written into the worktree between
-    implement and verify must be visible to the verify command.
+    """The Verifier executes its commands in the lane worktree's ``workspace/``
+    cwd (where the implementer wrote the package + ``tests/``), not the
+    implement run's run-home ``workspace/`` copy. A file written into the
+    worktree between implement and verify must be visible to the verify
+    command. The cwd matches the Planner's workspace-relative verify commands
+    (``PYTHONPATH=. python -m pytest tests``, ``python -m mypy <pkg>``) and the
+    v0.2 fallback cwd (``implement_run/workspace/``) - v0.7 capstone (ADR-0009
+    D2).
 
     Covers: reviewer/spec-gap/verifier legs use the lane worktree diff/files
     as their evidence surface.
@@ -1021,7 +1026,8 @@ class TestVerifierRunsInLaneWorktree:
             claude_path=str(fake),
         )
 
-        # Add a verify command that checks the worktree file content.
+        # Add a workspace-relative verify command (cwd = <worktree>/workspace/,
+        # where the implementer wrote workspace/lane1.py -> lane1.py there).
         root = _feature_root(git_repo, feature_id)
         graph = yaml.safe_load((root / LANE_GRAPH_YML).read_text())
         for entry in graph["lanes"]:
@@ -1029,7 +1035,7 @@ class TestVerifierRunsInLaneWorktree:
                 entry["verification_commands"] = [
                     {
                         "name": "lane1-file-exists",
-                        "command": "test -f workspace/lane1.py && echo present",
+                        "command": "test -f lane1.py && echo present",
                     }
                 ]
         (root / LANE_GRAPH_YML).write_text(yaml.safe_dump(graph, sort_keys=False))

@@ -329,6 +329,64 @@ sys.stdout.write('{"type":"result","subtype":"success","is_error":false}\\n')
 sys.exit(0)
 """
 
+# A fake ``claude`` whose tasks proposal uses the v0.7 multi-lane `lanes` array
+# form: one entry per seeded lane (LANE-001/002) with its own purpose +
+# verification_commands, and every task carrying a `lane` assignment. promote's
+# `_proposal_lanes` prefers the `lanes` array over the (still-required,
+# schema-wise) top-level `lane_purpose`, so the canonical lane-graph ends up
+# with two populated lane entries. Stands in for the real CLI on the 2-lane
+# tasks leg (v0.7 capstone ticket 07).
+_FAKE_CLAUDE_TASKS_TWO_LANE = """\
+#!__PY__
+import json, os, sys
+os.makedirs("output", exist_ok=True)
+with open("output/result.md", "w") as f:
+    f.write("Authored a two-lane tasks proposal.\\n")
+with open("output/result.json", "w") as f:
+    json.dump(
+        {
+            "lane_purpose": "Implement greet + exit across two lanes.",
+            "lanes": [
+                {"id": "LANE-001", "purpose": "Greeting module lane",
+                 "verification_commands": [
+                     {"name": "pytest", "command": "PYTHONPATH=. python -m pytest -q tests"},
+                     {"name": "mypy", "command": "python -m mypy src"}]},
+                {"id": "LANE-002", "purpose": "Exit handling lane",
+                 "verification_commands": [
+                     {"name": "pytest", "command": "PYTHONPATH=. python -m pytest -q tests"},
+                     {"name": "mypy", "command": "python -m mypy src"}]}
+            ],
+            "tasks": [
+                {
+                    "key": "t1",
+                    "summary": "Implement greeting module",
+                    "related_requirements": ["REQ-001"],
+                    "related_design": ["DES-001"],
+                    "expected_files": ["src/greet.py"],
+                    "exclusive_files": ["src/greet.py"],
+                    "lane": "LANE-001"
+                },
+                {
+                    "key": "t2",
+                    "summary": "Wire exit handling",
+                    "related_requirements": ["REQ-002"],
+                    "related_design": ["DES-001", "DES-002"],
+                    "expected_files": ["src/cli.py"],
+                    "exclusive_files": ["src/cli.py"],
+                    "lane": "LANE-002"
+                }
+            ],
+            "verification_commands": [
+                {"name": "pytest", "command": "PYTHONPATH=. python -m pytest -q tests"},
+                {"name": "mypy", "command": "python -m mypy src"}
+            ]
+        },
+        f,
+    )
+sys.stdout.write('{"type":"result","subtype":"success","is_error":false}\\n')
+sys.exit(0)
+"""
+
 _FAKE_CLAUDE = """\
 #!__PY__
 import json, os, sys
@@ -391,6 +449,7 @@ def _write_fake_claude(bin_dir: Path, *, variant: str = "valid") -> Path:
         "tasks": _FAKE_CLAUDE_TASKS,
         "tasks_invalid": _FAKE_CLAUDE_TASKS_INVALID,
         "tasks_gap": _FAKE_CLAUDE_TASKS_GAP,
+        "tasks_two_lane": _FAKE_CLAUDE_TASKS_TWO_LANE,
     }
     bin_dir.mkdir(parents=True, exist_ok=True)
     script = bin_dir / "claude"
@@ -1601,3 +1660,142 @@ class TestFreezeTasksGateAndCoverage:
         status = load_feature_status(root)["feature"]
         assert status["frozen_artifacts"]["tasks"] is True
         assert status["current_gate"] == "lane_gate"
+
+
+# ---------------------------------------------------------------------------
+# v0.7 capstone (ticket 07): multi-lane Planner tasks generation.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_lane_frozen_feature(repo_root: Path, write_profiles) -> str:
+    """A 2-lane feature run with requirements + design promoted + frozen.
+
+    Mirrors the ``feature_with_frozen_reqs_and_design`` fixture but seeds two
+    lanes (``create_feature_run(..., lanes=2)``) so the tasks leg's
+    multi-lane path is the unit under test. REQ-001/002 + AC-001/002 and
+    DES-001/002 are allocated exactly as the single-lane fixture, so the same
+    fake-claude refs resolve.
+    """
+    write_profiles(repo_root)
+    create_feature_run(repo_root, _INTENT, lanes=2)
+    root = _feature_root(repo_root)
+    promote_requirements(
+        root,
+        FEATURE_ID,
+        {
+            "requirements": [
+                {"key": "r1", "statement": "The CLI shall greet a named user."},
+                {"key": "r2", "statement": "The CLI shall exit 0 on success."},
+            ],
+            "acceptance_criteria": [
+                {"key": "a1", "requirement": "r1", "criterion": "greeting contains name"},
+                {"key": "a2", "requirement": "r2", "criterion": "exit 0 on valid name"},
+            ],
+        },
+        origin="test",
+    )
+    freeze_artifact(root, "requirements", origin="test")
+    promote_design(
+        root,
+        FEATURE_ID,
+        {
+            "design_elements": [
+                {"key": "d1", "name": "Greeting module",
+                 "description": "formats the greeting"},
+                {"key": "d2", "name": "Exit handling", "type": "module"},
+            ],
+            "requirement_mapping": [
+                {"key": "m1", "requirement": "REQ-001", "design_elements": ["d1"]},
+                {"key": "m2", "requirement": "REQ-002", "design_elements": ["d1", "d2"]},
+            ],
+            "architecture_decision": "single module",
+            "invariants": ["deterministic greeting"],
+        },
+        origin="test",
+    )
+    freeze_artifact(root, "design", origin="test")
+    return FEATURE_ID
+
+
+class TestBuildTasksInputPackageMultiLane:
+    """v0.7: when the feature has >1 seeded lane, the tasks package instructs
+    the Planner to emit a ``lanes`` array + per-task ``lane`` assignment; the
+    single-lane package keeps the v0.6 ``one MVP lane`` phrasing."""
+
+    def test_two_lane_package_carries_both_lane_ids_and_lanes_instruction(
+        self, repo_root: Path, write_profiles
+    ) -> None:
+        feature_id = _seed_two_lane_frozen_feature(repo_root, write_profiles)
+        run_id = build_tasks_input_package(repo_root, feature_id)
+        task_pkg = (
+            run_dir(repo_root, feature_id, run_id) / "input" / TASK_PACKAGE_FILE
+        ).read_text()
+        # Both seeded lane ids reach the Planner, plus the multi-lane `lanes`
+        # array contract and the per-task `lane` assignment instruction.
+        assert "LANE-001" in task_pkg
+        assert "LANE-002" in task_pkg
+        assert "lanes" in task_pkg
+        assert "exactly one lane" in task_pkg
+
+    def test_single_lane_package_keeps_one_lane_phrasing(
+        self, repo_root: Path, feature_with_frozen_reqs_and_design: str
+    ) -> None:
+        run_id = build_tasks_input_package(
+            repo_root, feature_with_frozen_reqs_and_design
+        )
+        task_pkg = (
+            run_dir(repo_root, feature_with_frozen_reqs_and_design, run_id)
+            / "input"
+            / TASK_PACKAGE_FILE
+        ).read_text()
+        # Backward compat: the v0.6 single-lane prompt is unchanged - the model
+        # is told there is one MVP lane and it does NOT assign lanes.
+        assert "one MVP lane" in task_pkg or "do NOT assign lanes" in task_pkg
+        # The multi-lane contract is NOT surfaced for one lane: no second lane
+        # id and no per-task lane-assignment instruction.
+        assert "LANE-002" not in task_pkg
+        assert "exactly one lane" not in task_pkg
+
+
+class TestRunGenerateTasksMultiLane:
+    """A 2-lane ``lanes``-array proposal promotes into a 2-lane lane-graph:
+    each lane gets its own purpose / tasks / files / verify commands."""
+
+    def test_two_lane_proposal_promotes_two_lane_graph(
+        self, repo_root: Path, write_profiles, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        feature_id = _seed_two_lane_frozen_feature(repo_root, write_profiles)
+        monkeypatch.setenv("CC_GLM52_TOKEN", "tok-tasks-two-lane")
+        fake = _write_fake_claude(repo_root / "bin", variant="tasks_two_lane")
+        profile = _load_profile(repo_root)
+        root = _feature_root(repo_root)
+
+        result = run_generate_tasks(
+            repo_root, feature_id, profile, claude_path=str(fake)
+        )
+
+        assert result.validation.passed
+        assert result.promoted
+        doc = json.loads((root / TASKS_JSON).read_text())
+        # Tasks are assigned to different lanes by the Planner's `lane` field.
+        lane_of = {t["key"]: t["lane"] for t in doc["tasks"]}
+        assert lane_of["t1"] == "LANE-001"
+        assert lane_of["t2"] == "LANE-002"
+        graph = yaml.safe_load((root / LANE_GRAPH_YML).read_text())
+        assert [lane["id"] for lane in graph["lanes"]] == ["LANE-001", "LANE-002"]
+        lane1, lane2 = graph["lanes"]
+        # Each lane carries its own Planner-authored purpose + tasks + files.
+        assert lane1["purpose"] == "Greeting module lane"
+        assert lane1["tasks"] == ["TASK-001"]
+        assert lane1["expected_files"] == ["src/greet.py"]
+        assert lane2["purpose"] == "Exit handling lane"
+        assert lane2["tasks"] == ["TASK-002"]
+        assert lane2["expected_files"] == ["src/cli.py"]
+        # Each lane got its own verify command set (zero hand-authored planning).
+        assert [vc["name"] for vc in lane1["verification_commands"]] == ["pytest", "mypy"]
+        assert [vc["name"] for vc in lane2["verification_commands"]] == ["pytest", "mypy"]
+        # lane-status synced to both lanes.
+        lane_status = yaml.safe_load(
+            (root / "status" / "lane-status.yml").read_text()
+        )
+        assert list(lane_status["lanes"]) == ["LANE-001", "LANE-002"]

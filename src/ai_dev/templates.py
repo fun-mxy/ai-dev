@@ -30,7 +30,7 @@ Two cross-cutting requirements shape every template:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 
@@ -221,8 +221,57 @@ def _tasks_md(feature_id: str) -> str:
     )
 
 
-def _lane_graph_payload(feature_id: str, lane_id: str) -> dict[str, Any]:
-    """§7.5 lane graph: one lane (§5.3 MVP) carrying the full lane-entry shape.
+def _lane_entry(lane_id: str) -> dict[str, Any]:
+    """One §7.5 lane entry: the full structural shape, content fields empty.
+
+    The lane's ``id`` is the real id allocated upstream by ticket 03 - the
+    graph references it rather than inventing a string. Content fields the
+    Planner fills (purpose, tasks, files, scope...) seed empty; the lane-entry
+    structure stays complete so the format is uniform across every lane.
+    """
+    return {
+        "id": lane_id,
+        "purpose": None,
+        "tasks": [],
+        "depends_on": [],
+        "expected_files": [],
+        "exclusive_files": [],
+        "provides": [],
+        "consumes": [],
+        "verification_scope": [],
+        "merge_policy": dict(_DEFAULT_MERGE_POLICY),
+    }
+
+
+def _normalize_lane_ids(lane_id: str | Sequence[str]) -> list[str]:
+    """Accept one lane id or a sequence of them; return a validated list.
+
+    v0.7 capstone: ``create_feature_run(..., lanes=N)`` seeds N lanes, so the
+    template writers accept either a single id (the v0.6 single-lane callers)
+    or a sequence (the multi-lane caller). A non-string / empty / duplicate id
+    is a section-24.2 precondition breach - fail loud rather than seeding a
+    malformed graph.
+    """
+    if isinstance(lane_id, str):
+        ids: list[str] = [lane_id]
+    else:
+        ids = list(lane_id)
+    if not ids:
+        raise ValueError("lane_id must contain at least one lane id (§24.2)")
+    seen: set[str] = set()
+    for lid in ids:
+        if not isinstance(lid, str) or not lid:
+            raise ValueError(f"lane id {lid!r} must be a non-empty string (§24.2)")
+        if lid in seen:
+            raise ValueError(f"duplicate lane id {lid!r} in lane_id (§24.2)")
+        seen.add(lid)
+    return ids
+
+
+def _lane_graph_payload(
+    feature_id: str, lane_id: str | Sequence[str]
+) -> dict[str, Any]:
+    """§7.5 lane graph: one entry per allocated lane carrying the full shape.
 
     The single lane's ``id`` is the real id allocated upstream by ticket 03 —
     the graph references it rather than inventing a string. Content fields the
@@ -235,28 +284,16 @@ def _lane_graph_payload(feature_id: str, lane_id: str) -> dict[str, Any]:
     machine artifacts carry (and ``final-report.json`` set the precedent for),
     so all feature-run machine files are self-describing about their owner.
     """
+    lane_ids = _normalize_lane_ids(lane_id)
     return {
         "feature": feature_id,
         "frozen": False,
-        "lanes": [
-            {
-                "id": lane_id,
-                "purpose": None,
-                "tasks": [],
-                "depends_on": [],
-                "expected_files": [],
-                "exclusive_files": [],
-                "provides": [],
-                "consumes": [],
-                "verification_scope": [],
-                "merge_policy": dict(_DEFAULT_MERGE_POLICY),
-            }
-        ],
+        "lanes": [_lane_entry(lid) for lid in lane_ids],
     }
 
 
 def seed_artifact_templates(
-    feature_root: Path, feature_id: str, lane_id: str
+    feature_root: Path, feature_id: str, lane_id: str | Sequence[str]
 ) -> list[Path]:
     """Seed the four §7 artifact templates under ``feature_root``.
 

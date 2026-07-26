@@ -213,3 +213,92 @@ class TestCreateFeatureRunSeedsLaneAndTaskStatus:
                 _feature_path(repo_root, fid, "status", "lane-status.yml").read_text()
             )
             assert list(doc["lanes"]) == ["LANE-001"]
+
+
+class TestCreateFeatureRunMultiLane:
+    """v0.7 capstone: ``create_feature_run(..., lanes=N)`` seeds N lanes.
+
+    The lane graph and lane-status both carry every allocated lane id so a
+    Planner tasks proposal may assign tasks across them (ADR-0009 D1). The
+    degenerate ``lanes=1`` (default) case stays byte-identical to the v0.6
+    single-lane shape - multi-lane is an additive superset.
+    """
+
+    def test_default_lanes_is_one_single_lane_shape_unchanged(
+        self, repo_root: Path
+    ) -> None:
+        create_feature_run(repo_root, INTENT)
+
+        graph = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "04-lane-graph.yml").read_text()
+        )
+        assert [lane["id"] for lane in graph["lanes"]] == ["LANE-001"]
+        lane_status = yaml.safe_load(
+            _feature_path(
+                repo_root, "FEATURE-001", "status", "lane-status.yml"
+            ).read_text()
+        )
+        assert list(lane_status["lanes"]) == ["LANE-001"]
+        counters = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "id-counters.yml").read_text()
+        )
+        assert counters == {"LANE": 1}
+
+    def test_lanes_two_seeds_two_lane_entries_and_status_rows(
+        self, repo_root: Path
+    ) -> None:
+        create_feature_run(repo_root, INTENT, lanes=2)
+
+        graph = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "04-lane-graph.yml").read_text()
+        )
+        # Both lanes carry the full §7.5 entry shape; only the id differs.
+        assert [lane["id"] for lane in graph["lanes"]] == ["LANE-001", "LANE-002"]
+        for lane in graph["lanes"]:
+            assert set(lane) >= {
+                "id",
+                "purpose",
+                "tasks",
+                "depends_on",
+                "expected_files",
+                "exclusive_files",
+                "verification_scope",
+                "merge_policy",
+            }
+            assert lane["purpose"] is None
+            assert lane["tasks"] == []
+        lane_status = yaml.safe_load(
+            _feature_path(
+                repo_root, "FEATURE-001", "status", "lane-status.yml"
+            ).read_text()
+        )
+        assert list(lane_status["lanes"]) == ["LANE-001", "LANE-002"]
+        assert lane_status["lanes"]["LANE-002"]["status"] == "pending"
+        counters = yaml.safe_load(
+            _feature_path(repo_root, "FEATURE-001", "id-counters.yml").read_text()
+        )
+        assert counters == {"LANE": 2}
+
+    def test_lanes_two_allocates_both_lanes_in_audit_order(
+        self, repo_root: Path
+    ) -> None:
+        create_feature_run(repo_root, INTENT, lanes=2)
+
+        records = json.loads(
+            _feature_path(repo_root, "FEATURE-001", AUDIT_LOG_JSON).read_text()
+        )
+        # create precedes the two lane allocations, in id order.
+        assert [r["event"] for r in records] == [
+            "create",
+            "allocate_id",
+            "allocate_id",
+        ]
+        assert records[1]["payload"] == {"id": "LANE-001", "type": "LANE", "seq": 1}
+        assert records[2]["payload"] == {"id": "LANE-002", "type": "LANE", "seq": 2}
+
+    def test_lanes_zero_or_negative_raises(self, repo_root: Path) -> None:
+        import pytest
+
+        for bad in (0, -1):
+            with pytest.raises(ValueError):
+                create_feature_run(repo_root, INTENT, lanes=bad)

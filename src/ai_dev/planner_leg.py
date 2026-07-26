@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from ai_dev.json_artifact import read_json_object
 from ai_dev.paths import OUTPUT_DIR, RESULT_JSON, feature_dir, require_feature_root, run_dir
@@ -67,6 +67,7 @@ from ai_dev.run_wrapper import (
     DEFAULT_PERMISSION_MODE,
     run_headless,
 )
+from ai_dev.status import lane_graph_ids
 from ai_dev.validate import ValidationResult, validate_run
 
 # The model role this leg prepares (§9.1). Pinned, not caller-supplied: the
@@ -239,8 +240,12 @@ def compute_planner_inputs(
         des_summary = _render_frozen_design_summary(
             read_frozen_design_doc(feature_root)
         )
+        # v0.7 capstone: the seeded lane ids decide the prompt's lane contract.
+        # One lane -> the v0.6 single-`lane_purpose` form; >1 lane -> the
+        # `lanes` array form with per-task `lane` assignment (ADR-0009 D1).
+        lane_ids = lane_graph_ids(feature_root)
         task_text = _tasks_task_text(
-            feature_id, intent, req_summary, des_summary, feedback
+            feature_id, intent, req_summary, des_summary, feedback, lane_ids
         )
     else:
         raise ValueError(f"unknown planner stage: {stage}")
@@ -674,12 +679,82 @@ def _render_frozen_design_summary(des_doc: Mapping[str, Any]) -> str:
     return "\n".join(lines) if lines else "- (none)"
 
 
+def _tasks_lane_structure_rules(lane_ids: Sequence[str]) -> list[str]:
+    """The lane-structure bullets for the tasks prompt, picked by lane count.
+
+    v0.7 capstone (ADR-0009 D1): one lane keeps the v0.6 single-``lane_purpose``
+    contract (the model does not assign lanes); more than one switches to the
+    ``lanes`` array contract - one entry per seeded LANE-NNN with its own
+    purpose, and every task assigned to exactly one lane via its ``lane``
+    field. Lanes are structural (allocated at feature creation), so the model
+    authors purpose + assignment, never the ids.
+    """
+    if len(lane_ids) <= 1:
+        return [
+            "- The top-level `lane_purpose` is a single sentence: the purpose of the "
+            "one MVP lane all tasks run on (the lane itself is structural; you do NOT "
+            "assign lanes).",
+        ]
+    lane_list = ", ".join(lane_ids)
+    return [
+        f"- This feature has {len(lane_ids)} independent lanes already allocated: "
+        f"{lane_list}. They are structural (allocated at feature creation) - you do "
+        "NOT re-allocate or rename them.",
+        "- Declare a top-level `lanes` array with one entry per seeded lane id, in "
+        "order. Each entry is `{\"id\": <LANE-NNN>, \"purpose\": <one sentence>, "
+        "\"verification_commands\": [...]}` (the per-lane verify command set - see "
+        "the rule below).",
+        "- Assign every task to exactly one lane via its `lane` field (the real "
+        "LANE-NNN id, e.g. `\"LANE-001\"`). Partition tasks so each lane owns a "
+        "disjoint set of `expected_files` - no two lanes touch the same file. Lanes "
+        "are executed in isolated git worktrees and integrated by a human later, so "
+        "overlapping files would conflict.",
+        "- Also emit a top-level `lane_purpose` (one sentence summarizing the whole "
+        "feature) - it is required by the schema; the `lanes` array takes precedence "
+        "at promote and the single `lane_purpose` is only the summary.",
+    ]
+
+
+def _tasks_lane_verify_rules(lane_ids: Sequence[str]) -> list[str]:
+    """The verify-command bullets for the tasks prompt, picked by lane count.
+
+    One lane -> a single top-level ``verification_commands`` array (v0.6);
+    more than one -> per-lane ``verification_commands`` inside each ``lanes``
+    entry. The command text is identical either way: the Verifier (§9.5) runs
+    each command with the lane worktree's ``workspace/`` as cwd, where the
+    lane's package + ``tests/`` live (v0.7 capstone).
+    """
+    head = (
+        "- Declare the __WHERE__ `verification_commands`: the shell commands the "
+        "Verifier (§9.5) runs to prove the lane works. Each entry is "
+        "`{\"name\": <label>, \"command\": <shell string>}`. The commands run "
+        "with the implementer run's `workspace/` as the working directory, where "
+        "the implemented package + `tests/` live - so emit **workspace-relative** "
+        "commands. Use exactly this two-command set for a Python package "
+        "`<pkg>` with a `tests/` dir (substitute the real package name):\n"
+        "  - `{\"name\": \"pytest\", \"command\": \"PYTHONPATH=. python -m pytest "
+        "-q -p no:cacheprovider -c /dev/null tests\"}`\n"
+        "  - `{\"name\": \"mypy\", \"command\": \"python -m mypy <pkg>\"}`\n"
+        "  These are the commands the Verifier executes; if you omit "
+        "`verification_commands` the Verifier fails loud (no verify command set "
+        "declared), so always emit them."
+    )
+    if len(lane_ids) <= 1:
+        return [head.replace("__WHERE__", "lane's top-level")]
+    return [
+        head.replace("__WHERE__", "per-lane (inside each `lanes` entry)"),
+        "- Every `lanes` entry must carry its own `verification_commands` so each "
+        "lane is independently verifiable in its own worktree.",
+    ]
+
+
 def _tasks_task_text(
     feature_id: str,
     intent: str,
     req_summary: str,
     des_summary: str,
     feedback: str | None,
+    lane_ids: Sequence[str],
 ) -> str:
     """The Planner tasks task: author an id-free tasks proposal from the intent +
     frozen requirements + frozen design.
@@ -688,12 +763,18 @@ def _tasks_task_text(
     upstream REQ-NNN ids) + the frozen design (the upstream DES-NNN ids) + the
     optional human feedback (ADR-0008 D4 refinement channel), then instructs the
     Planner to emit a tasks proposal conforming to ``input/output-schema.json`` -
-    **id-free** content: a top-level ``lane_purpose`` (the single MVP lane's
-    purpose) + local ``key`` handles per task, canonical ``REQ-NNN`` / ``DES-NNN``
-    refs (from the frozen upstreams) in each task's ``related_requirements`` /
-    ``related_design``. The schema (``TASKS_PROPOSAL_SCHEMA``, ticket 04) is the
+    **id-free** content: local ``key`` handles per task, canonical ``REQ-NNN`` /
+    ``DES-NNN`` refs (from the frozen upstreams) in each task's
+    ``related_requirements`` / ``related_design``, and a lane contract picked by
+    ``lane_ids``. The schema (``TASKS_PROPOSAL_SCHEMA``, ticket 04) is the
     contract; this text makes the model's job and the ref rules explicit so the
     proposal is promote-able on the first pass (mirrors the ticket-02/03 de-risk).
+
+    v0.7 capstone (ADR-0009 D1): one seeded lane -> the v0.6 single
+    ``lane_purpose`` form; more than one -> the ``lanes`` array form (one entry
+    per seeded LANE-NNN with its own purpose + verification_commands) plus a
+    per-task ``lane`` assignment. promote's ``_proposal_lanes`` honors the
+    ``lanes`` array preferentially, so each lane ends up with its own tasks.
     """
     blocks = [
         f"Author the tasks proposal for feature {feature_id} (§9.1, Planner).",
@@ -741,9 +822,7 @@ def _tasks_task_text(
         "upstream.",
         "- Each task's `related_design` is a list of the **canonical DES-NNN** ids "
         "of the frozen design elements it implements (read from the list above).",
-        "- The top-level `lane_purpose` is a single sentence: the purpose of the "
-        "one MVP lane all tasks run on (the lane itself is structural; you do NOT "
-        "assign lanes).",
+        *_tasks_lane_structure_rules(lane_ids),
         "- Each task also declares `expected_files` and `exclusive_files` - the "
         "file paths it will touch. These are **RUN-relative paths under `workspace/`** "
         "(the Implementer writes there): e.g. `workspace/<pkg>/cli.py`, "
@@ -751,19 +830,7 @@ def _tasks_task_text(
         "match against these, so the `workspace/` prefix is mandatory; an unprefixed "
         "path like `<pkg>/cli.py` will be rejected. List every file the task touches, "
         "including `workspace/<pkg>/__init__.py` when you create a package.",
-        "- Declare the lane's top-level `verification_commands`: the shell "
-        "commands the Verifier (§9.5) runs to prove the lane works. Each entry "
-        "is `{\"name\": <label>, \"command\": <shell string>}`. The commands run "
-        "with the implementer run's `workspace/` as the working directory, where "
-        "the implemented package + `tests/` live - so emit **workspace-relative** "
-        "commands. Use exactly this two-command set for a Python package "
-        "`<pkg>` with a `tests/` dir (substitute the real package name):\n"
-        "  - `{\"name\": \"pytest\", \"command\": \"PYTHONPATH=. python -m pytest "
-        "-q -p no:cacheprovider -c /dev/null tests\"}`\n"
-        "  - `{\"name\": \"mypy\", \"command\": \"python -m mypy <pkg>\"}`\n"
-        "  These are the commands the Verifier executes; if you omit "
-        "`verification_commands` the Verifier fails loud (no verify command set "
-        "declared), so always emit them.",
+        *_tasks_lane_verify_rules(lane_ids),
         "- `tasks[]` needs a non-empty `key`, `summary`, `related_requirements` "
         "(real frozen REQ-NNN ids), `related_design` (real frozen DES-NNN ids), "
         "`expected_files`, and `exclusive_files`.",

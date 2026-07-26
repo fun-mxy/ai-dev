@@ -40,12 +40,14 @@ from ai_dev.shell_verifier import (
     VERIFICATION_REPORT_MD,
     CommandResult,
     VerifyCommand,
+    _lane_worktree_root,
     read_implement_run_id,
     read_verification_commands,
     run_verify_command,
     run_verifier,
     write_verification_report,
 )
+from ai_dev.lane_worktree import create_lane_worktree
 from ai_dev.status import freeze_artifact
 from ai_dev.templates import LANE_GRAPH_YML, TASKS_MD
 from ai_dev.validate import validate_run
@@ -819,3 +821,93 @@ class TestVerifyCli:
                 "verify", feature_id, lane_id,
                 "--profile", "cc-glm52", "--repo-root", str(repo_root),
             ])
+
+
+# ===========================================================================
+# Seam 6: v0.7 lane-worktree verify cwd (ADR-0009 D2 capstone).
+# ===========================================================================
+
+
+class TestVerifyLaneWorktreeCwd:
+    """v0.7 capstone: when a lane has an active worktree, the verifier runs
+    each command with ``cwd=<worktree>/workspace/`` - the same place the
+    implementer leg wrote the package + ``tests/`` (the Planner emits
+    workspace-relative verify commands: ``PYTHONPATH=. python -m pytest tests``,
+    ``python -m mypy <pkg>``). A wrong cwd (the bare worktree root) would leave
+    the implemented files invisible to the commands and turn every verify into a
+    spurious failure - so this is the load-bearing cwd resolution for the real
+    two-lane dogfood."""
+
+    def test_worktree_cwd_is_workspace_subdir(self, git_repo: Path) -> None:
+        # The verify command imports `hello` - which only resolves because the
+        # verifier runs it with cwd = <worktree>/workspace/. The implement
+        # run's run-home workspace/ also has hello.py, but the worktree is the
+        # active cwd; with the fix the import resolves against the worktree's
+        # own workspace/, proving cwd = <worktree>/workspace/ (not the bare
+        # worktree root, where `import hello` would ModuleNotFoundError).
+        feature_id, lane_id, _ = _stage_implement_run_with_verify(
+            git_repo,
+            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+        )
+        worktree = create_lane_worktree(
+            git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t"
+        )
+        ws = worktree / "workspace"
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "hello.py").write_text(_IMPL_WORKSPACE_CONTENT)
+
+        result = run_verifier(
+            git_repo, feature_id, lane_id,
+            started_at="2026-07-20T12:00:00Z", ended_at="2026-07-20T12:00:01Z",
+        )
+
+        assert result.verdict == "pass"
+        assert result.command_results[0].passed is True
+
+    def test_lane_worktree_root_returns_workspace_when_present(
+        self, git_repo: Path
+    ) -> None:
+        # An active worktree that the implementer populated with a workspace/
+        # subdir resolves to <worktree>/workspace/ (the cwd the Planner's
+        # workspace-relative verify commands assume).
+        feature_id, lane_id, _ = _stage_implement_run_with_verify(
+            git_repo,
+            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+        )
+        worktree = create_lane_worktree(
+            git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t"
+        )
+        (worktree / "workspace").mkdir(parents=True, exist_ok=True)
+
+        resolved = _lane_worktree_root(git_repo, feature_id, lane_id)
+        assert resolved == worktree / "workspace"
+
+    def test_lane_worktree_root_falls_back_to_worktree_when_no_workspace(
+        self, git_repo: Path
+    ) -> None:
+        # An active worktree with no workspace/ subdir yet resolves to the bare
+        # worktree root (the else-branch; e.g. a worktree created but not yet
+        # populated by the implementer).
+        feature_id, lane_id, _ = _stage_implement_run_with_verify(
+            git_repo,
+            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+        )
+        worktree = create_lane_worktree(
+            git_repo, feature_id, lane_id, base_ref="HEAD", timestamp="t"
+        )
+
+        resolved = _lane_worktree_root(git_repo, feature_id, lane_id)
+        assert resolved == worktree
+
+    def test_lane_worktree_root_none_without_active_worktree(
+        self, repo_root: Path
+    ) -> None:
+        # No worktree.json -> None, so run_verifier falls back to the implement
+        # run's workspace/ (the v0.1-v0.6 cwd). This is the non-worktree path
+        # the v0.2 tests exercise.
+        feature_id, lane_id, _ = _stage_implement_run_with_verify(
+            repo_root,
+            verification_commands=[{"name": "import-hello", "command": _CMD_PASS}],
+        )
+
+        assert _lane_worktree_root(repo_root, feature_id, lane_id) is None

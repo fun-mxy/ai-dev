@@ -4,12 +4,12 @@
 
 **Blocked by:** 01, 02, 03, 04, 05, 06.
 
-**Status:** open
+**Status:** done
 
-- [ ] one feature has at least two lanes with separate tasks and lane graph entries
-- [ ] each lane uses a distinct git worktree and branch; `worktree.json` artifacts are recorded
-- [ ] each lane completes implement→review→spec-gap→verify→triage→lane-gate with lane gate pass
-- [ ] each lane branch is pushed and projected to a GitHub PR after lane gate pass
-- [ ] final report aggregates both lanes, worktree metadata, run/profile evidence, gate verdicts, and PR URLs
-- [ ] evidence records commands, artifact paths, PR URLs, token-safety grep, and the explicit non-claim that Merge Coordinator / auto-merge was not run
-- [ ] real backend/profile evidence included; `uv run mypy` + `uv run pytest` green
+- [x] one feature has at least two lanes with separate tasks and lane graph entries
+- [x] each lane uses a distinct git worktree and branch; `worktree.json` artifacts are recorded
+- [x] each lane completes implement→review→spec-gap→verify→triage→lane-gate with lane gate pass
+- [x] each lane branch is pushed and projected to a GitHub PR after lane gate pass
+- [x] final report aggregates both lanes, worktree metadata, run/profile evidence, gate verdicts, and PR URLs
+- [x] evidence records commands, artifact paths, PR URLs, token-safety grep, and the explicit non-claim that Merge Coordinator / auto-merge was not run
+- [x] real backend/profile evidence included; `uv run mypy` + `uv run pytest` green

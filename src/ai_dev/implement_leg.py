@@ -95,11 +95,27 @@ _TRACEABILITY_INSTRUCTION = (
     '- `"related_requirements"`: the REQ-NNN ids this run actually addressed.\n'
     '- `"related_acceptance_criteria"`: the AC-NNN ids this run satisfied.\n'
     "\n"
+    "These two fields are **top-level keys of `result.json`** - siblings of "
+    "`status` / `summary` / `tasks`, NOT nested inside each task entry. The "
+    "validated shape is:\n"
+    "\n"
+    "```json\n"
+    "{\n"
+    '  "status": "proposed_done",\n'
+    '  "summary": "...",\n'
+    '  "tasks": [{"id": "TASK-NNN", "status": "proposed_done", '
+    '"evidence": [...]}],\n'
+    '  "related_requirements": ["REQ-001"],\n'
+    '  "related_acceptance_criteria": ["AC-001"]\n'
+    "}\n"
+    "```\n"
+    "\n"
     "Declare only what this lane addressed - a partial-scope lane declares its "
     "own subset (e.g. `[\"REQ-001\"]`), not every requirement. Declare `[]` only "
     "if this run genuinely addressed none. This is validated (spec §14.4): the "
-    "run FAILS if the fields are missing or reference ids that do not exist in "
-    "`../01-requirements.json`."
+    "run FAILS if the fields are missing (including when they are nested "
+    "inside `tasks` instead of placed at the top level) or reference ids that "
+    "do not exist in `../01-requirements.json`."
 )
 
 

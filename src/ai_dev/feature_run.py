@@ -27,7 +27,7 @@ from ai_dev.feature_ids import allocate_id, next_feature_id
 from ai_dev.paths import feature_dir
 from ai_dev.status import (
     write_initial_feature_status,
-    write_initial_lane_status,
+    write_initial_lane_statuses,
     write_initial_task_status,
 )
 from ai_dev.templates import seed_artifact_templates
@@ -76,18 +76,31 @@ def _seed_empty_dirs(feature_root: Path) -> None:
         (feature_root / name).mkdir(parents=True, exist_ok=True)
 
 
-def create_feature_run(repo_root: Path, intent: str, *, origin: str | None = None) -> str:
+def create_feature_run(
+    repo_root: Path,
+    intent: str,
+    *,
+    lanes: int = 1,
+    origin: str | None = None,
+) -> str:
     """Create a new feature run for ``intent`` and return its ``FEATURE-NNN`` id.
 
     Lays down the §6 directory skeleton, records the intent, writes the initial
     canonical status and final-report placeholders, appends a ``create`` audit
-    record, then allocates the single MVP lane (§5.3) and seeds the four §7
-    artifact templates against it (ticket 05).
+    record, then allocates the feature's lanes (§5.3 - one by default, ``N`` when
+    ``lanes=N`` is given for v0.7 multi-lane execution) and seeds the four §7
+    artifact templates against them (ticket 05). Every allocated lane id is
+    seeded into ``04-lane-graph.yml`` and ``lane-status.yml`` so a Planner tasks
+    proposal may assign tasks across them (ADR-0009 D1).
 
     Idempotent over re-invocation: each call allocates the next id from the
     directories already on disk, so consecutive calls produce FEATURE-001,
     FEATURE-002, …
     """
+    if not isinstance(lanes, int) or isinstance(lanes, bool) or lanes < 1:
+        raise ValueError(
+            f"lanes must be a positive integer (got {lanes!r}); §24.2"
+        )
     feature_id = next_feature_id(repo_root)
     feature_root = feature_dir(repo_root, feature_id)
     feature_root.mkdir(parents=True, exist_ok=True)
@@ -102,14 +115,17 @@ def create_feature_run(repo_root: Path, intent: str, *, origin: str | None = Non
         payload={"feature": feature_id},
         origin=origin,
     )
-    # §5.3 MVP: every feature run owns exactly one lane. Allocate it through
-    # ticket 03's allocator so the lane-graph references a real, persisted,
-    # audited id rather than a placeholder string (ticket 05).
-    lane_id = allocate_id(feature_root, "LANE", origin=origin)
-    seed_artifact_templates(feature_root, feature_id, lane_id)
-    # Ticket 04: seed the §8.2 lane-status with that same allocated lane id and
+    # §5.3: every feature run owns at least one lane. Allocate ``lanes`` of them
+    # through ticket 03's allocator so the lane-graph references real, persisted,
+    # audited ids rather than placeholder strings (ticket 05). v0.7 capstone:
+    # ``lanes=N`` seeds N independent lanes for multi-lane worktree execution.
+    lane_ids = [
+        allocate_id(feature_root, "LANE", origin=origin) for _ in range(lanes)
+    ]
+    seed_artifact_templates(feature_root, feature_id, lane_ids)
+    # Ticket 04: seed the §8.2 lane-status with those same allocated lane ids and
     # the empty §8.1 task-status, completing the §6 ``status/`` set. These are
     # pure writers (no audit) so the audit order is unchanged: create, allocate.
-    write_initial_lane_status(feature_root / "status", lane_id)
+    write_initial_lane_statuses(feature_root / "status", lane_ids)
     write_initial_task_status(feature_root / "status")
     return feature_id

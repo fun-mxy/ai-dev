@@ -454,6 +454,16 @@ def _add_run_flags(
 
 def _args_create_feature_run(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("intent", help="The original user intent text to record.")
+    sub.add_argument(
+        "--lanes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of independent lanes to seed (v0.7 capstone, ADR-0009 D1). "
+        "Default 1 (the v0.6 single-lane shape). N>1 seeds N lane entries in "
+        "04-lane-graph.yml + lane-status.yml so the Planner tasks proposal may "
+        "assign tasks across them.",
+    )
 
 
 def _args_freeze(sub: argparse.ArgumentParser) -> None:
@@ -1946,7 +1956,9 @@ def _agent_command(
 
 def _run_create_feature_run_cmd(args: argparse.Namespace) -> int:
     """``create-feature-run`` - prints the minted id and exits 0 (no ``_run_*``)."""
-    feature_id = create_feature_run(Path(args.repo_root), args.intent, origin=ORIGIN_CLI)
+    feature_id = create_feature_run(
+        Path(args.repo_root), args.intent, lanes=args.lanes, origin=ORIGIN_CLI
+    )
     print(feature_id)
     return 0
 

@@ -500,16 +500,21 @@ class VerifierResult:
 def _lane_worktree_root(
     repo_root: Path, feature_id: str, lane_id: str
 ) -> Path | None:
-    """Return the lane's active worktree path, or ``None`` when no active one.
+    """Return the lane's active worktree cwd, or ``None`` when no active one.
 
     v0.7 (ADR-0009 D2): the implementer leg writes the files under
-    verification into the lane's git worktree; the verifier runs its
-    commands in that worktree's cwd so it sees the implemented files
-    (and any files written into the worktree between implement and
-    verify). When the lane has no active worktree (v0.1-v0.6 run, a
-    removed worktree, or a test that bypassed the lane-aware path),
-    this returns ``None`` and the caller falls back to the implement
-    run's ``workspace/``.
+    verification into the lane's git worktree (under the worktree's
+    ``workspace/`` subdir, per the ``workspace/`` prefix convention the
+    Planner's tasks prompt instructs the implementer to use); the verifier
+    runs its commands with that ``workspace/`` as cwd so it sees the
+    implemented package + ``tests/`` and the Planner's workspace-relative
+    verify commands (``PYTHONPATH=. python -m pytest tests``,
+    ``python -m mypy <pkg>``) resolve. When the worktree has been created
+    but not yet populated with a ``workspace/`` subdir, the bare worktree
+    root is returned (the else-branch). When the lane has no active
+    worktree (v0.1-v0.6 run, a removed worktree, or a test that bypassed
+    the lane-aware path), this returns ``None`` and the caller falls back
+    to the implement run's ``workspace/``.
     """
     feature_root = feature_dir(repo_root, feature_id)
     metadata = load_lane_worktree(feature_root, lane_id)
@@ -521,6 +526,13 @@ def _lane_worktree_root(
     path = Path(path_str)
     if not path.is_dir():
         return None
+    # Prefer <worktree>/workspace/ (the cwd the implementer wrote the
+    # package + tests/ into, and the cwd the Planner's workspace-relative
+    # verify commands assume) when the implementer has populated it; fall
+    # back to the bare worktree root for a not-yet-populated worktree.
+    workspace = path / WORKSPACE_DIR
+    if workspace.is_dir():
+        return workspace
     return path
 
 
@@ -542,12 +554,14 @@ def run_verifier(
     command (deterministic shell, no model), then ``write_verification_report``
     (the lane-level §4.4 double product) and one ``verify`` audit record.
 
-    v0.7 (ADR-0009 D2): the verify commands run with ``cwd=lane worktree`` (the
-    same cwd the implementer leg wrote the files into) when an active lane
-    worktree exists; otherwise the v0.1-v0.6 cwd (``implement_run/workspace/``)
-    is used. This way a file written into the worktree between implement and
-    verify is visible to the verify command (the §18.4 lane gate's
-    "verification of what was actually implemented" precondition). Returns a
+    v0.7 (ADR-0009 D2): the verify commands run with ``cwd=<worktree>/workspace/``
+    (the same cwd the implementer leg wrote the package + ``tests/`` into, and the
+    cwd the Planner's workspace-relative verify commands assume) when an active
+    lane worktree exists; otherwise the v0.1-v0.6 cwd
+    (``implement_run/workspace/``) is used. This way a file written into the
+    worktree between implement and verify is visible to the verify command (the
+    §18.4 lane gate's "verification of what was actually implemented"
+    precondition). Returns a
     ``VerifierResult`` whether every command passed or some failed - a
     verification failure is a captured result (reported, non-zero CLI exit),
     not a raised exception. It *does* raise ``ValueError`` (§24.2 fail loud)
@@ -569,12 +583,13 @@ def run_verifier(
     commands = read_verification_commands(feature_root, lane_id)
     implement_run_id = read_implement_run_id(feature_root, lane_id)
 
-    # v0.7 cwd resolution: prefer the lane's worktree (the canonical cwd of
-    # the implement leg's writes) when an active worktree exists; fall back
-    # to the implement run's ``workspace/`` (the v0.1-v0.6 cwd) for the
-    # non-lane path. The fallback keeps the v0.1-v0.6 tests and ticket-03
-    # e2e green without forcing every caller through the lane worktree
-    # lifecycle; the lane-worktree path is the v0.7 default.
+    # v0.7 cwd resolution: prefer the lane's worktree workspace (the canonical
+    # cwd of the implement leg's writes - ``<worktree>/workspace/`` when the
+    # implementer populated it, else the bare worktree root) when an active
+    # worktree exists; fall back to the implement run's ``workspace/`` (the
+    # v0.1-v0.6 cwd) for the non-lane path. The fallback keeps the v0.1-v0.6
+    # tests and ticket-03 e2e green without forcing every caller through the
+    # lane worktree lifecycle; the lane-worktree path is the v0.7 default.
     worktree_root = _lane_worktree_root(repo_root, feature_id, lane_id)
     if worktree_root is not None:
         cwd = worktree_root

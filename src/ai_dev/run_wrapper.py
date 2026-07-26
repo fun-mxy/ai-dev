@@ -593,6 +593,63 @@ def _copy_agent_outputs(agent_cwd: Path, output_dir: Path) -> None:
         shutil.copyfile(src, dst)
 
 
+# Build-tool cache dirs the agent may emit into ``workspace/`` while
+# self-verifying (pytest/mypy/ruff). These are non-deterministic build
+# artifacts, never authored source - excluding them from the run-home ->
+# worktree sync keeps ``changed_files`` (and the §14.2 boundary check) to
+# authored files only. ``__pycache__`` is also subtracted downstream by
+# ``_BUILD_ARTIFACT_RE``, but the sync excludes the whole cache dir tree so
+# the worktree (and the lane branch) never carries them either.
+_WORKSPACE_CACHE_DIRS: frozenset[str] = frozenset(
+    {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+)
+
+
+def _sync_run_workspace_to_worktree(
+    run_workspace: Path, worktree_workspace: Path
+) -> list[str]:
+    """Copy the run-home ``workspace/`` deliverables into the lane worktree.
+
+    v0.7 capstone (ADR-0009 D2): the real claude CLI agent resolves the
+    working directory stated in ``build_prompt`` (the run-home) and writes
+    its ``workspace/`` deliverables there with absolute paths, NOT to the
+    lane worktree (its actual process cwd) - the fake-claude test writes
+    relative-to-cwd so it hits the worktree directly, but the real agent
+    does not. This sync copies any files the agent wrote to the run-home
+    ``workspace/`` into the worktree ``workspace/`` BEFORE the after-snapshot
+    so that:
+
+    * ``changed_files`` (the §13.2 snapshot diff taken against the worktree
+      cwd) reports the deliverables - the §14.2 file-boundary check then
+      sees the real authored files (not a vacuous empty set);
+    * the lane branch can commit them (in ``run_in_lane_worktree``) for PR
+      projection;
+    * the verifier's worktree-cwd commands find the package + ``tests/``.
+
+    Build-tool cache dirs (``__pycache__`` / ``.mypy_cache`` /
+    ``.pytest_cache`` / ``.ruff_cache``) are skipped. Returns the sorted list
+    of worktree-relative paths synced (empty when the agent wrote no
+    ``workspace/`` files - e.g. reviewer / spec-gap / a failed run), so the
+    caller can decide whether to commit. Idempotent: re-running overwrites
+    in place, so a re-run that wrote identical files stages nothing new.
+    """
+    if not run_workspace.is_dir():
+        return []
+    synced: list[str] = []
+    for src in run_workspace.rglob("*"):
+        if not src.is_file():
+            continue
+        # Skip cache dirs anywhere under workspace/.
+        if any(part in _WORKSPACE_CACHE_DIRS for part in src.relative_to(run_workspace).parts):
+            continue
+        rel = src.relative_to(run_workspace)
+        dst = worktree_workspace / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        synced.append(str(rel))
+    return sorted(synced)
+
+
 # ---------------------------------------------------------------------------
 # ADR-0005: AgentRunner strategy per ``profile.cli`` (D1). Each adapter owns
 # child-env build (strip + inject), argv build, stdout/stderr/exit capture, and
@@ -1111,6 +1168,15 @@ def run_headless(
     # agent's two §13.1 outputs without disturbing the wrapper's artifacts.
     if agent_cwd != run_root:
         _copy_agent_outputs(agent_cwd, output_dir)
+        # v0.7 capstone: the real claude CLI agent writes its workspace/
+        # deliverables to the run-home (build_prompt states the run-home as
+        # the working directory), not to the worktree cwd. Sync them into
+        # the worktree BEFORE the after-snapshot so changed_files reports
+        # them (the §14.2 boundary check then sees the real files) and the
+        # lane branch can commit them downstream. No-op when the agent wrote
+        # no workspace files (reviewer / spec-gap / a failed run) or when
+        # the agent already wrote to the worktree (fake-claude tests).
+        _sync_run_workspace_to_worktree(workspace_dir, agent_cwd / WORKSPACE_DIR)
 
     after = snapshot_tree(agent_cwd)
     changed_files = compute_changed_files(before, after, runner.wrapper_owned_re)

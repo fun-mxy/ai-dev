@@ -189,10 +189,20 @@ def ensure_lane_worktree(
     feature_root = repo_root / ".ai-dev" / "features" / feature_id
     metadata = load_lane_worktree(feature_root, lane_id)
     if metadata is not None and metadata.get("lifecycle") == WORKTREE_LIFECYCLE_ACTIVE:
+        # v0.7 capstone: ``worktree.json`` stores the caller-supplied symbolic
+        # base_ref (e.g. ``HEAD``); resolve it to a SHA here so the downstream
+        # ``git diff <base>..HEAD`` / ``git log <base>..HEAD`` captures compare
+        # against the lane's original base, not ``HEAD..HEAD`` (which is always
+        # empty). The create path resolves the same way; ``_resolve_base_ref_sha``
+        # is idempotent on an already-pinned SHA, so this is safe whether the
+        # stored value is symbolic or a SHA.
+        base_ref_sha = _resolve_base_ref_sha(
+            repo_root, str(metadata["base_ref"])
+        )
         return LaneRunContext(
             worktree_path=Path(metadata["path"]),
             branch=str(metadata["branch"]),
-            base_ref=str(metadata["base_ref"]),
+            base_ref=base_ref_sha,
         )
     # No active worktree -> create one. ``create_lane_worktree`` enforces
     # the lane-registration + non-git + existing-branch preconditions; we
@@ -561,6 +571,48 @@ def _git_diff_shortstat(cwd: Path) -> str:
     return (result.stdout or "").strip()
 
 
+def commit_lane_deliverables(
+    worktree_path: Path, lane_id: str, run_id: str, role: str
+) -> list[str]:
+    """Commit the lane worktree's ``workspace/`` deliverables to the lane branch.
+
+    v0.7 capstone (ADR-0009 D2): ``run_headless`` syncs the agent's
+    ``workspace/`` deliverables (which the real claude CLI writes to the
+    run-home, not the worktree) into the lane worktree before the
+    after-snapshot. This function stages ``workspace/`` and commits it to
+    the lane branch so:
+
+    * the lane branch carries the implemented files (``project-lane-pr``
+      pushes real content, not an empty branch);
+    * the lane ``diff.patch`` / ``commits.log`` capture below is non-empty;
+
+    A no-op (returns ``[]``) when nothing is staged - e.g. a reviewer /
+    spec-gap leg (no ``workspace/`` writes) or a re-run whose files are
+    byte-identical to the last commit (``git add`` stages nothing new).
+    Only ``workspace/`` is staged (never ``.mypy_cache`` / stray worktree
+    files), and the worktree's ``.gitignore`` already excludes cache dirs.
+    """
+    add = _git(worktree_path, "add", "--", "workspace/")
+    if add.returncode != 0:
+        return []
+    # ``git diff --cached --quiet`` exits 1 when there are staged changes,
+    # 0 when the index matches HEAD (nothing new to commit).
+    cached = _git(worktree_path, "diff", "--cached", "--quiet")
+    if cached.returncode == 0:
+        return []
+    names = _git(
+        worktree_path, "diff", "--cached", "--name-only", "--relative", "workspace/"
+    )
+    committed = [
+        line.strip()
+        for line in (names.stdout or "").splitlines()
+        if line.strip()
+    ]
+    msg = f"ai-dev {role} {lane_id} (run {run_id}): workspace deliverables"
+    _git(worktree_path, "commit", "-m", msg, "--", "workspace/")
+    return committed
+
+
 def run_in_lane_worktree(
     repo_root: Path,
     feature_id: str,
@@ -705,6 +757,16 @@ def run_in_lane_worktree(
         origin=origin,
     )
 
+    # v0.7 capstone: commit the synced workspace/ deliverables to the lane
+    # branch BEFORE capturing the diff/commits, so the lane branch carries
+    # the implemented files (for PR projection) and the capture below is
+    # non-empty. No-op for legs that wrote no workspace files (reviewer /
+    # spec-gap) or a re-run with byte-identical files. See
+    # ``commit_lane_deliverables`` for the full rationale.
+    committed_files = commit_lane_deliverables(
+        context.worktree_path, lane_id, run_id, role
+    )
+
     # Capture the lane-level diff + commits from the worktree. The capture
     # is read-only against the worktree (it does not modify the lane's
     # state); the lane-level writers below land the captured text at the
@@ -776,6 +838,7 @@ def run_in_lane_worktree(
             "profile": profile.name,
             "exit_code": run_result.exit_code,
             "changed_files": run_result.changed_files,
+            "committed_files": committed_files,
             "worktree_diff_shortstat": _git_diff_shortstat(context.worktree_path),
             "elapsed_ms": elapsed_ms_between(started, ended),
         },
